@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <numa_support.hpp>
 #include <regex>
 #include <thread_pool.hpp>
@@ -104,7 +105,8 @@ void to_json(nlohmann::json& json, const SimpleThreadPoolConfig& conf) {
 SimpleThreadPool::SimpleThreadPool(const SimpleThreadPoolConfig& config) : base_type(config) {
   int64_t num_workers{config.num_workers};
   if (num_workers <= 0) {
-    num_workers = std::thread::hardware_concurrency();
+    const auto cores{static_cast<int64_t>(std::thread::hardware_concurrency())};
+    num_workers = std::max<int64_t>(cores - 2, 1);
   }
   NVE_CHECK_(num_workers > 0, "ThreadPool must have at least one worker!");
 

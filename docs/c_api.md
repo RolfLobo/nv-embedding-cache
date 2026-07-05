@@ -343,8 +343,20 @@ nve_layer_lookup(layer, ctx, num_keys, keys, output, row_size, NULL, hitrates);
 int64_t offsets[] = {0, 2, 5};
 nve_layer_lookup_pooled(
     layer, ctx, 5, keys, pooled_output, row_size, NULL,
-    NVE_POOL_MEAN, NVE_SPARSE_CSR, offsets, 3,
-    NULL, NVE_DTYPE_UNKNOWN, hitrates);
+    NVE_POOL_MEAN, NVE_SPARSE_CSR, offsets, 3, 0,
+    NULL, NVE_DTYPE_UNKNOWN, NVE_DTYPE_FLOAT32, hitrates);
+
+// Fixed hotness 2 uses the scalar argument and does not require a CSR offsets buffer.
+nve_layer_lookup_pooled(
+    layer, ctx, num_keys, keys, pooled_output, row_size, NULL,
+    NVE_POOL_SUM, NVE_SPARSE_FIXED, NULL, 0, 2,
+    NULL, NVE_DTYPE_UNKNOWN, NVE_DTYPE_FLOAT32, hitrates);
+
+// Concatenate emits one row per key. Sparse layout and weight arguments are ignored.
+nve_layer_lookup_pooled(
+    layer, ctx, num_keys, keys, output, row_size, NULL,
+    NVE_POOL_CONCATENATE, NVE_SPARSE_FIXED, NULL, 0, 0,
+    NULL, NVE_DTYPE_UNKNOWN, NVE_DTYPE_FLOAT32, hitrates);
 
 // Insert into a specific table (table_id = 0 for first table)
 nve_layer_insert(layer, ctx, num_keys, keys, stride, size, values, 0);

@@ -27,7 +27,7 @@ so the loader can refill the in-memory PS on a fresh process.
 ### 2. Run C++ Inference
 
 ```bash
-# Same binary handles both modes — point it at the export directory:
+# Same binary handles linearuvm/hierarchical/gpu — point it at the export directory:
 ./<build_folder>/bin/nve_inference samples/cpp_inference/output
 ./<build_folder>/bin/nve_inference samples/cpp_inference/output_hierarchical
 ```

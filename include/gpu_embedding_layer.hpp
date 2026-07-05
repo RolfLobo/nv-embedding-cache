@@ -31,10 +31,10 @@ namespace nve {
   int device_id{0};                  // Device id of the GPU used
   void*   embedding_table;           // Pointer to linear table in GPU memory.
   int64_t num_embeddings;            // Number of rows in the table
-  int64_t embedding_width_in_bytes;  // Size in bytes for each embedding row. Must divide by 2 atm 
-                                     // (only fp16 and fp32 types are supported)
+  int64_t embedding_width_in_bytes;  // Stored bytes per row. Rowwise-quantized rows must have an
+                                     // even width.
   DataType_t value_dtype{
-      DataType_t::Unknown};          // Storage data type of the table values. Only used for accumulate
+      DataType_t::Unknown};          // Float16/Float32 or QInt8/QUint8RowwiseF16/F32 storage.
 };
 
 void from_json(const nlohmann::json& json, GPUEmbeddingLayerConfig& conf);

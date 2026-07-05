@@ -155,13 +155,14 @@ nve::DataType_t convert_dtype(nve_data_type_t dt) {
   return nve::DataType_t::Unknown;
 }
 
+// The pooling/sparse converters throw on out-of-range values so the C entry points' NVE_C_CATCH
+// reports an error instead of silently running a valid operation the caller never requested.
 nve::SparseType_t convert_sparse_type(nve_sparse_type_t st) {
   switch (st) {
     case NVE_SPARSE_FIXED: return nve::SparseType_t::Fixed;
     case NVE_SPARSE_CSR:   return nve::SparseType_t::CSR;
-    case NVE_SPARSE_COO:   return nve::SparseType_t::COO;
   }
-  return nve::SparseType_t::Fixed;
+  NVE_THROW_ARG_("Unknown nve_sparse_type_t value: ", static_cast<int>(st));
 }
 
 nve::PoolingType_t convert_pooling_type(nve_pooling_type_t pt) {
@@ -172,7 +173,7 @@ nve::PoolingType_t convert_pooling_type(nve_pooling_type_t pt) {
     case NVE_POOL_WEIGHTED_SUM: return nve::PoolingType_t::WeightedSum;
     case NVE_POOL_WEIGHTED_MEAN:return nve::PoolingType_t::WeightedMean;
   }
-  return nve::PoolingType_t::Concatenate;
+  NVE_THROW_ARG_("Unknown nve_pooling_type_t value: ", static_cast<int>(pt));
 }
 
 nve::Partitioner_t convert_partitioner(nve_partitioner_t p) {

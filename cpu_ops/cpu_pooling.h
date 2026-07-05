@@ -27,35 +27,6 @@
 
 namespace nve {
 
-// Per-row quantized int8/uint8 layout: `row_width` value bytes followed by per-row
-// scale (and offset, for the affine uint8 variants) as trailing metadata. The
-// metadata element type is float for the *F32 variants and __half for the *F16
-// variants. Dequant:
-//   QInt8Rowwise*  (symmetric, int8):  value * scale
-//   QUint8Rowwise* (affine,    uint8): value * scale + offset
-inline bool is_quant_rowwise(const DataType_t dtype) {
-  return dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QInt8RowwiseF16 ||
-         dtype == DataType_t::QUint8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF16;
-}
-
-// Number of trailing scalar metadata elements per row: 1 (scale) for the symmetric
-// int8 variants, 2 (scale + offset) for the affine uint8 variants.
-inline int64_t quant_rowwise_meta_count(const DataType_t dtype) {
-  return (dtype == DataType_t::QUint8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF16) ? 2 : 1;
-}
-
-// Size in bytes of each scale/offset metadata element (fp32 vs fp16 variant).
-inline int64_t quant_rowwise_scale_bytes(const DataType_t dtype) {
-  return (dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF32)
-             ? static_cast<int64_t>(sizeof(float))
-             : static_cast<int64_t>(sizeof(__half));
-}
-
-// Bytes occupied by the trailing per-row metadata (scale [+ offset]).
-inline int64_t quant_rowwise_meta_bytes(const DataType_t dtype) {
-  return quant_rowwise_meta_count(dtype) * quant_rowwise_scale_bytes(dtype);
-}
-
 // Host-side scalar conversions to/from the float accumulation type. cuda_fp16.h
 // (pulled in via nve_types.hpp) provides host implementations of __half2float /
 // __float2half, so these compile under the plain host compiler.
@@ -108,8 +79,7 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
                         const PoolingType_t pooling_type,
                         const WeightT* weights,         // per-key weights or nullptr
                         const int64_t num_workers) {
-  const bool weighted = (pooling_type == PoolingType_t::WeightedSum) ||
-                        (pooling_type == PoolingType_t::WeightedMean);
+  const bool weighted = is_weighted_pooling(pooling_type);
   const bool mean = (pooling_type == PoolingType_t::Mean) ||
                     (pooling_type == PoolingType_t::WeightedMean);
 
@@ -207,8 +177,7 @@ void cpu_kernel_pooling_quant(thread_pool_ptr_t thread_pool,
                               const PoolingType_t pooling_type,
                               const WeightT* weights,         // per-key weights or nullptr
                               const int64_t num_workers) {
-  const bool weighted = (pooling_type == PoolingType_t::WeightedSum) ||
-                        (pooling_type == PoolingType_t::WeightedMean);
+  const bool weighted = is_weighted_pooling(pooling_type);
   const bool mean = (pooling_type == PoolingType_t::Mean) ||
                     (pooling_type == PoolingType_t::WeightedMean);
 
@@ -484,8 +453,7 @@ void cpu_kernel_pooling_dispatch_weight(thread_pool_ptr_t thread_pool, const int
                                         const int64_t fixed_hotness, const OffsetT* offsets,
                                         const PoolingType_t pooling_type, const void* weights,
                                         const DataType_t weight_type, const int64_t num_workers) {
-  const bool weighted = (pooling_type == PoolingType_t::WeightedSum) ||
-                        (pooling_type == PoolingType_t::WeightedMean);
+  const bool weighted = is_weighted_pooling(pooling_type);
   if (!weighted) {
     // Weight type is irrelevant; pick float as a placeholder (weights unused).
     cpu_kernel_pooling<InT, OutT, float, OffsetT>(std::move(thread_pool), num_bags, row_width, input,
@@ -546,8 +514,7 @@ void cpu_kernel_pooling_quant_dispatch_weight(
     const SparseType_t sparse_type, const int64_t fixed_hotness, const OffsetT* offsets,
     const PoolingType_t pooling_type, const void* weights, const DataType_t weight_type,
     const int64_t num_workers) {
-  const bool weighted = (pooling_type == PoolingType_t::WeightedSum) ||
-                        (pooling_type == PoolingType_t::WeightedMean);
+  const bool weighted = is_weighted_pooling(pooling_type);
   if (!weighted) {
     cpu_kernel_pooling_quant<BaseT, QScaleT, HasOffset, OutT, float, OffsetT>(
         std::move(thread_pool), num_bags, row_width, input, input_stride, output, output_stride,

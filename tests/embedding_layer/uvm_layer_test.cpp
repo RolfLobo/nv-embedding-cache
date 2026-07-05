@@ -243,31 +243,32 @@ class UVMLayerTest {
     EmbeddingLayerBase::PoolingParams pp;
     pp.pooling_type = tc.pooling_type;
     pp.sparse_type = tc.offsets_layout;
+    // Output dtype matches the table's stored value type (the layer derives the actual output type
+    // from config().value_dtype); set it so validate_pool_params() accepts the request.
+    pp.output_type = tc.data_type;
 
     SetupCSROffsets<int64_t> offsets_setup(
         tc.offsets_layout == SparseType_t::CSR ? static_cast<int64_t>(num_keys) : 1,
         std::max<int64_t>(tc.hotness, 1));
+    const int64_t fixed_hotness = (num_keys == 1) ? 1 : tc.hotness;
     if (tc.offsets_layout == SparseType_t::CSR) {
-      pp.key_indices = offsets_setup.offsets_buffer;
-      pp.num_key_indices = static_cast<int64_t>(offsets_setup.num_offsets);
+      pp.csr_offsets = offsets_setup.offsets_buffer;
+      pp.num_csr_offsets = static_cast<int64_t>(offsets_setup.num_offsets);
       output_bags = static_cast<int64_t>(offsets_setup.num_offsets) - 1;
     } else {
-      const int64_t hotness = (num_keys == 1) ? 1 : tc.hotness; // special handling for single key test
-      offsets_setup.offsets_buffer[0] = hotness;
-      pp.key_indices = offsets_setup.offsets_buffer;
-      pp.num_key_indices = 1;
+      pp.fixed_hotness = fixed_hotness;
       if (tc.pooling_type != PoolingType_t::Concatenate) {
-        output_bags = num_keys / hotness;
+        output_bags = num_keys / fixed_hotness;
       }
     }
 
     std::vector<int8_t> weights;
-    if ((tc.pooling_type == PoolingType_t::WeightedSum) || (tc.pooling_type == PoolingType_t::WeightedMean)) {
+    if (is_weighted_pooling(tc.pooling_type)) {
       GenerateWeights(weights, static_cast<uint64_t>(num_keys), tc.data_type);
-      pp.sparse_weights = weights.data();
+      pp.weights = weights.data();
       pp.weight_type = tc.data_type;
     } else {
-      pp.sparse_weights = nullptr;
+      pp.weights = nullptr;
     }
 
     // Allocate based on num_keys (matches the BufferWrapper size used by the layer internally),
@@ -295,8 +296,9 @@ class UVMLayerTest {
 
     std::vector<int8_t> ref_output(static_cast<size_t>(output_bags * m_row_size));
     auto* mock_ref = static_cast<MockHostTable<IndexT>*>(m_ref_tab.get());
-    mock_ref->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type, pp.key_indices,
-                      pp.num_key_indices, pp.sparse_weights, pp.weight_type, ref_output.data());
+    mock_ref->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type,
+                      pp.csr_offsets, pp.num_csr_offsets, pp.fixed_hotness, pp.weights,
+                      pp.weight_type, ref_output.data());
 
     NVE_CHECK_(cudaDeviceSynchronize());
 
@@ -766,6 +768,134 @@ INSTANTIATE_TEST_SUITE_P(
         UVMTestCase({ int64_t(1) << 30, int64_t(1) << 26, int64_t(1) << 10, int64_t(1) << 11, DataType_t::Float16, PrivateStreamMode::None,      false,         32,      PoolingType_t::WeightedMean,    SparseType_t::CSR})     // fp16 CSR weighted mean
       ));
 
+// ---------------------------------------------------------------------------
+// Rowwise-quantized lookup through LinearUVMEmbeddingLayer.
+//
+// Builds a UVM table of per-row quantized rows and drives the layer's lookup() with pool_params:
+//   * pooling_type == Concatenate  -> routes to GpuTable::find_and_dequant (one dequantized row per
+//     key, no pooling), the path piped in for this work.
+//   * pooling_type == Sum (Fixed)  -> routes to find_and_combine, which dequantizes each row before
+//     summing the bag.
+// The dequantized float/half output is checked against a CPU reference computed straight from the
+// quantized table via load_quant_row_element_as_float. Keys are never inserted (NeverInsert), so
+// every lookup resolves through the UVM table.
+// ---------------------------------------------------------------------------
+template <typename IndexT>
+static void RunQuantUVMLookup(DataType_t dtype, PoolingType_t pooling, int64_t hotness,
+                              bool raw_concatenate = false) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  const bool fp32_meta = (dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF32);
+  const bool has_offset = (dtype == DataType_t::QUint8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF16);
+  const DataType_t out_dt =
+      raw_concatenate ? dtype : (fp32_meta ? DataType_t::Float32 : DataType_t::Float16);
+  const int64_t param_size = fp32_meta ? static_cast<int64_t>(sizeof(float)) : 2;  // float vs __half
+  const bool concat = (pooling == PoolingType_t::Concatenate);
+
+  constexpr int device_id = 0;
+  ScopedDevice dev(device_id);
+
+  constexpr int64_t value_count = 64;  // % 4 == 0 -> char4 (Vec4) dequant path
+  int64_t row_bytes = value_count + (has_offset ? 2 : 1) * param_size;
+  row_bytes = (row_bytes + 3) & ~static_cast<int64_t>(3);  // pad stride for char4 alignment
+  constexpr int64_t num_rows = 4096;
+
+  int8_t* h_table = nullptr;
+  NVE_CHECK_(cudaMallocHost(&h_table, static_cast<size_t>(num_rows * row_bytes)));
+  InitTableRowsQuant(h_table, row_bytes, value_count, 0, num_rows, dtype, 4242);
+
+  GPUTableConfig cfg;
+  cfg.device_id = device_id;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = dtype;
+  cfg.uvm_table = h_table;
+  cfg.count_misses = true;
+  auto gpu_tab = std::make_shared<GpuTable<IndexT>>(cfg);
+
+  typename LinearUVMEmbeddingLayer<IndexT>::Config lcfg;
+  lcfg.insert_heuristic = std::make_shared<NeverInsertHeuristic>();
+  auto layer = std::make_shared<LinearUVMEmbeddingLayer<IndexT>>(lcfg, gpu_tab);
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  const int64_t num_keys = concat ? 100 : (hotness * 16);
+  std::vector<IndexT> keys(static_cast<size_t>(num_keys));
+  std::mt19937 gen(987);
+  std::uniform_int_distribution<int64_t> kd(0, num_rows - 1);
+  for (auto& k : keys) k = static_cast<IndexT>(kd(gen));
+
+  const int64_t out_stride = raw_concatenate ? row_bytes : value_count * param_size;
+
+  EmbeddingLayerBase::PoolingParams pp;
+  pp.pooling_type = pooling;
+  pp.sparse_type = SparseType_t::Fixed;
+  pp.output_type = out_dt;
+  pp.fixed_hotness = concat ? int64_t(1) : hotness;
+  const int64_t output_bags = concat ? num_keys : (num_keys / hotness);
+
+  // Allocate exactly the number of rows produced by the pooling layout.
+  int8_t* output = nullptr;
+  const size_t output_bytes = static_cast<size_t>(output_bags * out_stride);
+  NVE_CHECK_(cudaMallocHost(&output, output_bytes));
+  std::memset(output, 0, output_bytes);
+
+  std::vector<float> hitrates(3);
+  layer->lookup(ctx, num_keys, keys.data(), output, out_stride, nullptr /*hitmask*/, &pp, hitrates.data());
+  NVE_CHECK_(cudaDeviceSynchronize());
+
+  const float tol = fp32_meta ? 1e-3f
+                              : (concat ? 2e-2f : 1e-2f * static_cast<float>(std::max<int64_t>(hotness, 1)));
+  if (raw_concatenate) {
+    for (int64_t i = 0; i < num_keys; ++i) {
+      const int8_t* expected =
+          h_table + static_cast<int64_t>(keys[static_cast<size_t>(i)]) * row_bytes;
+      EXPECT_EQ(std::memcmp(output + i * out_stride, expected, static_cast<size_t>(row_bytes)), 0)
+          << "raw row mismatch at key slot " << i;
+    }
+  } else if (concat) {
+    for (int64_t i = 0; i < num_keys; ++i) {
+      const int8_t* row = h_table + static_cast<int64_t>(keys[static_cast<size_t>(i)]) * row_bytes;
+      for (int64_t e = 0; e < value_count; ++e) {
+        const float ref = load_quant_row_element_as_float(row, e, value_count, dtype);
+        const float got = load_as_float(output, i * value_count + e, out_dt);
+        ASSERT_NEAR(got, ref, tol) << "key slot " << i << " element " << e;
+      }
+    }
+  } else {
+    for (int64_t b = 0; b < output_bags; ++b) {
+      for (int64_t e = 0; e < value_count; ++e) {
+        float ref = 0.0f;
+        for (int64_t h = 0; h < hotness; ++h) {
+          const int8_t* row = h_table + static_cast<int64_t>(keys[static_cast<size_t>(b * hotness + h)]) * row_bytes;
+          ref += load_quant_row_element_as_float(row, e, value_count, dtype);
+        }
+        const float got = load_as_float(output, b * value_count + e, out_dt);
+        ASSERT_NEAR(got, ref, tol) << "bag " << b << " element " << e;
+      }
+    }
+  }
+
+  NVE_CHECK_(cudaFreeHost(output));
+  ctx->wait();
+  ctx.reset();
+  NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+// Concatenate (no pooling) -> find_and_dequant.
+TEST(UVMQuant, DequantQInt8F32_Int64)  { RunQuantUVMLookup<int64_t>(DataType_t::QInt8RowwiseF32,  PoolingType_t::Concatenate, 1); }
+TEST(UVMQuant, DequantQUint8F32_Int64) { RunQuantUVMLookup<int64_t>(DataType_t::QUint8RowwiseF32, PoolingType_t::Concatenate, 1); }
+TEST(UVMQuant, DequantQInt8F16_Int64)  { RunQuantUVMLookup<int64_t>(DataType_t::QInt8RowwiseF16,  PoolingType_t::Concatenate, 1); }
+TEST(UVMQuant, DequantQUint8F16_Int64) { RunQuantUVMLookup<int64_t>(DataType_t::QUint8RowwiseF16, PoolingType_t::Concatenate, 1); }
+TEST(UVMQuant, DequantQInt8F32_Int32)  { RunQuantUVMLookup<int32_t>(DataType_t::QInt8RowwiseF32,  PoolingType_t::Concatenate, 1); }
+TEST(UVMQuant, DequantQUint8F16_Int32) { RunQuantUVMLookup<int32_t>(DataType_t::QUint8RowwiseF16, PoolingType_t::Concatenate, 1); }
+// Same-type Concatenate -> raw row passthrough through the ordinary find path.
+TEST(UVMQuant, RawConcatQInt8F32_Int64)  { RunQuantUVMLookup<int64_t>(DataType_t::QInt8RowwiseF32,  PoolingType_t::Concatenate, 1, true); }
+TEST(UVMQuant, RawConcatQUint8F16_Int32) { RunQuantUVMLookup<int32_t>(DataType_t::QUint8RowwiseF16, PoolingType_t::Concatenate, 1, true); }
+// Fixed-hotness Sum pooling over quantized rows -> find_and_combine.
+TEST(UVMQuant, SumQInt8F32_Int64)  { RunQuantUVMLookup<int64_t>(DataType_t::QInt8RowwiseF32,  PoolingType_t::Sum, 8); }
+TEST(UVMQuant, SumQUint8F32_Int64) { RunQuantUVMLookup<int64_t>(DataType_t::QUint8RowwiseF32, PoolingType_t::Sum, 8); }
+TEST(UVMQuant, SumQInt8F16_Int64)  { RunQuantUVMLookup<int64_t>(DataType_t::QInt8RowwiseF16,  PoolingType_t::Sum, 8); }
+TEST(UVMQuant, SumQUint8F16_Int64) { RunQuantUVMLookup<int64_t>(DataType_t::QUint8RowwiseF16, PoolingType_t::Sum, 8); }
+
 class UVMSpecialConfig : public ::testing::TestWithParam<UVMTestCase> {};
 
 TEST_P(UVMSpecialConfig, InflightInsert) {
@@ -804,6 +934,119 @@ TEST_P(UVMSpecialConfig, InflightInsert) {
 
   // Last lookup - now hitrate should be (almost) 100%
   ult.LookupAndCheck(keys);
+}
+
+// Auto-insert on the pooling path: a pooling lookup produces no reusable per-key row data, so the layer
+// collects keys only and promotes them by reading their rows directly from the UVM table
+// (GpuTable::insert_from_uvm). Verifies the promoted rows become resolvable from the GPU cache.
+// tc.modify_on_gpu exercises both the GPU (key-indexed) and CPU histogram paths of insert_from_uvm.
+TEST_P(UVMSpecialConfig, InflightInsertPooling) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  const auto tc = GetParam();
+  UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
+                            tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> data;
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+
+  // Populate linear table + ref with known data, then drop the GPU cache so lookups start cold.
+  ult.Insert(keys, data);
+  ult.Clear(false /* clear_ref */);
+
+  // Pooling lookup over all keys: resolves via UVM (cache empty) and triggers insert_from_uvm.
+  auto tcp = tc;
+  tcp.pooling_type = PoolingType_t::Sum;
+  tcp.offsets_layout = SparseType_t::Fixed;
+  tcp.hotness = 8;
+  ult.LookupAndCheckPooling(tcp, keys);
+  ult.Wait();  // wait for the async auto-insert to finish
+
+  // The keys were promoted straight from the UVM table; a plain lookup should now hit in the GPU cache
+  // (cold before the pooling lookup) and return rows matching the table. LookupAndCheck also verifies
+  // the values for both hits and misses. hit_tol=1 ignores the hitrate comparison since the exact
+  // residency depends on set-associative eviction at this cache load; we assert it separately.
+  float hitrate{0.f};
+  ult.LookupAndCheck(keys, 0, uint64_t(-1), 1.f /*ignore hitrate tol*/, &hitrate);
+  ASSERT_GT(hitrate, 0.9f);
+}
+
+// Mixed collection: non-pooled lookups begin a collection (below the insert threshold), then a pooled
+// lookup joins it. The whole pending insert must switch to UVM mode and promote all collected keys from
+// the UVM table (the partial per-key data gathered before the switch is discarded).
+TEST_P(UVMSpecialConfig, InflightInsertPoolingMixed) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  const auto tc = GetParam();
+  UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
+                            tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> data;
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+
+  ult.Insert(keys, data);
+  ult.Clear(false /* clear_ref */);
+
+  const auto threshold = static_cast<uint64_t>(ult.Config().min_insert_size_gpu); // 1024
+  const auto first = threshold / 2; // 512: below threshold, starts a non-pooled collection (with data)
+  ASSERT_LE(threshold, tc.test_keys);
+
+  // Non-pooled lookup starts the collection but does not cross the threshold (no insert launched yet).
+  float hitrate{0.f};
+  ult.LookupAndCheck(keys, 0, first, 1.f /*ignore hitrate tol*/, &hitrate);
+  ASSERT_EQ(hitrate, 0.f);
+
+  // Pooled lookup over the remaining keys: flips the in-flight collection to UVM mode and crosses the
+  // threshold, launching insert_from_uvm for all collected keys (the first `first` keys + more).
+  auto tcp = tc;
+  tcp.pooling_type = PoolingType_t::Sum;
+  tcp.offsets_layout = SparseType_t::Fixed;
+  tcp.hotness = 8;
+  ult.LookupAndCheckPooling(tcp, keys, first, uint64_t(-1));
+  ult.Wait();  // wait for the async auto-insert to finish
+
+  // The collection grows to `threshold` keys (keys[0, threshold)); all should now resolve from the GPU
+  // cache, including the prefix that was collected before the switch to UVM mode.
+  ult.LookupAndCheck(keys, 0, threshold, 1.f /*ignore hitrate tol*/, &hitrate);
+  ASSERT_GT(hitrate, 0.9f);
+}
+
+// Reverse of InflightInsertPoolingMixed: a pooled lookup starts the collection (collection_is_uvm_=true
+// from the outset), then non-pooled lookups join and add more keys. The UVM mode must remain sticky so
+// that data is never collected for any of the joining lookups, and the final insert_from_uvm promotes
+// all collected keys correctly.
+TEST_P(UVMSpecialConfig, InflightInsertPoolingMixedReverse) {
+  cudaGetLastError();
+  const auto tc = GetParam();
+  UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
+                            tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> data;
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+
+  ult.Insert(keys, data);
+  ult.Clear(false /* clear_ref */);
+
+  const auto threshold = static_cast<uint64_t>(ult.Config().min_insert_size_gpu);
+  const auto first = threshold / 2; // below threshold: pooling lookup starts collection in UVM mode
+  ASSERT_LE(threshold, tc.test_keys);
+
+  // Pooled lookup below threshold: starts the collection in UVM mode (collection_is_uvm_ = true).
+  auto tcp = tc;
+  tcp.pooling_type = PoolingType_t::Sum;
+  tcp.offsets_layout = SparseType_t::Fixed;
+  tcp.hotness = 8;
+  ult.LookupAndCheckPooling(tcp, keys, 0, first);
+  ult.Wait();
+
+  // Non-pooled lookups join the in-flight collection. Even though these are non-pooled, UVM mode is
+  // sticky: keys are added but no per-key row data is collected.
+  float hitrate{0.f};
+  ult.LookupAndCheck(keys, first, uint64_t(-1), 1.f /*ignore hitrate tol*/, &hitrate);
+  ASSERT_EQ(hitrate, 0.f); // still cold before auto-insert completes
+  ult.Wait(); // wait for the async insert_from_uvm to finish
+
+  // All collected keys (first `threshold` keys from both lookups) must now be in the GPU cache.
+  ult.LookupAndCheck(keys, 0, threshold, 1.f /*ignore hitrate tol*/, &hitrate);
+  ASSERT_GT(hitrate, 0.9f);
 }
 
 TEST_P(UVMSpecialConfig, LargeModify) {

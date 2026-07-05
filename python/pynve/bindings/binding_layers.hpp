@@ -104,10 +104,11 @@ public:
         EmbeddingLayerBase::PoolingParams pool_params;
         pool_params.pooling_type = PoolingType_t(pooling_type);
         pool_params.sparse_type = SparseType_t::CSR;
-        pool_params.key_indices = reinterpret_cast<const void*>(offsets);
-        pool_params.num_key_indices = num_offsets;
-        pool_params.sparse_weights = reinterpret_cast<const void*>(weights);
+        pool_params.csr_offsets = reinterpret_cast<const void*>(offsets);
+        pool_params.num_csr_offsets = num_offsets;
+        pool_params.weights = reinterpret_cast<const void*>(weights);
         pool_params.weight_type = DataType_t(weight_data_type);
+        pool_params.output_type = DataType_t(data_type_);
 
         emb_layer_ptr_->lookup(ctx,
                             num_keys,
@@ -346,9 +347,10 @@ protected:
         std::lock_guard lock(stream_ctx_map_mutex_);
         if (stream_ctx_map_.count(stream) != 1)
         {
-            cudaStream_t lookup_stream = stream;
+            // For host-only layers (device_id_ < 0) we need to set the default stream.
+            cudaStream_t lookup_stream = (device_id_ < 0) ? cudaStream_t(0) : stream;
             cudaStream_t modify_stream = modify_stream_;
-            
+
             stream_ctx_map_[stream] = emb_layer_ptr_->create_execution_context(lookup_stream, modify_stream, nullptr, nullptr);
         }
 

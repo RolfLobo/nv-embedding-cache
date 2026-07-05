@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <vector>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <cuda_support.hpp>
@@ -27,6 +28,8 @@
 #include <execution_context.hpp>
 #include <ecache/embed_cache.h>
 #include <bit_ops.hpp>
+#include <chrono>
+#include "include/embedding_layer.hpp"  // for EmbeddingLayerBase::PoolingParams
 
 namespace nve {
 
@@ -146,7 +149,15 @@ class LayerExecutionContext: public ExecutionContext {
   }
 
   void submit_parallel_task(ThreadPool::task_type task, int64_t table_id) {
-    parallel_task_res_.at(static_cast<size_t>(table_id)) = thread_pool_->submit(std::move(task));
+    auto& fut{parallel_task_res_.at(static_cast<size_t>(table_id))};
+
+    if (fut.valid()) {
+      if (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        NVE_LOG_PERF_("Waiting for parallel task"); // This shouldn't happen - just a precaution
+      }
+      fut.get(); // Also propagates any exception from the previous task before it is overwritten below.
+    }
+    fut = thread_pool_->submit(std::move(task));
   }
 
   // Public members since only this file can access them (the actual class isn't exposed)
@@ -208,6 +219,11 @@ class BufferWrapper;
 
 class AutoInsertHandler final {
 public:
+  // Callback that promotes keys into the table by reading their rows directly from a backing UVM table
+  // (see GpuTable::insert_from_uvm). Supplied by layers whose table supports it (LinearUVM); empty
+  // otherwise. Kept as a callback so this generic handler doesn't depend on the concrete table type.
+  using uvm_insert_fn_t = std::function<void(context_ptr_t&, int64_t, std::shared_ptr<BufferWrapper<const void>>)>;
+
   AutoInsertHandler(
     std::shared_ptr<InsertHeuristic> heuristic,
     table_ptr_t table,
@@ -217,10 +233,15 @@ public:
     const int64_t min_insert_size,
     const int64_t key_size,
     const int32_t layer_gpu_device,
-    const void* invalid_key_bytes);
+    const void* invalid_key_bytes,
+    uvm_insert_fn_t uvm_insert_fn = {});
 
   ~AutoInsertHandler();
 
+  // insert_from_uvm: when true, this lookup produced no reusable per-key row data (e.g. a pooling
+  // lookup), so only keys are collected and the eventual insert promotes them via uvm_insert_fn_. The
+  // mode is sticky for the duration of a collection - if a non-pooled collection is later joined by a
+  // pooled lookup it switches to UVM mode and any partial data already collected is discarded.
   void auto_insert(
     std::shared_ptr<LayerExecutionContext> layer_ctx,
     std::shared_ptr<BufferWrapper<const void>>& keys_bw,
@@ -228,7 +249,8 @@ public:
     const float hitrate,
     const int64_t num_keys,
     const int64_t output_stride,
-    std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw = nullptr);
+    std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw = nullptr,
+    const bool insert_from_uvm = false);
   void lock_modify();
   void unlock_modify();
 
@@ -243,10 +265,12 @@ private:
   const int64_t key_size_;
   const int32_t layer_gpu_device_;
   std::vector<uint8_t> invalid_key_bytes_; // empty when no sentinel is configured (no rewriting)
+  uvm_insert_fn_t uvm_insert_fn_; // promotes keys from the backing UVM table; empty when unsupported
 
   int64_t insert_freq_cnt_{0};
   int64_t collected_keys_{0};
   int64_t collected_output_stride_{0};
+  bool collection_is_uvm_{false}; // sticky per-collection: insert the collected keys via uvm_insert_fn_
 
   // Handler keeps it own keys/data buffers for accumulation of small key sets
   std::unique_ptr<ResizeableBuffer> insert_keys_;
@@ -262,5 +286,45 @@ private:
     std::shared_ptr<LayerExecutionContext> layer_ctx,
     const int64_t output_stride);
 };
+
+void validate_pool_params(const EmbeddingLayerBase::PoolingParams& pool_params);
+
+/**
+ * Return the number of rows produced by a layer lookup.
+ *
+ * Plain lookup and Concatenate produce one row per key. Fixed pooling produces
+ * `num_keys / fixed_hotness` rows, while CSR pooling produces
+ * `num_csr_offsets - 1` rows. Invalid or non-divisible layouts are rejected.
+ */
+int64_t get_lookup_output_rows(
+    int64_t num_keys, const EmbeddingLayerBase::PoolingParams* pool_params);
+
+/**
+ * Pool/dequantize a host-resident gather buffer into a host-resident output buffer using the
+ * CPU pooling kernels (cpu_ops/cpu_pooling.h). Shared by the host layer and by the hierarchical
+ * layer's no-GPU-tier pooling path.
+ *
+ * `gather_host` holds `num_keys` raw stored rows at `gather_stride` (each `row_size` bytes,
+ * possibly carrying quantized scale/offset metadata); `value_dtype` is the stored value type.
+ * Derives the pooling metadata from `pool_params` (sparse layout, hotness/offsets, in/out dtype,
+ * element width) and reduces into `output` at `output_stride`. Reads `csr_offsets` and
+ * `weights` through `ctx`-wrapped buffers so device-resident inputs are handled, and wraps
+ * `output` so a device/managed user buffer is written via a host scratch and copied back.
+ *
+ * The caller owns the gather buffer. Same-type Concatenate copies each full raw row, including
+ * rowwise-quantization metadata, without conversion or reduction.
+ *
+ * @tparam KeyType key/offset element type (int32_t or int64_t).
+ */
+template <typename KeyType>
+void pool_gathered_host(context_ptr_t& ctx,
+                        const EmbeddingLayerBase::PoolingParams& pool_params,
+                        DataType_t value_dtype,
+                        const int8_t* gather_host, int64_t gather_stride,
+                        int64_t row_size, int64_t num_keys,
+                        void* output, int64_t output_stride);
+
+// Check if the pooling can be resolved with only copying (equivalent to lookup)
+bool is_pooling_raw_concat(const EmbeddingLayerBase::PoolingParams* pool_params, DataType_t value_dtype);
 
 }  // namespace nve

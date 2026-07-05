@@ -18,6 +18,7 @@
 #pragma once
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include "include/nve_types.hpp"
 
 namespace nve {
 
@@ -62,6 +63,238 @@ struct VecWidthHelper<__half>
     using Vec2 = half2;
     using Vec1 = __half;
 };
+
+template<DataType_t DataType>
+struct QuantizationHelper
+{
+};
+
+template<>
+struct QuantizationHelper<DataType_t::QInt8RowwiseF32>
+{
+    using Vec4 = char4;
+    using Vec2 = char2;
+    using Vec1 = char;
+    using ParamType = float;
+    constexpr static const bool has_scale = true;
+    constexpr static const bool has_offset = false;
+    constexpr static const size_t element_size = sizeof(char);
+};
+
+template<>
+struct QuantizationHelper<DataType_t::Float32>
+{
+    using Vec4 = float4;
+    using Vec2 = float2;
+    using Vec1 = float;
+    using ParamType = float;
+    constexpr static const bool has_scale = false;
+    constexpr static const bool has_offset = false;
+    constexpr static const size_t element_size = sizeof(float);
+};
+
+template<>
+struct QuantizationHelper<DataType_t::Float16>
+{
+    using Vec4 = half4;
+    using Vec2 = half2;
+    using Vec1 = __half;
+    using ParamType = __half;
+    constexpr static const bool has_scale = false;
+    constexpr static const bool has_offset = false;
+    constexpr static const size_t element_size = sizeof(__half);
+};
+
+template<>
+struct QuantizationHelper<DataType_t::QUint8RowwiseF32>
+{
+    using Vec4 = uchar4;
+    using Vec2 = uchar2;
+    using Vec1 = unsigned char;
+    using ParamType = float;
+    constexpr static const bool has_scale = true;
+    constexpr static const bool has_offset = true;
+    constexpr static const size_t element_size = sizeof(uint8_t);
+};
+
+template<>
+struct QuantizationHelper<DataType_t::QInt8RowwiseF16>
+{
+    using Vec4 = char4;
+    using Vec2 = char2;
+    using Vec1 = char;
+    using ParamType = __half;
+    constexpr static const bool has_scale = true;
+    constexpr static const bool has_offset = false;
+    constexpr static const size_t element_size = sizeof(int8_t);
+};
+
+template<>
+struct QuantizationHelper<DataType_t::QUint8RowwiseF16>
+{
+    using Vec4 = uchar4;
+    using Vec2 = uchar2;
+    using Vec1 = unsigned char;
+    using ParamType = __half;
+    constexpr static const bool has_scale = true;
+    constexpr static const bool has_offset = true;
+    constexpr static const size_t element_size = sizeof(uint8_t);
+};
+
+// Byte size of one stored row: elements followed by any per-row quantization parameters.
+template<DataType_t DTYPE>
+inline constexpr uint32_t get_row_size_in_bytes(uint32_t row_size_in_elements)
+{
+    uint32_t bytes = row_size_in_elements * QuantizationHelper<DTYPE>::element_size;
+    if constexpr (QuantizationHelper<DTYPE>::has_scale)
+    {
+        bytes += sizeof(typename QuantizationHelper<DTYPE>::ParamType);
+    }
+    if constexpr (QuantizationHelper<DTYPE>::has_offset)
+    {
+        bytes += sizeof(typename QuantizationHelper<DTYPE>::ParamType);
+    }
+    return bytes;
+}
+
+// Size in bytes of the dequantized value type (QuantizationHelper::ParamType) for a runtime data
+// type. Used to convert an output row stride (in bytes) into an element count. Returns 0 for
+// unsupported types (callers should only pass value/output types: *F32 -> float, *F16 -> __half).
+inline size_t value_size_in_bytes(DataType_t dtype) {
+    if (dtype == DataType_t::Float32 || dtype == DataType_t::Float16) {
+        return static_cast<size_t>(dtype_size(dtype));
+    }
+    if (is_quant_rowwise(dtype)) {
+        return static_cast<size_t>(dtype_size(quant_rowwise_output_dtype(dtype)));
+    }
+    NVE_THROW_("Unsupported value type for value_size_in_bytes(): ", static_cast<uint32_t>(dtype));
+    return 0;
+}
+
+template<typename QUANTIZE_TYPE, typename ELEMENT_VEC_TYPE, typename INPUT_VEC_TYPE>
+inline ELEMENT_VEC_TYPE __device__ dequantize(const INPUT_VEC_TYPE& el_quantized, const typename QUANTIZE_TYPE::ParamType& scale, const typename QUANTIZE_TYPE::ParamType& offset);
+
+template<>
+inline float4 __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF32>, float4, char4>(const char4& el_quantized, const float& scale, const float& offset) {
+  float4 tmp;
+  tmp.x = float(el_quantized.x) * scale + offset;
+  tmp.y = float(el_quantized.y) * scale + offset;
+  tmp.z = float(el_quantized.z) * scale + offset;
+  tmp.w = float(el_quantized.w) * scale + offset;
+  return tmp;
+}
+
+template<>
+inline float2 __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF32>, float2, char2>(const char2& el_quantized, const float& scale, const float& offset) {
+  float2 tmp;
+  tmp.x = float(el_quantized.x) * scale + offset;
+  tmp.y = float(el_quantized.y) * scale + offset;
+  return tmp;
+}
+
+template<>
+inline float __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF32>, float, char>(const char& el_quantized, const float& scale, const float& offset) {
+  return float(el_quantized) * scale + offset;
+}
+
+template<>
+inline float4 __device__ dequantize<QuantizationHelper<DataType_t::Float32>, float4, float4>(const float4& el_quantized, const float& scale, const float& offset) {
+  return el_quantized;
+}
+
+template<>
+inline float2 __device__ dequantize<QuantizationHelper<DataType_t::Float32>, float2, float2>(const float2& el_quantized, const float& scale, const float& offset) {
+  return el_quantized;
+}
+
+template<>
+inline float __device__ dequantize<QuantizationHelper<DataType_t::Float32>, float, float>(const float& el_quantized, const float& scale, const float& offset) {
+  return el_quantized;
+}
+
+template<>
+inline half4 __device__ dequantize<QuantizationHelper<DataType_t::Float16>, half4, half4>(const half4& el_quantized, const __half& scale, const __half& offset) {
+  return el_quantized;
+}
+
+template<>
+inline half2 __device__ dequantize<QuantizationHelper<DataType_t::Float16>, half2, half2>(const half2& el_quantized, const __half& scale, const __half& offset) {
+  return el_quantized;
+}
+
+template<>
+inline __half __device__ dequantize<QuantizationHelper<DataType_t::Float16>, __half, __half>(const __half& el_quantized, const __half& scale, const __half& offset) {
+  return el_quantized;
+}
+
+template<>
+inline float4 __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF32>, float4, uchar4>(const uchar4& el_quantized, const float& scale, const float& offset) {
+  float4 tmp;
+  tmp.x = float(el_quantized.x) * scale + offset;
+  tmp.y = float(el_quantized.y) * scale + offset;
+  tmp.z = float(el_quantized.z) * scale + offset;
+  tmp.w = float(el_quantized.w) * scale + offset;
+  return tmp;
+}
+
+template<>
+inline float2 __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF32>, float2, uchar2>(const uchar2& el_quantized, const float& scale, const float& offset) {
+  float2 tmp;
+  tmp.x = float(el_quantized.x) * scale + offset;
+  tmp.y = float(el_quantized.y) * scale + offset;
+  return tmp;
+}
+
+template<>
+inline float __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF32>, float, unsigned char>(const unsigned char& el_quantized, const float& scale, const float& offset) {
+  return float(el_quantized) * scale + offset;
+}
+
+template<>
+inline half4 __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF16>, half4, char4>(const char4& el_quantized, const __half& scale, const __half& offset) {
+  half4 tmp;
+  tmp.x = __float2half(float(el_quantized.x) * __half2float(scale));
+  tmp.y = __float2half(float(el_quantized.y) * __half2float(scale));
+  tmp.z = __float2half(float(el_quantized.z) * __half2float(scale));
+  tmp.w = __float2half(float(el_quantized.w) * __half2float(scale));
+  return tmp;
+}
+
+template<>
+inline half2 __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF16>, half2, char2>(const char2& el_quantized, const __half& scale, const __half& offset) {
+  half2 tmp;
+  tmp.x = __float2half(float(el_quantized.x) * __half2float(scale));
+  tmp.y = __float2half(float(el_quantized.y) * __half2float(scale));
+  return tmp;
+}
+
+template<>
+inline __half __device__ dequantize<QuantizationHelper<DataType_t::QInt8RowwiseF16>, __half, char>(const char& el_quantized, const __half& scale, const __half& offset) {
+  return __float2half(float(el_quantized) * __half2float(scale));
+}
+
+template<>
+inline half4 __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF16>, half4, uchar4>(const uchar4& el_quantized, const __half& scale, const __half& offset) {
+  half4 tmp;
+  tmp.x = __float2half(float(el_quantized.x) * __half2float(scale) + __half2float(offset));
+  tmp.y = __float2half(float(el_quantized.y) * __half2float(scale) + __half2float(offset));
+  tmp.z = __float2half(float(el_quantized.z) * __half2float(scale) + __half2float(offset));
+  tmp.w = __float2half(float(el_quantized.w) * __half2float(scale) + __half2float(offset));
+  return tmp;
+}
+
+template<>
+inline half2 __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF16>, half2, uchar2>(const uchar2& el_quantized, const __half& scale, const __half& offset) {
+  half2 tmp;
+  tmp.x = __float2half(float(el_quantized.x) * __half2float(scale) + __half2float(offset));
+  tmp.y = __float2half(float(el_quantized.y) * __half2float(scale) + __half2float(offset));
+  return tmp;
+}
+
+template<>
+inline __half __device__ dequantize<QuantizationHelper<DataType_t::QUint8RowwiseF16>, __half, uint8_t>(const uint8_t& el_quantized, const __half& scale, const __half& offset) {
+  return __float2half(float(el_quantized) * __half2float(scale) + __half2float(offset));
+}
 
 template<typename DataType>
 inline void __device__ InitAcc(DataType& acc);
@@ -221,6 +454,12 @@ inline void __device__ Div(half4& acc, const __half& weight) {
   acc.z /= weight;
   acc.w /= weight;
 }
+
+// Zero test for the Mean/WeightedMean averaging denominator, so a zero denominator (empty bag, or
+// weights summing to zero) can zero-fill the output row instead of dividing by zero.
+inline bool __device__ IsZero(const float& weight) { return weight == 0.f; }
+
+inline bool __device__ IsZero(const __half& weight) { return __half2float(weight) == 0.f; }
 
 template<typename FromType, typename ToType>
 inline ToType __device__ Cast(const FromType& d) {

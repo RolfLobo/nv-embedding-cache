@@ -17,7 +17,11 @@
 
 #include <distributed.hpp>
 #include <common.hpp>
+
+#ifndef NVE_DRIVERLESS_BUILD
+
 #include <cuda_support.hpp>
+#include <cuda_driver_support.hpp>
 #include <cerrno>
 #include <iostream>
 #include <sstream>
@@ -309,3 +313,20 @@ uint64_t CUDADistributedBuffer::collect_devices(std::vector<int>& all_devices) {
 }
 
 } // namespace nve
+
+#else  // NVE_DRIVERLESS_BUILD
+
+// Driverless stub
+namespace nve {
+
+CUDADistributedBuffer::CUDADistributedBuffer(uint64_t, std::shared_ptr<DistributedEnv>, BufferLocation) {
+    NVE_THROW_(
+        "CUDADistributedBuffer requires CUDA driver support; this build was compiled "
+        "with NVE_DRIVERLESS_BUILD=ON (no CUDA driver support).");
+}
+
+CUDADistributedBuffer::~CUDADistributedBuffer() {}
+
+} // namespace nve
+
+#endif  // NVE_DRIVERLESS_BUILD

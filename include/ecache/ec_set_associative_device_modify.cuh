@@ -89,6 +89,8 @@ public:
                 nullptr,
                 this->d_tags_,
                 d_counters_,
+                nullptr,                 // set_timestamps (unused for size query)
+                0,                       // global_ts
                 this->cache_,
                 this->config_.embed_width_in_bytes,
                 this->config_.decay_rate,
@@ -204,7 +206,13 @@ public:
     {
         try
         {
+            std::lock_guard<std::mutex> lock(modify_mutex_);
             CACHE_CUDA_ERR_CHK_AND_THROW(call_fill_tags<TagT>(this->d_tags_, this->num_sets_ * NUM_WAYS * this->config_.num_tables, this->config_.sentinel_key, stream));
+            // reset lazy-decay clock and per-set timestamps
+            global_ts_ = 0;
+            if (d_set_timestamps_ != nullptr) {
+                CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemsetAsync(d_set_timestamps_, 0, this->config_.num_tables * this->num_sets_ * sizeof(int64_t), stream));
+            }
             return ECERROR_SUCCESS;
         }
         catch(const ECException& e)
@@ -236,6 +244,8 @@ public:
 
             auto dst_tags = this->d_tags_ + table_index * this->num_sets_ * NUM_WAYS;
             int8_t* cache_ptr = this->cache_ + table_index * this->num_sets_ * NUM_WAYS * this->config_.embed_width_in_bytes;
+            auto d_curr_timestamp = this->d_set_timestamps_ + table_index * this->num_sets_;
+            auto d_curr_counters = this->d_counters_ + table_index * this->num_sets_ * NUM_WAYS;
 
             ModifyList list;
             list.num_entries = 0;
@@ -250,7 +260,9 @@ public:
                 num_keys,
                 priority,
                 dst_tags,
-                d_counters_,
+                d_curr_counters,
+                d_curr_timestamp,
+                ++global_ts_,            // advance the global clock once per insert
                 cache_ptr,
                 this->config_.embed_width_in_bytes,
                 this->config_.decay_rate,
@@ -438,19 +450,23 @@ private:
         }
     }
 
-    virtual size_t get_extra_device_alloc_size(uint64_t num_tables, uint64_t num_sets) const override 
+    virtual size_t get_extra_device_alloc_size(uint64_t num_tables, uint64_t num_sets) const override
     {
         size_t ctr_size = num_tables * num_sets * NUM_WAYS * sizeof(CounterT);
-        return ctr_size;
+        size_t ts_size  = num_tables * num_sets * sizeof(int64_t); // one lazy-decay timestamp per set
+        return ctr_size + ts_size;
     }
 
-    virtual void init_extras_device(uint64_t num_tables, int8_t* pool, size_t space) override 
+    virtual void init_extras_device(uint64_t num_tables, int8_t* pool, size_t space) override
     {
         // we should have set the number of sets before calling this function
         assert(this->num_sets_ > 0);
-        size_t sz = get_extra_device_alloc_size(num_tables, this->num_sets_);
-        d_counters_ = (CounterT*)EmbedCacheSA<IndexT, TagT>::allocate_in_pool(pool, space, sz, 16);
-        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_counters_, 0, sz));
+        size_t ctr_size = num_tables * this->num_sets_ * NUM_WAYS * sizeof(CounterT);
+        size_t ts_size  = num_tables * this->num_sets_ * sizeof(int64_t);
+        d_counters_ = (CounterT*)EmbedCacheSA<IndexT, TagT>::allocate_in_pool(pool, space, ctr_size, 16);
+        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_counters_, 0, ctr_size));
+        d_set_timestamps_ = (int64_t*)EmbedCacheSA<IndexT, TagT>::allocate_in_pool(pool, space, ts_size, 16);
+        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_set_timestamps_, 0, ts_size));
     }
 
     virtual size_t get_counter_size_per_set() const override {
@@ -459,5 +475,11 @@ private:
 
     mutable std::mutex modify_mutex_;
     CounterT* d_counters_ = nullptr; // device allocated counters to modify
+
+    // the last call that touched each set. A set's counters are decayed by
+    // decay_rate^(global_ts_ - set_ts) the next time it is touched. Both are
+    // guarded by modify_mutex_.
+    int64_t global_ts_ = 0;
+    int64_t* d_set_timestamps_ = nullptr; // one timestamp per set, allocated from the extras pool
 };
 }

@@ -36,8 +36,7 @@ thread_pool_ptr_t default_thread_pool();
 struct SimpleThreadPoolConfig : public ThreadPoolConfig {
   using base_type = ThreadPoolConfig;
 
-  int64_t num_workers{};
-
+  int64_t num_workers{};  // When <=0, we default to max(cores - 2, 1)
   void check() const;
 };
 

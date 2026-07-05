@@ -20,3 +20,4 @@ python/pynve.egg-info/
 .devcontainer/.env
 .cache/
 .claude/
+/.codex

@@ -131,7 +131,7 @@ extern "C" AtenTensorHandle nve_embedding_lookup_with_pooling_cuda(
         reinterpret_cast<std::uintptr_t>(keys.data_ptr()),
         reinterpret_cast<std::uintptr_t>(output.data_ptr()),
         static_cast<std::uint32_t>(pooling_type),
-        static_cast<std::size_t>(num_bags),
+        static_cast<std::size_t>(offsets.numel()),
         reinterpret_cast<std::uintptr_t>(offsets.data_ptr()),
         weight_dtype,
         weight_ptr,

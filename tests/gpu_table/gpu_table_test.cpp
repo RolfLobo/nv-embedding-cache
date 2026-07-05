@@ -18,11 +18,13 @@
 #include <gtest/gtest.h>
 
 #include <buffer_wrapper.hpp>
+#include <cmath>
 #include <common.hpp>
 #include <cstring>
 #include <cuda_support.hpp>
 #include <gpu_table.hpp>
 #include <default_allocator.hpp>
+#include <random>
 #include <tuple>
 #include <vector>
 
@@ -46,7 +48,7 @@ struct GpuTableTestParams {
 };
 
 template <typename KeyType,                 // Type used for keys/indices
-          typename OffsetType = KeyType,    // Type used for Offset during lookup of COO/CSR
+          typename OffsetType = KeyType,    // Type used for Offset during lookup of CSR
           typename ValueType = float,       // Type used for the data vectors
           typename OutputType = ValueType,  // Type used for output data vectors (can differ from
                                             // ValueType only when combining multiple rows)
@@ -248,6 +250,7 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
     cfg.device_id = params.device_id;
     cfg.cache_size = params.cache_size_bytes;
     cfg.row_size_in_bytes = params.row_size_bytes;
+    cfg.value_dtype = data_type<ValueType>();  // stored value type; find_and_combine dispatches on it
     cfg.uvm_table = nullptr;
     cfg.data_storage_on_host = params.data_storage_on_host;
     modify_on_gpu_ = cfg.modify_on_gpu = params.modify_on_gpu;
@@ -374,10 +377,12 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
         ctx_, "keys", d_keys_, sizeof(KeyType) * static_cast<size_t>(num_keys));
     auto values_bw = std::make_shared<BufferWrapper<void>>(
         ctx_, "values", d_data_, static_cast<size_t>(row_size));
-    tb_->template find_and_combine<OffsetType, ValueType, OutputType, WeightType>(
+    // Element type comes from the table config (value_dtype); pass the output/weight types.
+    tb_->find_and_pool(
         ctx_, num_keys, std::move(keys_bw), SparseType_t::Fixed, 0 /*num_offsets*/,
         nullptr /*offsets*/, num_keys /* fixed_hotness*/, PoolingType_t::Sum,
-        nullptr /*weights*/, row_size, std::move(values_bw));
+        nullptr /*weights*/, data_type<OutputType>(), data_type<WeightType>(),
+        row_size, std::move(values_bw));
     NVE_CHECK_(cudaDeviceSynchronize());
 
     // copy outputs to host
@@ -641,6 +646,216 @@ TEST(GpuTableInvalidKey, MinusOneRoundTripsWhenSentinelIsCustom) {
   allocator->device_free(d_keys);
   allocator->device_free(d_values);
   allocator->device_free(d_hitmask);
+}
+
+// ---------------------------------------------------------------------------
+// Rowwise-quantized find_and_dequant / find_and_combine tests (float-scale variants).
+//
+// Builds a host UVM table of per-row quantized rows ([ q[N] ][ scale ][ offset? ]) and verifies
+// that GpuTable::find_and_dequant (one dequantized row per key, no pooling) and the quantized
+// find_and_combine sum path reconstruct the same float values a CPU dequant reference does. Keys
+// are never inserted into the GPU cache, so every lookup resolves through the UVM table fallback.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int64_t QUANT_NUM_ELEMENTS = 32;  // % 4 == 0 -> exercises the char4 (Vec4) dequant path
+
+// Byte size of one quantized row for a float-scale variant, padded to a 4-byte stride so each row
+// base stays char4-aligned (and divisible by 2 as GpuTable requires).
+int64_t quant_row_bytes(bool has_offset) {
+  int64_t bytes = QUANT_NUM_ELEMENTS + (has_offset ? 2 : 1) * static_cast<int64_t>(sizeof(float));
+  return (bytes + 3) & ~static_cast<int64_t>(3);
+}
+
+// Quantize one row of floats into a quantized row, mirroring the kernel/test convention:
+//   QInt8RowwiseF32  (signed, symmetric): scale = max|v| / 127, q = round(v / scale), no offset.
+//   QUint8RowwiseF32 (unsigned, affine):  scale = (max - min) / 255, offset = min,
+//                                         q = round((v - offset) / scale).
+void quantize_row_f32(const std::vector<float>& v, bool has_offset, int8_t* row) {
+  float scale = 1.0f, offset = 0.0f;
+  if (!has_offset) {
+    float amax = 0.0f;
+    for (float x : v) amax = std::max(amax, std::fabs(x));
+    scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    for (size_t j = 0; j < v.size(); ++j) {
+      long q = std::lround(v[j] / scale);
+      q = std::min<long>(127, std::max<long>(-127, q));
+      reinterpret_cast<int8_t*>(row)[j] = static_cast<int8_t>(q);
+    }
+  } else {
+    float lo = v[0], hi = v[0];
+    for (float x : v) { lo = std::min(lo, x); hi = std::max(hi, x); }
+    scale = hi > lo ? (hi - lo) / 255.0f : 1.0f;
+    offset = lo;
+    for (size_t j = 0; j < v.size(); ++j) {
+      long q = std::lround((v[j] - offset) / scale);
+      q = std::min<long>(255, std::max<long>(0, q));
+      reinterpret_cast<uint8_t*>(row)[j] = static_cast<uint8_t>(q);
+    }
+  }
+  int8_t* meta = row + QUANT_NUM_ELEMENTS;  // element_size == 1 byte
+  std::memcpy(meta, &scale, sizeof(float));
+  if (has_offset) std::memcpy(meta + sizeof(float), &offset, sizeof(float));
+}
+
+// CPU reference dequant of element e: float(q[e]) * scale [+ offset], mirroring the kernel.
+float dequant_row_element(const int8_t* row, int64_t e, bool has_offset, bool is_signed) {
+  const float base = is_signed ? static_cast<float>(reinterpret_cast<const int8_t*>(row)[e])
+                               : static_cast<float>(reinterpret_cast<const uint8_t*>(row)[e]);
+  const int8_t* meta = row + QUANT_NUM_ELEMENTS;
+  float scale = 1.0f, offset = 0.0f;
+  std::memcpy(&scale, meta, sizeof(float));
+  if (has_offset) std::memcpy(&offset, meta + sizeof(float), sizeof(float));
+  return base * scale + offset;
+}
+
+// Build a host UVM table of `num_rows` quantized rows (returns the pinned-host pointer).
+int8_t* make_quant_uvm_table(int64_t num_rows, bool has_offset, int64_t row_bytes, size_t seed) {
+  int8_t* h_table = nullptr;
+  NVE_CHECK_(cudaMallocHost(&h_table, static_cast<size_t>(num_rows * row_bytes)));
+  std::mt19937 gen(seed);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> v(QUANT_NUM_ELEMENTS);
+  for (int64_t r = 0; r < num_rows; ++r) {
+    for (auto& x : v) x = dist(gen);
+    quantize_row_f32(v, has_offset, h_table + r * row_bytes);
+  }
+  return h_table;
+}
+
+}  // namespace
+
+template <typename KeyType>
+static void RunFindAndDequantQuant(DataType_t dtype) {
+  const bool has_offset = (dtype == DataType_t::QUint8RowwiseF32);
+  const bool is_signed = (dtype == DataType_t::QInt8RowwiseF32);
+  const int64_t row_bytes = quant_row_bytes(has_offset);
+  constexpr int64_t num_rows = 512;
+  int8_t* h_table = make_quant_uvm_table(num_rows, has_offset, row_bytes, 0xC0FFEE);
+
+  GPUTableConfig cfg;
+  cfg.device_id = GT_TEST_DEVICE;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = dtype;
+  cfg.uvm_table = h_table;
+  GpuTable<KeyType> tab(cfg);
+  auto ctx = tab.create_execution_context(0, 0, nullptr, nullptr);
+
+  std::vector<KeyType> keys{3, 7, 42, 100, 0, 255, 511};
+  const int64_t num_keys = static_cast<int64_t>(keys.size());
+  const int64_t out_stride = QUANT_NUM_ELEMENTS * static_cast<int64_t>(sizeof(float));
+
+  auto allocator = GetDefaultAllocator();
+  void* d_keys = nullptr;
+  void* d_out = nullptr;
+  NVE_CHECK_(allocator->device_allocate(&d_keys, sizeof(KeyType) * static_cast<size_t>(num_keys)));
+  NVE_CHECK_(allocator->device_allocate(&d_out, static_cast<size_t>(out_stride * num_keys)));
+  NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), sizeof(KeyType) * static_cast<size_t>(num_keys), cudaMemcpyDefault));
+  NVE_CHECK_(cudaMemset(d_out, 0, static_cast<size_t>(out_stride * num_keys)));
+
+  {
+    auto keys_bw = std::make_shared<BufferWrapper<const void>>(
+        ctx, "keys", d_keys, sizeof(KeyType) * static_cast<size_t>(num_keys));
+    auto out_bw = std::make_shared<BufferWrapper<void>>(
+        ctx, "values", d_out, static_cast<size_t>(out_stride * num_keys));
+    // Concatenate routes find_and_pool to the dequant path (one dequantized row per key).
+    tab.find_and_pool(ctx, num_keys, std::move(keys_bw), SparseType_t::Fixed, 0 /*num_offsets*/,
+                      nullptr /*offsets*/, 1 /*fixed_hotness*/, PoolingType_t::Concatenate,
+                      nullptr /*weights*/, DataType_t::Float32 /*output*/, DataType_t::Float32 /*weight*/,
+                      out_stride, std::move(out_bw));
+  }
+  NVE_CHECK_(cudaDeviceSynchronize());
+
+  std::vector<float> out(static_cast<size_t>(num_keys * QUANT_NUM_ELEMENTS), 0.0f);
+  NVE_CHECK_(cudaMemcpy(out.data(), d_out, static_cast<size_t>(out_stride * num_keys), cudaMemcpyDefault));
+
+  for (int64_t i = 0; i < num_keys; ++i) {
+    const int8_t* row = h_table + static_cast<int64_t>(keys[static_cast<size_t>(i)]) * row_bytes;
+    for (int64_t e = 0; e < QUANT_NUM_ELEMENTS; ++e) {
+      EXPECT_NEAR(out[static_cast<size_t>(i * QUANT_NUM_ELEMENTS + e)],
+                  dequant_row_element(row, e, has_offset, is_signed), 1e-3f)
+          << "key slot " << i << " element " << e;
+    }
+  }
+
+  allocator->device_free(d_keys);
+  allocator->device_free(d_out);
+  NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+template <typename KeyType>
+static void RunFindAndCombineQuant(DataType_t dtype) {
+  const bool has_offset = (dtype == DataType_t::QUint8RowwiseF32);
+  const bool is_signed = (dtype == DataType_t::QInt8RowwiseF32);
+  const int64_t row_bytes = quant_row_bytes(has_offset);
+  constexpr int64_t num_rows = 512;
+  int8_t* h_table = make_quant_uvm_table(num_rows, has_offset, row_bytes, 0xBEEF);
+
+  GPUTableConfig cfg;
+  cfg.device_id = GT_TEST_DEVICE;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = dtype;
+  cfg.uvm_table = h_table;
+  GpuTable<KeyType> tab(cfg);
+  auto ctx = tab.create_execution_context(0, 0, nullptr, nullptr);
+
+  // Single fixed-hotness bag summing num_keys dequantized rows into one output row.
+  std::vector<KeyType> keys{1, 5, 13, 200};
+  const int64_t num_keys = static_cast<int64_t>(keys.size());
+  const int64_t out_stride = QUANT_NUM_ELEMENTS * static_cast<int64_t>(sizeof(float));
+
+  auto allocator = GetDefaultAllocator();
+  void* d_keys = nullptr;
+  void* d_out = nullptr;
+  NVE_CHECK_(allocator->device_allocate(&d_keys, sizeof(KeyType) * static_cast<size_t>(num_keys)));
+  NVE_CHECK_(allocator->device_allocate(&d_out, static_cast<size_t>(out_stride)));
+  NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), sizeof(KeyType) * static_cast<size_t>(num_keys), cudaMemcpyDefault));
+  NVE_CHECK_(cudaMemset(d_out, 0, static_cast<size_t>(out_stride)));
+
+  {
+    auto keys_bw = std::make_shared<BufferWrapper<const void>>(
+        ctx, "keys", d_keys, sizeof(KeyType) * static_cast<size_t>(num_keys));
+    auto out_bw = std::make_shared<BufferWrapper<void>>(ctx, "values", d_out, static_cast<size_t>(out_stride));
+    tab.find_and_pool(ctx, num_keys, std::move(keys_bw), SparseType_t::Fixed, 0 /*num_offsets*/,
+                      nullptr /*offsets*/, num_keys /*fixed_hotness*/, PoolingType_t::Sum,
+                      nullptr /*weights*/, DataType_t::Float32 /*output*/, DataType_t::Float32 /*weight*/,
+                      out_stride, std::move(out_bw));
+  }
+  NVE_CHECK_(cudaDeviceSynchronize());
+
+  std::vector<float> out(static_cast<size_t>(QUANT_NUM_ELEMENTS), 0.0f);
+  NVE_CHECK_(cudaMemcpy(out.data(), d_out, static_cast<size_t>(out_stride), cudaMemcpyDefault));
+
+  for (int64_t e = 0; e < QUANT_NUM_ELEMENTS; ++e) {
+    float ref = 0.0f;
+    for (int64_t i = 0; i < num_keys; ++i) {
+      const int8_t* row = h_table + static_cast<int64_t>(keys[static_cast<size_t>(i)]) * row_bytes;
+      ref += dequant_row_element(row, e, has_offset, is_signed);
+    }
+    EXPECT_NEAR(out[static_cast<size_t>(e)], ref, 1e-3f) << "element " << e;
+  }
+
+  allocator->device_free(d_keys);
+  allocator->device_free(d_out);
+  NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+TEST(GpuTableQuant, FindAndDequantQInt8F32_Int64) {
+  RunFindAndDequantQuant<int64_t>(DataType_t::QInt8RowwiseF32);
+}
+TEST(GpuTableQuant, FindAndDequantQUint8F32_Int64) {
+  RunFindAndDequantQuant<int64_t>(DataType_t::QUint8RowwiseF32);
+}
+TEST(GpuTableQuant, FindAndDequantQInt8F32_Int32) {
+  RunFindAndDequantQuant<int32_t>(DataType_t::QInt8RowwiseF32);
+}
+TEST(GpuTableQuant, FindAndCombineQInt8F32_Int64) {
+  RunFindAndCombineQuant<int64_t>(DataType_t::QInt8RowwiseF32);
+}
+TEST(GpuTableQuant, FindAndCombineQUint8F32_Int64) {
+  RunFindAndCombineQuant<int64_t>(DataType_t::QUint8RowwiseF32);
 }
 
 }  // namespace nve

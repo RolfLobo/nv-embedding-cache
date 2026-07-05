@@ -47,6 +47,9 @@ nve_status_t nve_set_error(nve_status_t status, const std::string& message);
   catch (const std::bad_alloc&) {                                   \
     return nve_set_error(NVE_ERROR_OUT_OF_MEMORY, "Out of memory"); \
   }                                                                 \
+  catch (const nve::InvalidArgumentError& e) {                      \
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, e.what());     \
+  }                                                                 \
   catch (const std::invalid_argument& e) {                          \
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, e.what());     \
   }                                                                 \

@@ -33,6 +33,7 @@
 #include <vector>
 #include <execution_context.hpp>
 #include <thread_pool.hpp>
+#include <nve_types.hpp>
 #include "mock_host_table.hpp"
 
 namespace nve {
@@ -291,6 +292,7 @@ class HierLayerTest {
     // create ref (using single mock table)
     HostTableConfig mock_cfg;
     mock_cfg.value_dtype = data_type;
+    mock_cfg.max_value_size = row_size; // MockHostTable::combine() uses this as the input row stride
     m_ref_tab = std::make_shared<MockHostTable<IndexT>>(mock_cfg, true /*functional_ref*/);
   }
   HierLayerTest(HierTestCase tc) : HierLayerTest<IndexT>(tc.gpu_cache, tc.host_cache, tc.remote_ps, tc.row_size, tc.table_size, tc.insert_heuristic, tc.data_type) {}
@@ -358,6 +360,116 @@ class HierLayerTest {
       }
     }
     NVE_CHECK_(cudaFreeHost(output));
+  }
+
+  // Lookup with pooling on the layer and compare against the mock reference (find to gather raw
+  // stored rows, then combine). All keys must already be resolvable in the tiers so the gathered
+  // bags match the reference. value_dtype is the tier storage dtype; out_dtype is the expected
+  // output type. Same-type quantized Concatenate preserves the complete raw row.
+  void LookupAndCheckPooling(std::vector<IndexT>& keys, DataType_t value_dtype, DataType_t out_dtype,
+                             PoolingType_t pooling_type, SparseType_t sparse_type, int64_t hotness,
+                             bool weighted) {
+    const int64_t num_keys = static_cast<int64_t>(keys.size());
+    if (num_keys == 0) return;
+
+    // value elements per row (a quant row carries trailing scale[+offset] metadata).
+    const bool quant = is_quant_rowwise(value_dtype);
+    const bool raw_concat =
+        pooling_type == PoolingType_t::Concatenate && out_dtype == value_dtype;
+    const int64_t value_count =
+        quant ? (m_row_size - quant_rowwise_meta_bytes(value_dtype)) : (m_row_size / dtype_size(value_dtype));
+    const int64_t out_stride = raw_concat ? m_row_size : value_count * dtype_size(out_dtype);
+
+    EmbeddingLayerBase::PoolingParams pp;
+    pp.pooling_type = pooling_type;
+    pp.sparse_type = sparse_type;
+    pp.output_type = out_dtype;
+
+    SetupCSROffsets<IndexT> offsets_setup(
+        sparse_type == SparseType_t::CSR ? num_keys : 1, std::max<int64_t>(hotness, 1));
+    int64_t output_bags = num_keys;
+    if (sparse_type == SparseType_t::CSR) {
+      pp.csr_offsets = offsets_setup.offsets_buffer;
+      pp.num_csr_offsets = static_cast<int64_t>(offsets_setup.num_offsets);
+      output_bags = static_cast<int64_t>(offsets_setup.num_offsets) - 1;
+    } else {
+      pp.fixed_hotness = hotness;
+      if (pooling_type != PoolingType_t::Concatenate) output_bags = num_keys / hotness;
+    }
+
+    std::vector<int8_t> weights;
+    if (weighted) {
+      GenerateWeights(weights, static_cast<uint64_t>(num_keys), DataType_t::Float32);
+      pp.weights = weights.data();
+      pp.weight_type = DataType_t::Float32;
+    }
+
+    int8_t* output = nullptr;
+    NVE_CHECK_(cudaMallocHost(&output, static_cast<size_t>(num_keys * out_stride)));
+    std::memset(output, 0, static_cast<size_t>(num_keys * out_stride));
+
+    std::vector<float> hitrates(static_cast<size_t>(m_layer->get_num_tables()));
+    m_layer->lookup(m_ctx, num_keys, keys.data(), output, out_stride, nullptr /*hitmask*/, &pp,
+                    hitrates.data());
+
+    // Reference: gather raw rows from the mock, then combine into the dequantized/pooled output.
+    std::vector<int8_t> find_output(static_cast<size_t>(num_keys * m_row_size), 0);
+    {
+      auto keys_bw = std::make_shared<BufferWrapper<const void>>(
+          m_ctx, "keys", keys.data(), static_cast<size_t>(num_keys) * sizeof(IndexT));
+      auto values_bw = std::make_shared<BufferWrapper<void>>(
+          m_ctx, "values", find_output.data(), static_cast<size_t>(num_keys * m_row_size));
+      m_ref_tab->find(m_ctx, num_keys, std::move(keys_bw), nullptr /*hitmask*/, m_row_size,
+                      std::move(values_bw), nullptr /*value_sizes*/);
+    }
+    std::vector<int8_t> ref_output;
+    if (raw_concat) {
+      ref_output = find_output;
+    } else {
+      ref_output.resize(static_cast<size_t>(output_bags * out_stride), 0);
+      auto* mock_ref = static_cast<MockHostTable<IndexT>*>(m_ref_tab.get());
+      mock_ref->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type,
+                        pp.csr_offsets, pp.num_csr_offsets, pp.fixed_hotness, pp.weights,
+                        pp.weight_type, ref_output.data(), out_dtype);
+    }
+    NVE_CHECK_(cudaDeviceSynchronize());
+
+    if (raw_concat) {
+      for (size_t i = 0; i < ref_output.size(); ++i) {
+        ASSERT_EQ(output[i], ref_output[i]) << "raw byte " << i;
+      }
+    } else {
+      const bool mean =
+          pooling_type == PoolingType_t::Mean || pooling_type == PoolingType_t::WeightedMean;
+      float tol;
+      if (out_dtype == DataType_t::Float16) {
+        tol = mean ? 5e-2f : 5e-2f * static_cast<float>(std::max<int64_t>(hotness, 1));
+      } else {
+        tol = quant ? 1e-3f : 1e-4f;
+      }
+      const int64_t output_elements = output_bags * value_count;
+      for (int64_t i = 0; i < output_elements; i++) {
+        ASSERT_NEAR(load_as_float(output, i, out_dtype),
+                    load_as_float(ref_output.data(), i, out_dtype), tol)
+            << "elem " << i << " value_dtype " << static_cast<int>(value_dtype) << " pooling "
+            << static_cast<int>(pooling_type);
+      }
+    }
+    NVE_CHECK_(cudaFreeHost(output));
+  }
+
+  // Minimal pooling lookup with no result checking; used to assert host-only configs reject pooling.
+  void LookupPoolingNoCheck(std::vector<IndexT>& keys, PoolingType_t pooling) {
+    const int64_t num_keys = static_cast<int64_t>(keys.size());
+    EmbeddingLayerBase::PoolingParams pp;
+    pp.pooling_type = pooling;
+    pp.sparse_type = SparseType_t::Fixed;
+    IndexT hotness = 1;
+    pp.fixed_hotness = hotness;
+    pp.output_type = DataType_t::Float32;
+    std::vector<int8_t> out(static_cast<size_t>(num_keys * m_row_size), 0);
+    m_layer->lookup(m_ctx, num_keys, keys.data(), out.data(), m_row_size, nullptr /*hitmask*/, &pp,
+                    nullptr /*hitrates*/);
   }
   void Insert(std::vector<IndexT>& keys, std::vector<uint8_t>& datavectors, TableType db_type,
               uint64_t start_key = 0, uint64_t end_key = uint64_t(-1)) {
@@ -1128,5 +1240,113 @@ INSTANTIATE_TEST_SUITE_P(
         HierTestCase({true,  HostTableType::NVHashMap, true, int64_t(1) << 10, int64_t(1) << 30, int64_t(1) << 11, true, DataType_t::Float32}),
         HierTestCase({true,  HostTableType::Abseil,    true, int64_t(1) << 10, int64_t(1) << 30, int64_t(1) << 11, true, DataType_t::Float32}),
         HierTestCase({true,  HostTableType::Phmap,     true, int64_t(1) << 10, int64_t(1) << 30, int64_t(1) << 11, true, DataType_t::Float32})));
+
+// ---------------------------------------------------------------------------
+// Pooling / rowwise-quant dequant through HierarchicalEmbeddingLayer.
+//
+// For reductions or dequantization, the layer gathers raw stored rows across tiers into a device
+// buffer, then runs the dequant/combine kernel over it (ad-hoc ECNoCache functor,
+// load_indices=false). Same-type Concatenate instead gathers directly into the final output. All
+// keys are inserted up front so every bag fully resolves; the result is checked against the mock
+// reference (find to gather, then combine). insert_tier == Host with a gpu+host config exercises the
+// host->device scatter feeding the kernel.
+// ---------------------------------------------------------------------------
+template <typename IndexT>
+static void RunHierPooling(bool gpu, HostTableType host, TableType insert_tier, int64_t value_count,
+                           DataType_t value_dtype, DataType_t out_dtype, PoolingType_t pooling,
+                           SparseType_t sparse, int64_t hotness, bool weighted) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  const bool quant = is_quant_rowwise(value_dtype);
+  const int64_t row_size =
+      quant ? (value_count + quant_rowwise_meta_bytes(value_dtype)) : (value_count * dtype_size(value_dtype));
+
+  HierLayerTest<IndexT> hlt(gpu, host, false /*remote*/, row_size, int64_t(1) << 30,
+                            false /*insert_heuristic*/, value_dtype);
+
+  const int64_t num_keys = (pooling == PoolingType_t::Concatenate) ? 64 : (hotness * 32);
+  std::vector<IndexT> keys(static_cast<size_t>(num_keys));
+  std::vector<uint8_t> data;
+  if (quant) {
+    for (int64_t i = 0; i < num_keys; i++) keys[static_cast<size_t>(i)] = static_cast<IndexT>(i + 1);
+    data.resize(static_cast<size_t>(num_keys * row_size));
+    InitTableRowsQuant(reinterpret_cast<int8_t*>(data.data()), row_size, value_count, 0,
+                       static_cast<uint64_t>(num_keys), value_dtype, 4242);
+  } else {
+    // GenerateData fills random unique keys and matching float/half row data.
+    GenerateData<IndexT>(keys, data, static_cast<size_t>(num_keys), row_size, 1, int64_t(1) << 20,
+                         value_dtype, true /*unique*/, 4242);
+  }
+
+  hlt.Insert(keys, data, insert_tier);
+  NVE_CHECK_(cudaDeviceSynchronize());
+  hlt.LookupAndCheckPooling(keys, value_dtype, out_dtype, pooling, sparse, hotness, weighted);
+}
+
+// Float32 / Float16, all pooling types, both sparse layouts. GPU-only (gather straight on device).
+TEST(HierachicalPooling, F32_Sum_Fixed)        { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Sum,          SparseType_t::Fixed, 8, false); }
+TEST(HierachicalPooling, F32_Mean_CSR)         { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Mean,         SparseType_t::CSR,   8, false); }
+TEST(HierachicalPooling, F32_WeightedSum_Fixed){ RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::WeightedSum,  SparseType_t::Fixed, 8, true);  }
+TEST(HierachicalPooling, F32_Concatenate)      { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Concatenate,  SparseType_t::Fixed, 1, false); }
+TEST(HierachicalPooling, F16_Sum_Fixed)        { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float16, DataType_t::Float16, PoolingType_t::Sum,          SparseType_t::Fixed, 8, false); }
+TEST(HierachicalPooling, F16_WeightedMean_CSR) { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::Float16, DataType_t::Float16, PoolingType_t::WeightedMean, SparseType_t::CSR,   8, true);  }
+
+// Rowwise-quant FP16 and FP32 storage -> dequantized FP32/FP16 output.
+TEST(HierachicalPooling, QInt8F16_Sum_Fixed)   { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 62, DataType_t::QInt8RowwiseF16,  DataType_t::Float16, PoolingType_t::Sum,         SparseType_t::Fixed, 8, false); }
+TEST(HierachicalPooling, QUint8F16_Mean_CSR)   { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::QUint8RowwiseF16, DataType_t::Float16, PoolingType_t::Mean,        SparseType_t::CSR,   8, false); }
+TEST(HierachicalPooling, QInt8F16_Concatenate) { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 62, DataType_t::QInt8RowwiseF16,  DataType_t::Float16, PoolingType_t::Concatenate, SparseType_t::Fixed, 1, false); }
+TEST(HierachicalPooling, QUint8F16_Concatenate){ RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::QUint8RowwiseF16, DataType_t::Float16, PoolingType_t::Concatenate, SparseType_t::Fixed, 1, false); }
+TEST(HierachicalPooling, QInt8F32_WeightedSum) { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::QInt8RowwiseF32,  DataType_t::Float32, PoolingType_t::WeightedSum, SparseType_t::Fixed, 8, true);  }
+TEST(HierachicalPooling, QUint8F32_Sum_CSR)    { RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::QUint8RowwiseF32, DataType_t::Float32, PoolingType_t::Sum,         SparseType_t::CSR,   8, false); }
+TEST(HierachicalPooling, QUint8F32_Concatenate){ RunHierPooling<int64_t>(true, HostTableType::None, TableType::Device, 64, DataType_t::QUint8RowwiseF32, DataType_t::Float32, PoolingType_t::Concatenate, SparseType_t::Fixed, 1, false); }
+
+// gpu+host: keys resolve in the host tier, so the gathered rows are scattered down to device before
+// the kernel runs (exercises the cross-tier gather path).
+TEST(HierachicalPooling, F32_Sum_GpuHost_HostHit)   { RunHierPooling<int64_t>(true, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Sum, SparseType_t::Fixed, 8, false); }
+TEST(HierachicalPooling, QUint8F16_GpuHost_HostHit) { RunHierPooling<int64_t>(true, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::QUint8RowwiseF16, DataType_t::Float16, PoolingType_t::Sum, SparseType_t::Fixed, 8, false); }
+
+// A pooling lookup still auto-inserts the gathered raw rows into faster tiers (gather_bw holds one
+// raw stored row per key). Populate only the host tier, pool-lookup (which should auto-insert into
+// the GPU tier), then drop the host tier: the keys must now resolve from the GPU tier alone.
+TEST(HierachicalPooling, AutoInsertFromGather) {
+  cudaGetLastError();
+  const int64_t value_count = 64;
+  const int64_t row_size = value_count * dtype_size(DataType_t::Float32);
+  HierLayerTest<int64_t> hlt(true /*gpu*/, HostTableType::NVHashMap, false /*remote*/, row_size,
+                             int64_t(1) << 30, true /*insert_heuristic*/, DataType_t::Float32);
+  const int64_t hotness = 8;
+  const int64_t num_keys = 4096;  // > min_insert_size_gpu (1<<10) so GPU auto-insert triggers
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> data;
+  GenerateData<int64_t>(keys, data, static_cast<size_t>(num_keys), row_size, 1, int64_t(1) << 20,
+                        DataType_t::Float32, true /*unique*/, 4242);
+
+  // Populate only the host tier (+ ref); the GPU tier starts empty.
+  hlt.Insert(keys, data, TableType::Host);
+  NVE_CHECK_(cudaDeviceSynchronize());
+  // Pooling lookup: resolves from host, gathers raw rows, and auto-inserts them into the GPU tier.
+  hlt.LookupAndCheckPooling(keys, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Sum,
+                            SparseType_t::Fixed, hotness, false);
+  hlt.Wait();  // wait for the async auto-insert to finish
+
+  // Drop the host tier; the keys must now be served from the GPU tier that auto-insert populated.
+  hlt.Clear(TableType::Host);
+  NVE_CHECK_(cudaDeviceSynchronize());
+  hlt.LookupAndCheckPooling(keys, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Sum,
+                            SparseType_t::Fixed, hotness, false);
+}
+
+// Host-only configs (no GPU tier) pool/dequant on the CPU path (pool_gathered_host), reusing the
+// host layer's kernels. Verify correctness across pooling modes, sparse layouts, weighting, and
+// quantized dequant -- mirroring the GPU-tier cases above but with gpu=false.
+TEST(HierachicalPooling, HostOnly_F32_Sum_Fixed)       { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Sum,          SparseType_t::Fixed, 8, false); }
+TEST(HierachicalPooling, HostOnly_F32_Mean_CSR)        { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Mean,         SparseType_t::CSR,   8, false); }
+TEST(HierachicalPooling, HostOnly_F32_WeightedSum)     { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::WeightedSum,  SparseType_t::Fixed, 8, true);  }
+TEST(HierachicalPooling, HostOnly_F32_Concatenate)     { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::Float32, DataType_t::Float32, PoolingType_t::Concatenate,  SparseType_t::Fixed, 1, false); }
+TEST(HierachicalPooling, HostOnly_QUint8F16_Mean_CSR)  { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::QUint8RowwiseF16, DataType_t::Float16, PoolingType_t::Mean,        SparseType_t::CSR,   8, false); }
+TEST(HierachicalPooling, HostOnly_QInt8F32_WeightedSum){ RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::QInt8RowwiseF32,  DataType_t::Float32, PoolingType_t::WeightedSum, SparseType_t::Fixed, 8, true);  }
+TEST(HierachicalPooling, HostOnly_QInt8F32_RawConcatenate) { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::QInt8RowwiseF32, DataType_t::QInt8RowwiseF32, PoolingType_t::Concatenate, SparseType_t::Fixed, 1, false); }
+// Host-only dequant honors cross-precision output (a fp32-scale quant type -> fp16 output), which
+// the GPU dequant kernels cannot do -- the host CPU path has no such restriction.
+TEST(HierachicalPooling, HostOnly_QInt8F32_outF16_Sum) { RunHierPooling<int64_t>(false, HostTableType::NVHashMap, TableType::Host, 64, DataType_t::QInt8RowwiseF32,  DataType_t::Float16, PoolingType_t::Sum,        SparseType_t::Fixed, 8, false); }
 
 }  // namespace nve

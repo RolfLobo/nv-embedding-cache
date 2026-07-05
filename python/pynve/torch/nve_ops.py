@@ -28,6 +28,25 @@ def _stream_handle(device: torch.device) -> int:
         return 0
     return torch.cuda.current_stream(device).cuda_stream
 
+
+def pooling_type_from_mode(mode: str, weighted: bool) -> "nve.PoolingType_t":
+    """Convert a torch.nn.EmbeddingBag-style pooling mode to an nve.PoolingType_t.
+
+    Only the reducing modes are mapped here: 'sum' and 'mean' (and their weighted
+    variants when `weighted` is True). 'concat' is handled by the caller (it is not
+    a pooled reduction and routes through the plain embedding op), so it is rejected
+    here along with every other value. In particular 'max' — which torch supports
+    but NVE does not (there is no PoolingType_t.Max / kernel support) — raises rather
+    than silently degrading to mean.
+    """
+    if mode == 'sum':
+        return nve.PoolingType_t.WeightedSum if weighted else nve.PoolingType_t.Sum
+    if mode == 'mean':
+        return nve.PoolingType_t.WeightedMean if weighted else nve.PoolingType_t.Mean
+    raise ValueError(
+        f"Unsupported pooling mode {mode!r}; expected 'sum' or 'mean' "
+        "('concat' is handled separately). 'max' pooling is not implemented.")
+
 # ---------------------------------------------------------------------------
 # torch.export-compatible ops
 #
@@ -250,14 +269,14 @@ class CacheEmbeddingBagOp(torch.autograd.Function):
         if per_sample_weights is not None:
             w_type = nve.DataType_t.Float32 if per_sample_weights.dtype == torch.float32 \
                      else nve.DataType_t.Float16
-            pool = nve.PoolingType_t.WeightedSum if mode == 'sum' else nve.PoolingType_t.WeightedMean
+            pool = pooling_type_from_mode(mode, weighted=True)
             nve_op.lookup_with_pooling(keys.numel(), keys.data_ptr(), result.data_ptr(),
-                                       pool, offsets.numel() - 1, offsets.data_ptr(),
+                                       pool, offsets.numel(), offsets.data_ptr(),
                                        w_type, per_sample_weights.data_ptr(), stream)
         else:
-            pool = nve.PoolingType_t.Sum if mode == 'sum' else nve.PoolingType_t.Mean
+            pool = pooling_type_from_mode(mode, weighted=False)
             nve_op.lookup_with_pooling(keys.numel(), keys.data_ptr(), result.data_ptr(),
-                                       pool, offsets.numel() - 1, offsets.data_ptr(),
+                                       pool, offsets.numel(), offsets.data_ptr(),
                                        nve.DataType_t.Float32, 0, stream)
         return result
 
@@ -279,14 +298,14 @@ class CacheEmbeddingBagOp(torch.autograd.Function):
         if per_sample_weights is not None:
             w_type = nve.DataType_t.Float32 if per_sample_weights.dtype == torch.float32 \
                      else nve.DataType_t.Float16
-            pool = nve.PoolingType_t.WeightedSum if ctx.mode == 'sum' else nve.PoolingType_t.WeightedMean
+            pool = pooling_type_from_mode(ctx.mode, weighted=True)
             num_unique = nve_op.pooling_backprop(
                 num_keys, keys.data_ptr(), grad_output.data_ptr(),
                 unique_keys.data_ptr(), result.data_ptr(),
                 pool, offsets.numel() - 1, offsets.data_ptr(),
                 w_type, per_sample_weights.data_ptr(), stream)
         else:
-            pool = nve.PoolingType_t.Sum if ctx.mode == 'sum' else nve.PoolingType_t.Mean
+            pool = pooling_type_from_mode(ctx.mode, weighted=False)
             num_unique = nve_op.pooling_backprop(
                 num_keys, keys.data_ptr(), grad_output.data_ptr(),
                 unique_keys.data_ptr(), result.data_ptr(),

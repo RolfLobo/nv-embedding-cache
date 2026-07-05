@@ -119,6 +119,26 @@
 #endif
 #define NVE_THROW_NOT_IMPLEMENTED_() NVE_THROW_("Not implemented yet!")
 
+// Variants of NVE_CHECK_/NVE_THROW_ for validating caller-supplied arguments. They throw
+// nve::InvalidArgumentError (still an nve::Exception) so API boundaries such as the C API can
+// classify argument errors separately from internal runtime failures.
+#ifdef NVE_CHECK_ARG_
+#error NVE_CHECK_ARG_ was already defined.
+#endif
+#define NVE_CHECK_ARG_(_expr_, ...)                                       \
+  do {                                                                    \
+    if (!(_expr_)) {                                                      \
+      throw nve::InvalidArgumentError(__FILE__, __LINE__, #_expr_,        \
+                                      nve::to_string(__VA_ARGS__));       \
+    }                                                                     \
+  } while (false)
+
+#ifdef NVE_THROW_ARG_
+#error NVE_THROW_ARG_ was already defined.
+#endif
+#define NVE_THROW_ARG_(...) \
+  throw nve::InvalidArgumentError(__FILE__, __LINE__, "throw", nve::to_string(__VA_ARGS__))
+
 namespace nve {
 
 /**
@@ -283,6 +303,28 @@ class RuntimeError<bool> : public Exception {
   }
 
   virtual std::string to_string() const override;
+};
+
+/**
+ * Thrown when a caller-supplied argument is invalid. Don't use directly; use the
+ * `NVE_CHECK_ARG_` and `NVE_THROW_ARG_` macros instead.
+ */
+class InvalidArgumentError : public Exception {
+ public:
+  using base_type = Exception;
+
+  InvalidArgumentError() = delete;
+
+  inline InvalidArgumentError(const char file[], const int line, const char expr[],
+                              const std::string& hint) noexcept
+      : base_type(file, line, expr, hint) {}
+
+  inline InvalidArgumentError(const InvalidArgumentError& that) noexcept : base_type(that) {}
+
+  inline InvalidArgumentError& operator=(const InvalidArgumentError& that) noexcept {
+    base_type::operator=(that);
+    return *this;
+  }
 };
 
 static std::random_device random_device;

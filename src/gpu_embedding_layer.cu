@@ -28,12 +28,62 @@
 #pragma GCC diagnostic pop
 
 #include <default_allocator.hpp>
+#include "cuda_ops/find_and_dequant.cuh"
+#include "cuda_ops/pool_gathered.cuh"
 #include "cuda_ops/update_accumulate.cuh"
+#include <ecache/ec_no_cache.cuh>
 #include <ecache/embed_cache.h> // DefaultECEvent
 #include "cuda_ops/cuda_common.h"
 #include <buffer_wrapper.hpp>
 
 namespace nve {
+
+namespace {
+
+int64_t gpu_quant_value_count(const GPUEmbeddingLayerConfig& config) {
+  const int64_t metadata_bytes = quant_rowwise_meta_bytes(config.value_dtype);
+  NVE_CHECK_(config.embedding_width_in_bytes > metadata_bytes,
+             "Quantized GPU embedding rows must contain values in addition to metadata");
+  return (config.embedding_width_in_bytes - metadata_bytes) / dtype_size(config.value_dtype);
+}
+
+int64_t gpu_quant_output_stride(const GPUEmbeddingLayerConfig& config) {
+  return gpu_quant_value_count(config) *
+         dtype_size(quant_rowwise_output_dtype(config.value_dtype));
+}
+
+void validate_quant_pool_types_and_stride(
+    const GPUEmbeddingLayerConfig& config,
+    const EmbeddingLayerBase::PoolingParams& pool_params,
+    int64_t output_stride) {
+  const DataType_t required_output_type = quant_rowwise_output_dtype(config.value_dtype);
+  NVE_CHECK_ARG_(pool_params.output_type == required_output_type,
+                 "Quantized GPU embedding output type must match the quantization metadata precision");
+  NVE_CHECK_ARG_(output_stride == gpu_quant_output_stride(config),
+                 "Invalid dequantized output stride for quantized GPU embedding table");
+
+  if (pool_params.pooling_type == PoolingType_t::Concatenate) {
+    return;
+  }
+
+  switch (pool_params.pooling_type) {
+    case PoolingType_t::Sum:
+    case PoolingType_t::Mean:
+    case PoolingType_t::WeightedSum:
+    case PoolingType_t::WeightedMean: break;
+    default:
+      NVE_THROW_ARG_("Unsupported pooling type ",
+                     static_cast<uint32_t>(pool_params.pooling_type));
+  }
+
+  if (is_weighted_pooling(pool_params.pooling_type)) {
+    NVE_CHECK_ARG_(pool_params.weight_type == DataType_t::Float32 ||
+                       pool_params.weight_type == DataType_t::Float16,
+                   "Quantized GPU embedding weights must be Float32 or Float16");
+  }
+}
+
+}  // namespace
 
 class GPUEmbeddingTableExecutionContext: public ExecutionContext {
  public:
@@ -92,13 +142,14 @@ void to_json(nlohmann::json& json, const GPUEmbeddingLayerConfig& conf) {
   NVE_WRITE_JSON_FIELD_(value_dtype);
 }
 
-// offset type is currently int64_t as the offsets are coming from PoolingType_t struct, which is not templated
-// fp16 math is currently off, will be aded to pooling params later
+// cuEmbed's index and CSR-offset types follow the layer's KeyType. Quantized pooling bypasses this
+// adapter after its raw gather and uses the KeyType-typed shared CUDA pooling path instead. fp16
+// math is currently off, and will be added to pooling params later.
 template <typename KeyType>
 void call_cuembed_forward(void* embedding_table,
                           const int embed_width_in_bytes,
                           const void* indices,
-                          const int64_t* offsets,
+                          const KeyType* offsets,
                           const void* weights,
                           const int batch_size,
                           const int num_hots,
@@ -108,7 +159,7 @@ void call_cuembed_forward(void* embedding_table,
                           DataType_t value_dtype) {
   switch (value_dtype) {
       case DataType_t::Float32:
-          cuembed::EmbeddingForward<float, float, KeyType, int64_t, false>(
+          cuembed::EmbeddingForward<float, float, KeyType, KeyType, false>(
               reinterpret_cast<const float*>(embedding_table),
               embed_width_in_bytes / sizeof(float),
               reinterpret_cast<const KeyType*>(indices), offsets,
@@ -118,7 +169,7 @@ void call_cuembed_forward(void* embedding_table,
               reinterpret_cast<float*>(ret), stream);
           break;
       case DataType_t::Float16:
-          cuembed::EmbeddingForward<__half, __half, KeyType, int64_t, false>(
+          cuembed::EmbeddingForward<__half, __half, KeyType, KeyType, false>(
               reinterpret_cast<const __half*>(embedding_table),
               embed_width_in_bytes / sizeof(__half),
               reinterpret_cast<const KeyType*>(indices), offsets,
@@ -134,14 +185,29 @@ void call_cuembed_forward(void* embedding_table,
 }
 
 template <typename KeyType>
-int64_t cuembed_find(context_ptr_t& ctx, const GPUEmbeddingLayerConfig& config,
+int64_t gpu_find_raw(context_ptr_t& ctx, const GPUEmbeddingLayerConfig& config,
                      int64_t num_keys, const void* keys, void* values) {
   NVE_CHECK_(ctx != nullptr, "Invalid execution context");
-  
   auto lookup_stream{ctx->get_lookup_stream()};
 
   NVE_CHECK_(num_keys <= INT_MAX, "Number of keys exceeding max int value is not supported");
   NVE_CHECK_(config.embedding_width_in_bytes <= INT_MAX, "Embedding width exceeding max int value is not supported");
+
+  if (is_quant_rowwise(config.value_dtype)) {
+    // Reuse the Float16 identity specialization as a byte-preserving raw-row gather. Quantized GPU
+    // rows are required to have an even byte width, so treating the complete row (including scale
+    // and offset metadata) as half elements copies every bit without interpreting the payload.
+    typename ECNoCache<KeyType>::CacheData cache{};
+    cache.row_size_in_bytes = static_cast<uint32_t>(config.embedding_width_in_bytes);
+    const cudaError_t status = call_find_and_dequant<KeyType, typename ECNoCache<KeyType>::CacheData>(
+        static_cast<const KeyType*>(keys), static_cast<size_t>(num_keys),
+        static_cast<int8_t*>(values), static_cast<const int8_t*>(config.embedding_table),
+        DataType_t::Float16,
+        static_cast<uint32_t>(config.embedding_width_in_bytes / sizeof(__half)), cache,
+        lookup_stream, static_cast<size_t>(config.embedding_width_in_bytes), true /*load_indices*/);
+    NVE_CHECK_(status, "Raw quantized GPU lookup failed");
+    return -1;
+  }
 
   // need to optimize hotness (inner loop) value
   call_cuembed_forward<KeyType>(
@@ -159,11 +225,11 @@ template <typename KeyType>
 void cuembed_find_and_combine(context_ptr_t& ctx, const GPUEmbeddingLayerConfig& config,
                               int64_t num_keys, const void* keys,
                               SparseType_t hot_type, int64_t num_offsets,
-                              const int64_t* offsets, int64_t fixed_hotness,
+                              const KeyType* offsets, int64_t fixed_hotness,
                               PoolingType_t pooling_type, const void* weights,
                               void* values) {
 
-  if ((pooling_type == PoolingType_t::WeightedSum) || (pooling_type == PoolingType_t::WeightedMean)) {
+  if (is_weighted_pooling(pooling_type)) {
     NVE_CHECK_(weights != nullptr, "Weights should be provided for weighted sum/mean pooling");
   }
   NVE_CHECK_(ctx != nullptr, "Invalid execution context");
@@ -223,9 +289,6 @@ void cuembed_find_and_combine(context_ptr_t& ctx, const GPUEmbeddingLayerConfig&
           0, mode, values, lookup_stream, config.value_dtype);
       break;
     }
-    case SparseType_t::COO:
-      NVE_THROW_NOT_IMPLEMENTED_();
-      break;
     default:
       NVE_LOG_ERROR_("Invalid Hotness type");
       throw std::invalid_argument(std::string("Invalid Hotness type"));
@@ -236,9 +299,19 @@ template <typename KeyType>
 GPUEmbeddingLayer<KeyType>::GPUEmbeddingLayer(const GPUEmbeddingLayerConfig& config,
                                               allocator_ptr_t allocator)
   : config_(config) {
+    NVE_CHECK_(static_cast<bool>(config_.embedding_table), "Invalid embedding table");
+    NVE_CHECK_(config_.value_dtype == DataType_t::Float32 ||
+                   config_.value_dtype == DataType_t::Float16 ||
+                   is_quant_rowwise(config_.value_dtype),
+               "Unsupported GPU embedding table value type");
+    if (is_quant_rowwise(config_.value_dtype)) {
+      NVE_CHECK_(config_.embedding_width_in_bytes % sizeof(__half) == 0,
+                 "Quantized GPU embedding row width must be even");
+      (void)gpu_quant_value_count(config_);
+    }
+
     allocator_ = allocator ? allocator : GetDefaultAllocator();
     NVE_CHECK_(allocator_ != nullptr, "Failed to get default allocator");
-    NVE_CHECK_(static_cast<bool>(config_.embedding_table), "Invalid embedding table");
     
     // Initialize context registry
     contexts_ = std::make_shared<ContextRegistry>();
@@ -264,48 +337,116 @@ void GPUEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_ke
                     const PoolingParams* pool_params, float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(config_.device_id);
-  NVE_CHECK_(num_keys >= 0, "Invalid num_keys");
-  NVE_CHECK_(keys != nullptr, "Invalid keys buffer");
-  NVE_CHECK_(output != nullptr, "Invalid output buffer");
-  NVE_CHECK_(hitmask == nullptr, "Hitmask is not supported for GPU embedding layer");
-  NVE_CHECK_(output_stride == config_.embedding_width_in_bytes,
-             "Output stride must be the same as embedding width");
-  NVE_CHECK_(ctx != nullptr, "Invalid layer context");
+  NVE_CHECK_ARG_(num_keys >= 0, "Invalid num_keys");
+  NVE_CHECK_ARG_(keys != nullptr, "Invalid keys buffer");
+  NVE_CHECK_ARG_(output != nullptr, "Invalid output buffer");
+  NVE_CHECK_ARG_(hitmask == nullptr, "Hitmask is not supported for GPU embedding layer");
+  NVE_CHECK_ARG_(ctx != nullptr, "Invalid layer context");
+  NVE_CHECK_ARG_(num_keys <= INT_MAX, "Number of keys exceeding max int value is not supported");
+  NVE_CHECK_(config_.embedding_width_in_bytes <= INT_MAX,
+             "Embedding width exceeding max int value is not supported");
+
+  const bool quantized = is_quant_rowwise(config_.value_dtype);
+  const bool concatenate =
+      pool_params && pool_params->pooling_type == PoolingType_t::Concatenate;
+  const bool raw_concatenate = is_pooling_raw_concat(pool_params, config_.value_dtype);
+  if (pool_params) {
+    validate_pool_params(*pool_params);
+    if (raw_concatenate) {
+      NVE_CHECK_ARG_(output_stride == config_.embedding_width_in_bytes,
+                 "Raw Concatenate output stride must be the same as the stored row width");
+    } else if (quantized) {
+      validate_quant_pool_types_and_stride(config_, *pool_params, output_stride);
+    } else {
+      NVE_CHECK_ARG_(output_stride == config_.embedding_width_in_bytes,
+                     "Output stride must be the same as embedding width");
+      NVE_CHECK_ARG_(pool_params->output_type == config_.value_dtype,
+                     "GPU embedding layer requires pooled output type to match the table value type");
+      if (!concatenate && pool_params->weights != nullptr) {
+        NVE_CHECK_ARG_(pool_params->weight_type == config_.value_dtype,
+                       "GPU embedding layer requires weight type to match the table value type");
+      }
+    }
+  } else {
+    NVE_CHECK_ARG_(output_stride == config_.embedding_width_in_bytes,
+                   "Output stride must be the same as embedding width");
+  }
+
   const cudaStream_t lookup_stream = ctx->get_lookup_stream();
 
   // Make sure keys are device accessible
-  const auto keys_buffer_size = sizeof(KeyType) * num_keys;
-  const auto output_buffer_size = output_stride * num_keys;
+  const auto keys_buffer_size = static_cast<size_t>(sizeof(KeyType)) * num_keys;
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
-  auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
   const void* d_keys = keys_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
-  void* d_output = output_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream);
+
+  if (quantized) {
+    if (pool_params && !raw_concatenate) {
+      const auto gather_buffer_size =
+          static_cast<size_t>(num_keys) * static_cast<size_t>(config_.embedding_width_in_bytes);
+      auto* gather_dev = static_cast<int8_t*>(
+          ctx->get_buffer("gpu_pool_gather", gather_buffer_size, false /*host_alloc*/));
+      NVE_CHECK_(gather_dev != nullptr, "Failed to allocate quantized GPU pooling gather buffer");
+
+      std::lock_guard lock(kernel_launch_mutex_);
+      NVE_CHECK_(cudaStreamWaitEvent(lookup_stream, modify_in_progress_));
+      gpu_find_raw<KeyType>(ctx, config_, num_keys, d_keys, gather_dev);
+      pool_gathered_device<KeyType>(ctx, *pool_params, config_.value_dtype, gather_dev,
+                                    config_.embedding_width_in_bytes, num_keys, output,
+                                    output_stride, lookup_stream);
+    } else {
+      // Plain lookup and same-type Concatenate both return the complete stored row, including
+      // rowwise-quantization metadata.
+      const auto output_buffer_size =
+          static_cast<size_t>(num_keys) * static_cast<size_t>(output_stride);
+      auto output_bw =
+          std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+      void* d_output =
+          output_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream);
+
+      std::lock_guard lock(kernel_launch_mutex_);
+      NVE_CHECK_(cudaStreamWaitEvent(lookup_stream, modify_in_progress_));
+      gpu_find_raw<KeyType>(ctx, config_, num_keys, d_keys, d_output);
+      if (output != d_output) {
+        NVE_CHECK_(cudaMemcpyAsync(output, d_output, output_buffer_size, cudaMemcpyDefault,
+                                   lookup_stream));
+      }
+    }
+
+    if (hitrates) {
+      hitrates[0] = 1.0f;
+    }
+    return;
+  }
+
+  const int64_t output_rows = get_lookup_output_rows(num_keys, pool_params);
+  const auto output_buffer_size =
+      static_cast<size_t>(output_rows) * static_cast<size_t>(output_stride);
+  auto output_bw =
+      std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+  void* d_output =
+      output_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream);
 
   // Lookup 
-  if (pool_params) {
-    NVE_CHECK_(pool_params->key_indices != nullptr, "Invalid offsets buffer");
-    const int64_t* d_offsets = nullptr;
-    int64_t hotness = 1;
+  if (pool_params && !concatenate) {
+    const KeyType* d_offsets = nullptr;
+    int64_t hotness = pool_params->fixed_hotness;
+    int64_t num_offsets = 0;
+    std::shared_ptr<BufferWrapper<const KeyType>> offsets_bw;
 
-    const auto offsets_buffer_size = (size_t)pool_params->num_key_indices * sizeof(KeyType);
-    auto offsets_bw = std::make_shared<BufferWrapper<const KeyType>>(ctx, "offsets", static_cast<const KeyType*>(pool_params->key_indices), offsets_buffer_size);
-
-    if (pool_params->num_key_indices != 1) {
-      NVE_CHECK_(pool_params->key_indices != nullptr, "Invalid pooling indices");
-      // cuembed_find_and_combine consumes the offsets as int64_t, so this access is only
-      // type-safe when the layer's key type (and thus the offsets) is int64_t.
-      NVE_CHECK_((std::is_same_v<KeyType, int64_t>),
-                 "CSR/COO pooling on the GPU layer requires int64 key_indices");
-      d_offsets = reinterpret_cast<const int64_t*>(offsets_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream));
-    } else {
-      // This assumes key_indices is in host memory for fixed pooling
-      hotness = offsets_bw->access_buffer(cudaMemoryTypeHost, true /*copy_content*/, lookup_stream)[0];
+    if (pool_params->sparse_type == SparseType_t::CSR) {
+      num_offsets = pool_params->num_csr_offsets - 1;
+      const auto offsets_buffer_size =
+          static_cast<size_t>(pool_params->num_csr_offsets) * sizeof(KeyType);
+      offsets_bw = std::make_shared<BufferWrapper<const KeyType>>(
+          ctx, "offsets", static_cast<const KeyType*>(pool_params->csr_offsets),
+          offsets_buffer_size);
+      d_offsets = offsets_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
     }
 
     const void* d_weights = nullptr;
-    if (pool_params->sparse_weights != nullptr) {
+    if (pool_params->weights != nullptr) {
       const auto weights_buffer_size = dtype_size(pool_params->weight_type) * num_keys;
-      auto weights_bw = std::make_shared<BufferWrapper<const void>>(ctx, "weights", pool_params->sparse_weights, weights_buffer_size);
+      auto weights_bw = std::make_shared<BufferWrapper<const void>>(ctx, "weights", pool_params->weights, weights_buffer_size);
       d_weights = weights_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
 
     }
@@ -317,16 +458,18 @@ void GPUEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_ke
 
     cuembed_find_and_combine<KeyType>(ctx, config_,
                                       num_keys, d_keys, pool_params->sparse_type,
-                                      pool_params->num_key_indices - 1, d_offsets,
+                                      num_offsets, d_offsets,
                                       hotness,
                                       pool_params->pooling_type, d_weights,
                                       d_output);
   } else {
+    // Plain lookup and Concatenate both emit one stored row per key. Concatenate's sparse-layout
+    // and weight fields are intentionally ignored; output_type compatibility was checked above.
     // Wait until no other lookup/modify is queued
     std::lock_guard lock(kernel_launch_mutex_);
 
     NVE_CHECK_(cudaStreamWaitEvent(lookup_stream, modify_in_progress_));
-    cuembed_find<KeyType>(ctx, config_, num_keys, d_keys, d_output);
+    gpu_find_raw<KeyType>(ctx, config_, num_keys, d_keys, d_output);
   }
 
   if (output != d_output) {
@@ -403,6 +546,8 @@ void GPUEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const int64_t nu
   NVE_CHECK_(num_keys >= 0, "Invalid num_keys");
   NVE_CHECK_(keys != nullptr, "Invalid keys buffer");
   NVE_CHECK_(values != nullptr, "Invalid values buffer");
+  NVE_CHECK_(!is_quant_rowwise(config_.value_dtype),
+             "Accumulate is not supported for quantized GPU embedding tables");
   NVE_CHECK_(value_size == config_.embedding_width_in_bytes, "Invalid value size");
   NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
 

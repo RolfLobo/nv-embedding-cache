@@ -39,7 +39,7 @@ Three modes are supported via ``--mode``:
   entirely in GPU memory (no host cache, no remote PS). Output layout
   matches the linearuvm mode (model.pt2 + metadata.json + weights/).
 
-All modes are loadable by the same ``nve_inference`` C++ binary.
+All modes are loadable by the ``nve_inference`` C++ binary.
 """
 
 import argparse
@@ -171,6 +171,12 @@ _MODE_DEFAULT_SUBDIR = {
     "gpu":          "output_gpu",
 }
 
+_MODE_DEVICE = {
+    "linearuvm":    torch.device("cuda"),
+    "hierarchical": torch.device("cuda"),
+    "gpu":          torch.device("cuda"),
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -197,7 +203,7 @@ def main():
     builder = _MODE_BUILDERS[args.mode]
     model, extra_export_kwargs = builder(output_dir)
 
-    keys = torch.tensor([0, 1, 5, 10], device=DEVICE, dtype=torch.int64)
+    keys = torch.tensor([0, 1, 5, 10], device=_MODE_DEVICE[args.mode], dtype=torch.int64)
     with torch.no_grad():
         out = model(keys)
     print(f"Forward output for keys [0,1,5,10]:\n{out}")

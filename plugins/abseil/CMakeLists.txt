@@ -29,6 +29,6 @@ target_link_libraries(nve-plugin-abseil PUBLIC
   nve-common
 )
 
-if(NOT DEFINED NVE_DISABLE_TESTS_AND_SAMPLES)
+if(NOT NVE_DISABLE_TESTS_AND_SAMPLES)
   add_subdirectory(tests)
 endif()

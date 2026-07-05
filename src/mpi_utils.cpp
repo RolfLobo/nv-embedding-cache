@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#ifndef NVE_DISABLE_MPI
+
 #include <vector>
 #include <memory>
 #include <mpi_utils.hpp>
@@ -94,10 +96,9 @@ MPIEnv::MPIEnv(const std::vector<size_t> ranks, const std::vector<int> devices) 
     _mpi_ = std::make_unique<MPIInit>();
   }
 
-  // Init cuda
+  // Init cuda. 
   int val = 0;
-  NVE_CHECK_(cuInit(0));
-  NVE_CHECK_(cuDeviceGetCount(&val));
+  NVE_CHECK_(cudaGetDeviceCount(&val));
   device_count_ = static_cast<size_t>(val);
   MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &val));
   world_size_ = static_cast<size_t>(val);
@@ -145,18 +146,13 @@ MPIEnv::MPIEnv(const std::vector<size_t> ranks, const std::vector<int> devices) 
   }
 
   if (local_device_ >= 0) {
-    CUdevice dev;
-    int busId, deviceId, domainId;
-    NVE_CHECK_(cuDeviceGet(&dev, static_cast<int>(local_device_)));
-    NVE_CHECK_(cuDeviceGetName(tmp_str, STRING_LENGTH, dev));
-    NVE_CHECK_(cuDeviceGetAttribute(&domainId, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, dev));
-    NVE_CHECK_(cuDeviceGetAttribute(&busId, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, dev));
-    NVE_CHECK_(cuDeviceGetAttribute(&deviceId, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, dev));
+    cudaDeviceProp props;
+    NVE_CHECK_(cudaGetDeviceProperties(&props, static_cast<int>(local_device_)));
     std::stringstream oss;
-    oss << tmp_str << " (" <<
-      std::hex << std::setw(8) << std::setfill('0') << domainId << ":" <<
-      std::hex << std::setw(2) << std::setfill('0') << busId << ":" <<
-      std::hex << std::setw(2) << std::setfill('0') << deviceId << ")" <<
+    oss << props.name << " (" <<
+      std::hex << std::setw(8) << std::setfill('0') << props.pciDomainID << ":" <<
+      std::hex << std::setw(2) << std::setfill('0') << props.pciBusID << ":" <<
+      std::hex << std::setw(2) << std::setfill('0') << props.pciDeviceID << ")" <<
       std::dec << std::setfill(' ') << std::setw(0);  // reset formatting
     device_name_ = oss.str();
   } else {
@@ -197,3 +193,5 @@ std::ostream& operator<<(std::ostream& os, const MPIEnv& env) {
 }
 
 } // namespace nve
+
+#endif  // NVE_DISABLE_MPI

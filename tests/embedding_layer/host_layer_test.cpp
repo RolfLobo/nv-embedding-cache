@@ -22,7 +22,6 @@
 
 #include <gtest/gtest.h>
 
-#include "cpu_ops/cpu_pooling.h"
 #include "include/buffer_wrapper.hpp"
 #include "include/common.hpp"
 #include "include/host_embedding_layer.hpp"
@@ -333,8 +332,7 @@ std::vector<float> reference_pool(HostLayerTest<KeyType>* t, const std::vector<K
                                   const std::vector<float>& weights) {
   const size_t elements = t->data_elements();
   const size_t num_bags = bag_offsets.size() - 1;
-  const bool weighted =
-      (pooling == PoolingType_t::WeightedSum) || (pooling == PoolingType_t::WeightedMean);
+  const bool weighted = is_weighted_pooling(pooling);
   const bool mean = (pooling == PoolingType_t::Mean) || (pooling == PoolingType_t::WeightedMean);
   std::vector<float> expected(num_bags * elements, 0.0f);
   for (size_t b = 0; b < num_bags; b++) {
@@ -391,15 +389,14 @@ void test_pooling_fixed(HostLayerTest<KeyType>* t) {
 
   for (const auto pooling : {PoolingType_t::Sum, PoolingType_t::Mean, PoolingType_t::WeightedSum,
                              PoolingType_t::WeightedMean}) {
-    const bool weighted =
-        (pooling == PoolingType_t::WeightedSum) || (pooling == PoolingType_t::WeightedMean);
+    const bool weighted = is_weighted_pooling(pooling);
     EmbeddingLayerBase::PoolingParams pp;
     pp.pooling_type = pooling;
     pp.sparse_type = SparseType_t::Fixed;
-    pp.key_indices = &hotness;
-    pp.num_key_indices = 1;
+    pp.output_type = params.value_dtype;
+    pp.fixed_hotness = hotness;
     if (weighted) {
-      pp.sparse_weights = weights.data();
+      pp.weights = weights.data();
       pp.weight_type = DataType_t::Float32;
     }
 
@@ -421,22 +418,22 @@ void test_pooling_csr(HostLayerTest<KeyType>* t) {
   const auto& params = t->GetParam();
   const size_t elements = t->data_elements();
   const auto keys = make_keys<KeyType>({0, 5, 42, 1337, 7});
-  // key_indices must be of the same type as the layer's key type.
+  // csr_offsets must be of the same type as the layer's key type.
   const auto offsets = make_keys<KeyType>({0, 2, 5});
   const int64_t num_bags = 2;
   const std::vector<float> weights{1.0f, 2.0f, 0.5f, 3.0f, 1.0f};
 
   for (const auto pooling : {PoolingType_t::Sum, PoolingType_t::Mean, PoolingType_t::WeightedSum,
                              PoolingType_t::WeightedMean}) {
-    const bool weighted =
-        (pooling == PoolingType_t::WeightedSum) || (pooling == PoolingType_t::WeightedMean);
+    const bool weighted = is_weighted_pooling(pooling);
     EmbeddingLayerBase::PoolingParams pp;
     pp.pooling_type = pooling;
     pp.sparse_type = SparseType_t::CSR;
-    pp.key_indices = offsets.data();
-    pp.num_key_indices = static_cast<int64_t>(offsets.size());
+    pp.output_type = params.value_dtype;
+    pp.csr_offsets = offsets.data();
+    pp.num_csr_offsets = static_cast<int64_t>(offsets.size());
     if (weighted) {
-      pp.sparse_weights = weights.data();
+      pp.weights = weights.data();
       pp.weight_type = DataType_t::Float32;
     }
 
@@ -465,8 +462,7 @@ void test_pooling_fp16_output(HostLayerTest<KeyType>* t) {
   EmbeddingLayerBase::PoolingParams pp;
   pp.pooling_type = PoolingType_t::Mean;
   pp.sparse_type = SparseType_t::Fixed;
-  pp.key_indices = &hotness;
-  pp.num_key_indices = 1;
+  pp.fixed_hotness = hotness;
   pp.output_type = DataType_t::Float16;
 
   const int64_t out_stride = static_cast<int64_t>(elements * sizeof(__half));
@@ -496,8 +492,7 @@ void test_pooling_output_stride_too_small(HostLayerTest<KeyType>* t) {
   EmbeddingLayerBase::PoolingParams pp;
   pp.pooling_type = PoolingType_t::Mean;
   pp.sparse_type = SparseType_t::Fixed;
-  pp.key_indices = &hotness;
-  pp.num_key_indices = 1;
+  pp.fixed_hotness = hotness;
   pp.output_type = DataType_t::Float16;
 
   const int64_t min_out_stride = static_cast<int64_t>(elements * sizeof(__half));
@@ -588,17 +583,16 @@ void test_quant_pooling(DataType_t qtype) {
 
   for (const auto pooling : {PoolingType_t::Sum, PoolingType_t::Mean, PoolingType_t::WeightedSum,
                              PoolingType_t::WeightedMean}) {
-    const bool weighted =
-        (pooling == PoolingType_t::WeightedSum) || (pooling == PoolingType_t::WeightedMean);
+    const bool weighted = is_weighted_pooling(pooling);
     const bool mean =
         (pooling == PoolingType_t::Mean) || (pooling == PoolingType_t::WeightedMean);
     EmbeddingLayerBase::PoolingParams pp;
     pp.pooling_type = pooling;
     pp.sparse_type = SparseType_t::Fixed;
-    pp.key_indices = &hotness;
-    pp.num_key_indices = 1;
+    pp.output_type = DataType_t::Float32;
+    pp.fixed_hotness = hotness;
     if (weighted) {
-      pp.sparse_weights = weights.data();
+      pp.weights = weights.data();
       pp.weight_type = DataType_t::Float32;
     }
 
@@ -786,7 +780,7 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
   auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
 
   // Key layout + bag offsets per sparse type. bag_off holds the reference bag
-  // boundaries and, for CSR, doubles as the key_indices (which must be of the
+  // boundaries and, for CSR, doubles as csr_offsets (which must be of the
   // same type as the layer's key type).
   const KeyType hotness = static_cast<KeyType>(3);
   std::vector<KeyType> keys;
@@ -820,8 +814,7 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
 
   for (const auto pooling : {PoolingType_t::Sum, PoolingType_t::Mean, PoolingType_t::WeightedSum,
                              PoolingType_t::WeightedMean}) {
-    const bool weighted =
-        (pooling == PoolingType_t::WeightedSum) || (pooling == PoolingType_t::WeightedMean);
+    const bool weighted = is_weighted_pooling(pooling);
     const bool mean =
         (pooling == PoolingType_t::Mean) || (pooling == PoolingType_t::WeightedMean);
 
@@ -830,14 +823,13 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
     pp.sparse_type = sparse;
     pp.output_type = out_dtype;
     if (sparse == SparseType_t::Fixed) {
-      pp.key_indices = &hotness;
-      pp.num_key_indices = 1;
+      pp.fixed_hotness = hotness;
     } else {
-      pp.key_indices = bag_off.data();
-      pp.num_key_indices = static_cast<int64_t>(bag_off.size());
+      pp.csr_offsets = bag_off.data();
+      pp.num_csr_offsets = static_cast<int64_t>(bag_off.size());
     }
     if (weighted) {
-      pp.sparse_weights = w_half ? static_cast<const void*>(wh.data())
+      pp.weights = w_half ? static_cast<const void*>(wh.data())
                                  : static_cast<const void*>(wf.data());
       pp.weight_type = weight_dtype;
     }
@@ -935,7 +927,7 @@ COMBO_TEST(quint8_f16_fp16_out_csr_fp16w, DataType_t::QUint8RowwiseF16, DataType
 // Concatenate = no arithmetic reduction: each key produces one output row, only
 // converting/dequantizing the raw gathered data to the output type. Verifies the
 // pure data-conversion path (notably QInt8Rowwise -> fp16/fp32). The sparse layout
-// and weights are ignored, and key_indices may be null.
+// and weights are ignored, and csr_offsets may be null.
 template <typename KeyType>
 void test_pooling_concat_convert(DataType_t in_dtype, DataType_t out_dtype) {
   const bool out_half = (out_dtype == DataType_t::Float16);
@@ -964,8 +956,14 @@ void test_pooling_concat_convert(DataType_t in_dtype, DataType_t out_dtype) {
   EmbeddingLayerBase::PoolingParams pp;
   pp.pooling_type = PoolingType_t::Concatenate;
   pp.output_type = out_dtype;
-  // key_indices / sparse_type / weights are intentionally left unset — Concatenate
-  // ignores them.
+  // Deliberately invalid/irrelevant metadata: Concatenate must ignore all of it.
+  double ignored_weight = 0.0;
+  pp.sparse_type = static_cast<SparseType_t>(2);
+  pp.csr_offsets = nullptr;
+  pp.num_csr_offsets = -1;
+  pp.fixed_hotness = -1;
+  pp.weights = &ignored_weight;
+  pp.weight_type = DataType_t::Float64;
 
   const int64_t out_stride =
       num_values * static_cast<int64_t>(out_half ? sizeof(__half) : sizeof(float));
@@ -1053,9 +1051,9 @@ void test_weighted_mean_zero_weight_sum(DataType_t in_dtype) {
   EmbeddingLayerBase::PoolingParams pp;
   pp.pooling_type = PoolingType_t::WeightedMean;
   pp.sparse_type = SparseType_t::Fixed;
-  pp.key_indices = &hotness;
-  pp.num_key_indices = 1;
-  pp.sparse_weights = weights.data();
+  pp.output_type = DataType_t::Float32;
+  pp.fixed_hotness = hotness;
+  pp.weights = weights.data();
   pp.weight_type = DataType_t::Float32;
 
   std::vector<float> out(static_cast<size_t>(num_bags * num_values), 123.0f);

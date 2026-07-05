@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
+#include <cmath>
 #include <memory>
 #include <cassert>
 #include <mutex>
@@ -198,6 +199,11 @@ public:
         {
             std::fill(this->h_tags_, this->h_tags_ + this->num_sets_ * NUM_WAYS * this->config_.num_tables, this->config_.sentinel_key);
             std::fill(this->h_counters_, this->h_counters_ + this->num_sets_ * NUM_WAYS * this->config_.num_tables, 0);
+            // reset lazy-decay clock and per-set timestamps
+            global_ts_ = 0;
+            if (h_set_timestamps_ != nullptr) {
+                std::fill(h_set_timestamps_, h_set_timestamps_ + this->num_sets_ * this->config_.num_tables, 0);
+            }
             CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpyAsync(this->d_tags_, this->h_tags_, this->num_sets_*sizeof(TagT) * NUM_WAYS* this->config_.num_tables, cudaMemcpyDefault, stream));
 
             return ECERROR_SUCCESS;
@@ -233,14 +239,11 @@ public:
             auto curr_tags = this->h_tags_ + table_index * this->num_sets_ * NUM_WAYS;
             auto curr_counters = this->h_counters_ + table_index * this->num_sets_ * NUM_WAYS;
 
-            // decay all counters
-            for (uint64_t i = 0; i < this->num_sets_; i++)
-            {
-                for (uint32_t j = 0; j < NUM_WAYS; j++)
-                {
-                    curr_counters[i*NUM_WAYS + j] *= this->config_.decay_rate;
-                }
-            }
+            // Lazy decay: advance the global clock once per insert; each touched
+            // set is aged below by decay_rate^(elapsed calls) the first time it
+            // is seen this call. Untouched sets are not decayed until next touched.
+            const int64_t now = ++global_ts_;
+            auto curr_ts = h_set_timestamps_ + table_index * this->num_sets_;
 
             std::unordered_map<uint64_t, ModifyEntry> insertMap;
             
@@ -251,6 +254,17 @@ public:
                 IndexT index = keys[i];
                 uint64_t set = embed_cache_hash_set_idx(index, this->num_sets_);
                 TagT* set_ways = curr_tags + set * NUM_WAYS;
+
+                // lazy decay: age this set's counters once, on its first touch this call
+                if (curr_ts[set] != now)
+                {
+                    const int64_t delta = now - curr_ts[set];
+                    const float factor = static_cast<float>(std::pow(static_cast<double>(this->config_.decay_rate), static_cast<double>(delta)));
+                    CounterT* sc = curr_counters + set * NUM_WAYS;
+                    for (uint32_t j = 0; j < NUM_WAYS; j++) { sc[j] *= factor; }
+                    curr_ts[set] = now;
+                }
+
                 bool found = false;
                 for (uint32_t j = 0; j < NUM_WAYS; j++)
                 {
@@ -502,21 +516,26 @@ private:
 
 private:
 
-    virtual size_t get_extra_host_alloc_size(uint64_t num_tables, uint64_t num_sets) const override 
+    virtual size_t get_extra_host_alloc_size(uint64_t num_tables, uint64_t num_sets) const override
     {
         size_t ctr_size = num_tables * num_sets * NUM_WAYS * sizeof(CounterT);
-        return ctr_size;
+        size_t ts_size  = num_tables * num_sets * sizeof(int64_t); // one lazy-decay timestamp per set
+        return ctr_size + ts_size;
     }
 
-    virtual void init_extras_host(uint64_t num_tables, int8_t* pool, size_t space) override 
+    virtual void init_extras_host(uint64_t num_tables, int8_t* pool, size_t space) override
     {
         // we should have set the number of sets before calling this function
         assert(this->num_sets_ > 0);
         h_counters_ = (CounterT*)EmbedCacheSA<IndexT, TagT>::allocate_in_pool(pool, space, sizeof(CounterT) * num_tables * this->num_sets_ * NUM_WAYS, 16);
         std::fill(h_counters_, h_counters_ + num_tables * this->num_sets_ * NUM_WAYS, 0);
+        h_set_timestamps_ = (int64_t*)EmbedCacheSA<IndexT, TagT>::allocate_in_pool(pool, space, sizeof(int64_t) * num_tables * this->num_sets_, 16);
+        std::fill(h_set_timestamps_, h_set_timestamps_ + num_tables * this->num_sets_, 0);
     }
 
     CounterT* h_counters_; // per table counters
+    int64_t* h_set_timestamps_ = nullptr; // per (table, set) lazy-decay timestamp
+    int64_t global_ts_ = 0;                // modify-call clock (guarded by rw_lock_)
     typename EmbedCacheSA<IndexT, TagT>::ReadWriteLock rw_lock_;
 };
 }

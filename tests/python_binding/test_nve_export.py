@@ -31,6 +31,10 @@ from pynve.torch.nve_export import (
     export as nve_export, export_aot, load as nve_load, load_aot,
     save_nve, load_nve_layers, rebind_markers,
 )
+from pynve.torch.nve_export import (
+    _gcd_memblock_type, _memblock_resource_descriptor, _collect_resources,
+    _build_memblock_from_descriptor,
+)
 from conftest import requires_nvhm
 
 DEVICE = torch.device("cuda")
@@ -783,6 +787,167 @@ def test_shared_memblock_within_model():
     print("PASS: shared memblock within model round-trips correctly")
 
 
+class _StubMemblockModule:
+    """Lightweight stand-in for an NVEmbeddingBase carrying just the attributes
+    the memblock descriptor reads, so the pure type logic can be exercised
+    without constructing real (shared) UserMemBlocks."""
+    def __init__(self, layer_type, memblock_type, layer_id=0):
+        self.layer_type = layer_type
+        self.memblock_type = memblock_type
+        self.id = layer_id
+        self.embedding_size = EMB_SIZE
+        self.num_embeddings = NUM_EMB
+        self.data_type = torch.float32
+
+
+def test_memblock_resource_descriptor_records_actual_type():
+    """The descriptor records the memblock's real type and layer geometry;
+    User-block resolution happens later, in _collect_resources."""
+    LayerType = nve_layers.LayerType
+    for mb in (nve.MemBlockType.NVL, nve.MemBlockType.Managed,
+               nve.MemBlockType.Host, nve.MemBlockType.Linear,
+               nve.MemBlockType.User):
+        desc = _memblock_resource_descriptor(
+            _StubMemblockModule(LayerType.LinearUVM, mb))
+        assert desc["type"] == mb.name
+        assert desc["row_elements"] == EMB_SIZE
+        assert desc["num_rows"] == NUM_EMB
+        assert "float32" in desc["dtype"]
+    print("PASS: memblock resource descriptor records the actual type")
+
+
+def test_memblock_resource_descriptor_rejects_unserializable_type():
+    """A non-reconstructable memblock type (e.g. distributed MPI) must raise at
+    serialization, not get written out and fail later on load."""
+    stub = _StubMemblockModule(nve_layers.LayerType.GPULayer, nve.MemBlockType.MPI)
+    with pytest.raises(ValueError, match="Cannot serialize memblock of type"):
+        _memblock_resource_descriptor(stub)
+    print("PASS: memblock resource descriptor rejects unserializable types")
+
+
+def test_gcd_memblock_type():
+    """A User block shared across layers resolves to a type all sharers can use."""
+    LayerType = nve_layers.LayerType
+    MB = nve.MemBlockType
+    G, U, H = LayerType.GPULayer, LayerType.LinearUVM, LayerType.HostLayer
+
+    # Single-layer (un-shared) User blocks: reconstructable form per intent.
+    assert _gcd_memblock_type({G}) == MB.Linear.name
+    assert _gcd_memblock_type({U}) == MB.Managed.name
+    assert _gcd_memblock_type({H}) == MB.Host.name
+
+    # GPU + LinearUVM both access device memory directly -> Linear.
+    assert _gcd_memblock_type({G, U}) == MB.Linear.name
+
+    # Host-touching combinations need host-accessible memory -> Managed.
+    assert _gcd_memblock_type({H, U}) == MB.Managed.name
+
+    # Mixed device-only + host-only intent -> Managed, with a warning.
+    with pytest.warns(UserWarning, match="GPULayer and HostLayer"):
+        assert _gcd_memblock_type({G, H}) == MB.Managed.name
+    with pytest.warns(UserWarning, match="GPULayer and HostLayer"):
+        assert _gcd_memblock_type({G, H, U}) == MB.Managed.name
+    print("PASS: gcd memblock type resolves shared User blocks correctly")
+
+
+def test_collect_resources_resolves_user_blocks():
+    """_collect_resources must resolve a UserMemBlock to a concrete,
+    serializable type — never leave the un-loadable 'User' type in metadata.
+
+    This exercises the full descriptor -> finalize path; the unit test above
+    only covers _gcd_memblock_type in isolation.
+    """
+    # A GPULayer with auto-allocated storage is backed by a UserMemBlock.
+    model = SimpleModel(layer_type=nve_layers.LayerType.GPULayer)
+    assert model.emb.memblock_type == nve.MemBlockType.User, "precondition"
+
+    resources, _, refs = _collect_resources(model)
+    mb_type = resources["memblocks"][refs["emb"]]["type"]
+    assert mb_type == nve.MemBlockType.Linear.name, \
+        f"User block on GPULayer must resolve to Linear, got {mb_type}"
+    assert "User" not in mb_type
+
+    # A UserMemBlock shared by two GPULayers: single ref, still resolves.
+    dev_t = torch.empty(NUM_EMB, EMB_SIZE, dtype=torch.float32, device=DEVICE)
+    shared = nve.UserMemBlock(dev_t.data_ptr())
+    emb_a = nve_layers.NVEmbedding(NUM_EMB, EMB_SIZE, torch.float32,
+                                   nve_layers.LayerType.GPULayer,
+                                   storage=shared, device=DEVICE)
+    emb_b = nve_layers.NVEmbedding(NUM_EMB, EMB_SIZE, torch.float32,
+                                   nve_layers.LayerType.GPULayer,
+                                   storage=shared, device=DEVICE)
+    model2 = TwoLayerModel(emb_a, emb_b)
+    resources2, _, refs2 = _collect_resources(model2)
+    assert refs2["emb_a"] == refs2["emb_b"], "shared block -> one ref"
+    assert resources2["memblocks"][refs2["emb_a"]]["type"] == nve.MemBlockType.Linear.name
+    print("PASS: _collect_resources resolves User blocks to serializable types")
+
+
+def test_host_layer_user_block_roundtrip():
+    """HostLayer with an (auto) UserMemBlock must export as 'Host' and reload as
+    a HostMemBlock reproducing the original weights.
+
+    test_export_and_load_gpu covers GPULayer User->Linear and
+    test_shared_memblock_within_model covers Managed; the HostLayer User->Host
+    default case had no dedicated round-trip. Note the existing
+    test_host_layer_cpu_export_load_roundtrip loads on device='cpu', which builds
+    a HostMemBlock via the cpu shortcut regardless of the serialized type — so it
+    does not actually pin down the User->Host resolution. The metadata assertion
+    below does.
+    """
+    num_emb, emb_size = 512, 8
+    weight = (torch.arange(num_emb, dtype=torch.float32)
+              .unsqueeze(1).expand(num_emb, emb_size).contiguous())
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nve_layers.NVEmbedding(
+                num_emb, emb_size, torch.float32,
+                layer_type=nve_layers.LayerType.HostLayer,
+                weight_init=weight, optimize_for_training=False)
+
+    model = M()
+    assert model.emb.memblock_type == nve.MemBlockType.User, \
+        "precondition: auto HostLayer storage is a UserMemBlock"
+
+    with tempfile.TemporaryDirectory() as save_dir:
+        save_nve(model, save_dir)
+
+        with open(os.path.join(save_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        ref = meta["layers"][0]["storage_ref"]
+        # The resolution under test: a HostLayer's User block serializes as Host.
+        assert meta["resources"]["memblocks"][ref]["type"] == nve.MemBlockType.Host.name, \
+            "HostLayer User block must serialize as Host (not User/Managed)"
+
+        layers = load_nve_layers(save_dir, device=torch.device("cpu"))
+        assert len(layers) == 1
+        assert layers[0].storage.get_type() == nve.MemBlockType.Host, \
+            "reloaded storage must be a HostMemBlock"
+        keys = torch.tensor([0, 5, 17, 256, 511], dtype=torch.int64)
+        out = layers[0](keys)
+        assert out.device.type == "cpu"
+        assert torch.equal(out, weight[keys]), "reloaded weights must match"
+    print("PASS: HostLayer UserMemBlock round-trips as HostMemBlock with weights")
+
+
+def test_build_memblock_unsupported_type_raises():
+    """An un-reconstructable memblock type (e.g. distributed MPI) must raise on
+    load, not silently downgrade to Managed."""
+    cfg = {"type": "MPI", "row_elements": 8, "num_rows": 64, "dtype": "float32"}
+    with pytest.raises(ValueError, match="Cannot reconstruct memblock of type"):
+        _build_memblock_from_descriptor(cfg, 0, "cuda")
+
+    # The four supported types still build (no cpu shortcut: device_type="cuda").
+    for mb in (nve.MemBlockType.NVL, nve.MemBlockType.Linear,
+               nve.MemBlockType.Managed):
+        blk = _build_memblock_from_descriptor(
+            {**cfg, "type": mb.name}, 0, "cuda")
+        assert blk.get_type() == mb
+    print("PASS: unsupported memblock type raises on load")
+
+
 @requires_custom_remote
 def test_shared_ps_within_model():
     """Two Hierarchical layers sharing one PS round-trip with one PS instance."""
@@ -1059,6 +1224,12 @@ if __name__ == "__main__":
     test_cpp_inference_custom_ps()
     test_v2_metadata_schema()
     test_shared_memblock_within_model()
+    test_memblock_resource_descriptor_records_actual_type()
+    test_memblock_resource_descriptor_rejects_unserializable_type()
+    test_gcd_memblock_type()
+    test_collect_resources_resolves_user_blocks()
+    test_host_layer_user_block_roundtrip()
+    test_build_memblock_unsupported_type_raises()
     test_future_version_raises()
     test_v1_legacy_load()
     test_geometry_mismatch_raises()

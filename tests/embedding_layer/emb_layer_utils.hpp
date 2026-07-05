@@ -143,4 +143,13 @@ void InitTableRows(int8_t* table, uint64_t row_size, uint64_t start_row, uint64_
 // dtype:       must be a per-row quant type: QInt8RowwiseF32/F16 or QUint8RowwiseF32/F16
 float load_quant_row_element_as_float(const int8_t* row_ptr, int64_t e, int64_t value_count, DataType_t dtype);
 
+// Fill table rows with per-row quantized data (the layout read by load_quant_row_element_as_float):
+// `value_count` int8/uint8 value bytes followed by trailing scale [+ offset] metadata (float for the
+// *F32 variants, __half for the *F16 variants). Each row's float values are drawn in [-1, 1] and
+// quantized with the same convention as the kernels (QInt8*: symmetric scale-only; QUint8*: affine
+// min/max scale + offset). `row_size` is the (padded) byte stride between rows.
+// dtype must be one of QInt8RowwiseF32/F16 or QUint8RowwiseF32/F16.
+void InitTableRowsQuant(int8_t* table, int64_t row_size, int64_t value_count, uint64_t start_row,
+                        uint64_t end_row, DataType_t dtype, size_t seed = 1337);
+
 }  // namespace nve

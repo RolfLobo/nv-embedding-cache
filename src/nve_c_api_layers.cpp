@@ -253,20 +253,30 @@ nve_status_t nve_layer_lookup_pooled(
     void* output, int64_t output_stride,
     uint64_t* hitmask,
     nve_pooling_type_t pooling_type, nve_sparse_type_t sparse_type,
-    const void* key_indices, int64_t num_key_indices,
-    const void* sparse_weights,
-    nve_data_type_t weight_type, float* hitrates) {
+    const void* csr_offsets, int64_t num_csr_offsets, int64_t fixed_hotness,
+    const void* weights,
+    nve_data_type_t weight_type, nve_data_type_t output_type,
+    float* hitrates) {
   if (!layer || !layer->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "layer and ctx must not be NULL");
   }
   NVE_C_TRY
+    const nve::DataType_t converted_output_type = convert_dtype(output_type);
+    if (converted_output_type == nve::DataType_t::Unknown) {
+      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT,
+                           "output_type must be a supported, non-UNKNOWN data type");
+    }
     nve::EmbeddingLayerBase::PoolingParams params;
     params.pooling_type = convert_pooling_type(pooling_type);
-    params.sparse_type = convert_sparse_type(sparse_type);
-    params.key_indices = key_indices;
-    params.num_key_indices = num_key_indices;
-    params.sparse_weights = sparse_weights;
-    params.weight_type = convert_dtype(weight_type);
+    params.output_type = converted_output_type;
+    if (params.pooling_type != nve::PoolingType_t::Concatenate) {
+      params.sparse_type = convert_sparse_type(sparse_type);
+      params.csr_offsets = csr_offsets;
+      params.num_csr_offsets = num_csr_offsets;
+      params.fixed_hotness = fixed_hotness;
+      params.weights = weights;
+      params.weight_type = convert_dtype(weight_type);
+    }
 
     layer->ptr->lookup(ctx->ptr, num_keys, keys, output, output_stride,
                        hitmask, &params, hitrates);

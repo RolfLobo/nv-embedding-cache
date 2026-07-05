@@ -22,6 +22,8 @@
 #include <layer_utils.hpp>
 #include "cuda_ops/update_accumulate.cuh"
 #include "cuda_ops/find_and_combine_kernel.cuh"
+#include "cuda_ops/find_and_dequant.cuh"
+#include "cuda_ops/find_and_pool.cuh"
 #include "cuda_ops/cuda_common.h"
 #include "cuda_ops/pipeline_gather.cuh"
 #include "cuda_ops/gather_keys_data_ptrs.cuh"
@@ -434,7 +436,87 @@ void GpuTable<KeyType>::insert(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
 
     NVE_CHECK_(cache_->insert(
       mod_ctx,
-      histogram.get_keys(), 
+      histogram.get_keys(),
+      histogram.get_priority(),
+      histogram.get_data(),
+      histogram.get_num_bins(),
+      0, // tableIndex
+      ec_event.get(),
+      sc.queue_stream
+    ), "Failed to call cache insert");
+  }
+}
+
+template <typename KeyType>
+void GpuTable<KeyType>::insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys) {
+  NVE_NVTX_SCOPED_FUNCTION_COL2_();
+  ScopedDevice scope_device(config_.device_id);
+  NVE_CHECK_(config_.uvm_table != nullptr, "insert_from_uvm requires a UVM table");
+  auto modify_stream = ctx->get_modify_stream();
+  const void* keys_buf =
+      keys->access_buffer(config_.modify_on_gpu ? cudaMemoryTypeDevice : cudaMemoryTypeHost,
+                          true /*copy_content*/, modify_stream);
+  NVE_CHECK_(keys_buf != nullptr, "Invalid cache insert params");
+
+  // Each key's row is read directly from the dense, key-indexed UVM table: uvm_table + row_size*key.
+  const int8_t* uvm_table = static_cast<const int8_t*>(config_.uvm_table);
+  const int64_t row_size = config_.row_size_in_bytes;
+
+  std::shared_lock uvm_lock(uvm_table_mutex_, std::defer_lock); // don't lock yet, only lock when not using private stream
+  if (!config_.private_stream) {
+    uvm_lock.lock();
+  }
+
+  auto gpu_table_ctx = std::dynamic_pointer_cast<GPUTableExecutionContext<KeyType>>(ctx);
+  NVE_CHECK_(gpu_table_ctx != nullptr, "Invalid GPU table context");
+
+  auto mod_ctx{gpu_table_ctx->modify_context()};
+
+  if (num_keys > gpu_table_ctx->max_modify_size_) {
+    NVE_LOG_WARNING_("Cache insert exceeds allowed size, partial insert will be performed");
+  }
+
+  if (config_.modify_on_gpu) {
+
+    nve::DefaultGPUHistogram<KeyType, true /*LoadIndices*/> histogram(num_keys);
+    size_t histAllocSize = histogram.get_alloc_size();
+    void* d_hist_storage = ctx->get_buffer("d_hist_storage", histAllocSize, false);
+    cudaStream_t mod_stream = modify_stream;
+
+    histogram.compute_histogram(reinterpret_cast<const KeyType*>(keys_buf), num_keys,
+                               uvm_table, row_size, d_hist_storage, mod_stream);
+
+    auto ec_event = create_sync_event();
+    StreamCoordinator sc(mod_stream, config_.private_stream);
+
+    auto num_keys_ = std::min(histogram.get_num_bins(), static_cast<int64_t>(gpu_table_ctx->max_modify_size_));
+
+    NVE_CHECK_(cache_->insert(
+      mod_ctx,
+      histogram.get_keys(),
+      histogram.get_priority(),
+      histogram.get_data(),
+      num_keys_,
+      0, // tableIndex
+      ec_event.get(),
+      sc.queue_stream
+    ), "Failed to call cache insert");
+  } else {
+
+    // is_linear=true: per-key data pointer is uvm_table + row_size*key (key-indexed dense table).
+    nve::DefaultHistogram histogram(
+    static_cast<const key_type*>(keys_buf),
+    static_cast<size_t>(num_keys),
+    uvm_table,
+    static_cast<size_t>(row_size),
+    true /*is_linear*/);
+
+    auto ec_event = create_sync_event();
+    StreamCoordinator sc(gpu_table_ctx->get_modify_stream(), config_.private_stream);
+
+    NVE_CHECK_(cache_->insert(
+      mod_ctx,
+      histogram.get_keys(),
       histogram.get_priority(),
       histogram.get_data(),
       histogram.get_num_bins(),
@@ -670,9 +752,11 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
 
         // Now launch meta task to wait on cuda events then submit additional work to threadpool
         // Don't want to block many threads in the pool on cudaEventSynchronize
-        std::atomic<int64_t> remaining_tasks(num_copies * tasks_per_copy);
-        std::promise<void> barrier;
-        auto future = barrier.get_future();
+        // barrier and remaining_tasks are heap-allocated so all closures can own them via shared_ptr;
+        // this prevents dangling references if any closure outlives the outer frame after future.wait().
+        auto remaining_tasks = std::make_shared<std::atomic<int64_t>>(num_copies * tasks_per_copy);
+        auto barrier = std::make_shared<std::promise<void>>();
+        auto future = barrier->get_future();
 
         int8_t* i8_table = reinterpret_cast<int8_t*>(config_.uvm_table);
         const int8_t* i8_h_updates = reinterpret_cast<const int8_t*>(h_updates);
@@ -681,13 +765,13 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
         NVE_CHECK_(update_size % dtype_size(update_dtype) == 0);
         const auto elements_per_row = update_size / dtype_size(update_dtype);
 
-        const auto update_launcher_task{[=, &barrier, &remaining_tasks]() {
+        const auto update_launcher_task{[=]() {
           for (int64_t i=0 ; i<num_copies ; i++) {
             // First wait for the copy to complete
             NVE_CHECK_(cudaEventSynchronize(copy_events.at(i)));
 
             // Define the update tasks
-            const auto update_task_fp16{[=, &barrier, &remaining_tasks] (const size_t idx) {
+            const auto update_task_fp16{[=] (const size_t idx) {
               const auto base_key = i * keys_per_copy;
               const int64_t start_key = base_key + (idx * keys_per_task);
               const int64_t end_key = std::min<int64_t>(start_key + keys_per_task, num_keys);
@@ -704,11 +788,11 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
                   dst[i][j] += src[i][j];
                 }
               }
-              if ((--remaining_tasks) == 0) {
-                barrier.set_value(); // release the future
+              if ((--(*remaining_tasks)) == 0) {
+                barrier->set_value(); // release the future
               }
             }};
-            const auto update_task_fp32{[=, &barrier, &remaining_tasks] (const int64_t idx) {
+            const auto update_task_fp32{[=] (const int64_t idx) {
               const auto base_key = i * keys_per_copy;
               const int64_t start_key = base_key + (idx * keys_per_task);
               const int64_t end_key = std::min<int64_t>(start_key + keys_per_task, num_keys);
@@ -725,8 +809,8 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
                   dst[i][j] += src[i][j];
                 }
               }
-              if ((--remaining_tasks) == 0) {
-                barrier.set_value(); // release the future
+              if ((--(*remaining_tasks)) == 0) {
+                barrier->set_value(); // release the future
               }
             }};
 
@@ -884,26 +968,25 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
 }
 
 template <typename KeyType>
-template <typename OffsetType, typename ValueType, typename OutputType, typename WeightType>
-void GpuTable<KeyType>::find_and_combine(
+void GpuTable<KeyType>::find_and_pool(
     context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys_bw,
-    SparseType_t hot_type, int64_t num_offsets, buffer_ptr<const OffsetType> offsets_bw,
-    int64_t fixed_hotness, PoolingType_t pooling_type, buffer_ptr<const WeightType> weights_bw,
+    SparseType_t hot_type, int64_t num_offsets, buffer_ptr<const KeyType> offsets_bw,
+    int64_t fixed_hotness, PoolingType_t pooling_type, buffer_ptr<const void> weights_bw,
+    DataType_t output_dtype, DataType_t weight_dtype,
     int64_t value_stride, buffer_ptr<void> values_bw) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(config_.device_id);
-  NVE_CHECK_(value_stride == config_.row_size_in_bytes,
-             "Output stride must be the same as cache row size");
-  NVE_CHECK_(config_.uvm_table != nullptr,
-             "find_and_combine requires a UVM table");
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_(config_.uvm_table != nullptr, "find_and_pool requires a UVM table");
+  // The pool/dequant kernels derive the embedding width from the output stride, so output padding
+  // is not supported here: the stride must decode to a value count that fits within one stored row.
+  validate_pool_output_stride(config_.value_dtype, config_.row_size_in_bytes, value_stride);
   auto lookup_stream = ctx->get_lookup_stream();
   const void* keys = keys_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
-  const OffsetType* offsets =
-      offsets_bw ? offsets_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream)
-                 : nullptr;
-  const WeightType* weights =
-      weights_bw ? weights_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream)
-                 : nullptr;
+  const KeyType* offsets = offsets_bw ? offsets_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;
+  const void* weights = weights_bw ? weights_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;
   void* values = values_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream);
 
   auto gpu_table_ctx = std::dynamic_pointer_cast<GPUTableExecutionContext<KeyType>>(ctx);
@@ -918,96 +1001,27 @@ void GpuTable<KeyType>::find_and_combine(
   auto lookup_ctx{gpu_table_ctx->lookup_context()};
   using CacheDataType = typename CacheType::CacheData;
 
-  int32_t num_elements = static_cast<int32_t>(value_stride / sizeof(ValueType));
-
-  switch (hot_type) {
-    case SparseType_t::Fixed:
-      if (num_keys % fixed_hotness > 0) {
-        NVE_LOG_ERROR_("Number of keys doesn't divide by fixed hotness");
-        throw std::invalid_argument("Invalid number of keys for fixed hotness");
-      }
-      {
-        uint32_t batch = static_cast<uint32_t>(num_keys / fixed_hotness);
-        switch (pooling_type) {
-          case PoolingType_t::Sum:
-              callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, true, true, false>
-                  (batch, static_cast<const int8_t*>(config_.uvm_table), reinterpret_cast<const KeyType*>(keys),
-                  offsets, weights, static_cast<int32_t>(fixed_hotness), cache_->get_cache_data(lookup_ctx),
-                  num_elements, reinterpret_cast<ValueType*>(values), sc.queue_stream);
-              break;
-          case PoolingType_t::Mean:
-              callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, true, false, false>
-                  (batch, static_cast<const int8_t*>(config_.uvm_table), reinterpret_cast<const KeyType*>(keys),
-                  offsets, weights, static_cast<int32_t>(fixed_hotness), cache_->get_cache_data(lookup_ctx),
-                  num_elements, reinterpret_cast<ValueType*>(values), sc.queue_stream);
-              break;
-          case PoolingType_t::WeightedSum:
-              NVE_CHECK_(weights != nullptr,
-                        "Weights must be provided for weighted sum pooling");
-              callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, true, true, true>
-                  (batch, static_cast<const int8_t*>(config_.uvm_table), reinterpret_cast<const KeyType*>(keys),
-                  offsets, weights, static_cast<int32_t>(fixed_hotness), cache_->get_cache_data(lookup_ctx),
-                  num_elements, reinterpret_cast<ValueType*>(values), sc.queue_stream);
-              break;
-          case PoolingType_t::WeightedMean:
-              NVE_CHECK_(weights != nullptr,
-                        "Weights must be provided for weighted mean pooling");
-              callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, true, false, true>
-                  (batch, static_cast<const int8_t*>(config_.uvm_table), reinterpret_cast<const KeyType*>(keys),
-                  offsets, weights, static_cast<int32_t>(fixed_hotness), cache_->get_cache_data(lookup_ctx),
-                  num_elements, reinterpret_cast<ValueType*>(values), sc.queue_stream);
-              break;
-          default:
-              NVE_THROW_NOT_IMPLEMENTED_();
-        }
-      }
-      break;
-    case SparseType_t::CSR:
-      NVE_CHECK_(offsets != nullptr,
-                 "Offsets must be provided for CSR layout");
-      switch (pooling_type) {
-        case PoolingType_t::Sum:
-            callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, false, true, false>
-                (static_cast<uint32_t>(num_offsets), static_cast<const int8_t*>(config_.uvm_table),
-                 reinterpret_cast<const KeyType*>(keys), offsets, weights, static_cast<int32_t>(fixed_hotness),
-                 cache_->get_cache_data(lookup_ctx), num_elements,
-                 reinterpret_cast<ValueType*>(values), sc.queue_stream);
-            break;
-        case PoolingType_t::Mean:
-            callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, false, false, false>
-                (static_cast<uint32_t>(num_offsets), static_cast<const int8_t*>(config_.uvm_table),
-                 reinterpret_cast<const KeyType*>(keys), offsets, weights, static_cast<int32_t>(fixed_hotness),
-                 cache_->get_cache_data(lookup_ctx), num_elements,
-                 reinterpret_cast<ValueType*>(values), sc.queue_stream);
-            break;
-        case PoolingType_t::WeightedSum:
-            NVE_CHECK_(weights != nullptr,
-                       "Weights must be provided for weighted sum pooling");
-            callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, false, true, true>
-                (static_cast<uint32_t>(num_offsets), static_cast<const int8_t*>(config_.uvm_table),
-                 reinterpret_cast<const KeyType*>(keys), offsets, weights, static_cast<int32_t>(fixed_hotness),
-                 cache_->get_cache_data(lookup_ctx), num_elements,
-                 reinterpret_cast<ValueType*>(values), sc.queue_stream);
-            break;
-        case PoolingType_t::WeightedMean:
-            NVE_CHECK_(weights != nullptr,
-                       "Weights must be provided for weighted mean pooling");
-            callFindAndCombineKernel<ValueType, KeyType, ValueType, CacheDataType, false, false, true>
-                (static_cast<uint32_t>(num_offsets), static_cast<const int8_t*>(config_.uvm_table),
-                 reinterpret_cast<const KeyType*>(keys), offsets, weights, static_cast<int32_t>(fixed_hotness),
-                 cache_->get_cache_data(lookup_ctx), num_elements,
-                 reinterpret_cast<ValueType*>(values), sc.queue_stream);
-            break;
-        default:
-          NVE_THROW_NOT_IMPLEMENTED_();
-      } break;
-    case SparseType_t::COO:
-      NVE_THROW_NOT_IMPLEMENTED_();
-      break;
-    default:
-      NVE_LOG_ERROR_("Invalid Hotness type");
-      throw std::invalid_argument(std::string("Invalid Hotness type"));
-  }
+  // Resolve each key's row address through the GPU cache (falling back to the UVM table), so keys
+  // carry actual table indices (load_indices = true).
+  nve::find_and_pool<KeyType, CacheDataType>(
+    static_cast<uint32_t>(num_keys),
+    reinterpret_cast<const KeyType*>(keys),
+    static_cast<const int8_t*>(config_.uvm_table),
+    cache_->get_cache_data(lookup_ctx),
+    true /*load_indices*/,
+    hot_type,
+    pooling_type,
+    offsets,
+    static_cast<uint32_t>(num_offsets),
+    static_cast<int32_t>(fixed_hotness),
+    weights,
+    config_.value_dtype,            // value_dtype (table's stored value type)
+    output_dtype,
+    weight_dtype,
+    DataType_t::Float32,            // acc_dtype (always fp32)
+    value_stride,
+    values,
+    sc.queue_stream);
 }
 
 template <typename KeyType>
@@ -1110,24 +1124,7 @@ DataType_t GpuTable<KeyType>::get_value_type() const {
 template class GpuTable<int32_t>;
 template class GpuTable<int64_t>;
 
-template void GpuTable<int64_t>::find_and_combine<int64_t, float, float, float>(
-  context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, SparseType_t sparse_type,
-  int64_t num_offsets, buffer_ptr<const int64_t> offsets, int64_t fixed_hotness,
-  PoolingType_t pooling_type, buffer_ptr<const float> weights, int64_t value_stride,
-  buffer_ptr<void> values);
-template void GpuTable<int32_t>::find_and_combine<int32_t, float, float, float>(
-  context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, SparseType_t sparse_type,
-  int64_t num_offsets, buffer_ptr<const int32_t> offsets, int64_t fixed_hotness,
-  PoolingType_t pooling_type, buffer_ptr<const float> weights, int64_t value_stride,
-  buffer_ptr<void> values);
-template void GpuTable<int64_t>::find_and_combine<int64_t, __half, __half, __half>(
-  context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, SparseType_t sparse_type,
-  int64_t num_offsets, buffer_ptr<const int64_t> offsets, int64_t fixed_hotness,
-  PoolingType_t pooling_type, buffer_ptr<const __half> weights, int64_t value_stride,
-  buffer_ptr<void> values);
-template void GpuTable<int32_t>::find_and_combine<int32_t, __half, __half, __half>(
-  context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, SparseType_t sparse_type, int64_t num_offsets,
-  buffer_ptr<const int32_t> offsets, int64_t fixed_hotness, PoolingType_t pooling_type,
-  buffer_ptr<const __half> weights, int64_t value_stride, buffer_ptr<void> values);
+// find_and_pool is a non-template member, so it is instantiated by the
+// `template class GpuTable<...>` instantiations above (no per-overload explicit instantiation).
 
 }  // namespace nve

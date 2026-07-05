@@ -80,7 +80,6 @@ typedef enum {
 typedef enum {
   NVE_SPARSE_FIXED = 0,
   NVE_SPARSE_CSR,
-  NVE_SPARSE_COO,
 } nve_sparse_type_t;
 
 typedef enum {
@@ -162,8 +161,8 @@ typedef struct {
   int32_t     device_id;
   void*       embedding_table;       /* Pointer to linear table in GPU memory */
   int64_t     num_embeddings;
-  int64_t     embedding_width_in_bytes;
-  nve_data_type_t value_dtype;
+  int64_t     embedding_width_in_bytes; /* Stored bytes per row. Quantized rows must have an even width. */
+  nve_data_type_t value_dtype; /* FLOAT16/FLOAT32 or rowwise QINT8/QUINT8 F16/F32 storage. */
 } nve_gpu_embedding_layer_config_t;
 
 typedef struct {
@@ -224,7 +223,8 @@ NVE_C_API nve_gpu_table_config_t             nve_gpu_table_config_default(void);
 /**
  * Return a GPU embedding-layer config initialized to library defaults
  * (matches nve::GPUEmbeddingLayerConfig{}). Caller must set layer_name,
- * embedding_table, num_embeddings, and embedding_width_in_bytes before use.
+ * embedding_table, num_embeddings, embedding_width_in_bytes, and value_dtype before use.
+ * value_dtype must be NVE_DTYPE_FLOAT16 or NVE_DTYPE_FLOAT32.
  */
 NVE_C_API nve_gpu_embedding_layer_config_t   nve_gpu_embedding_layer_config_default(void);
 
@@ -628,7 +628,10 @@ NVE_C_API nve_status_t nve_host_table_size(
  * ============================================================================ */
 
 /**
- * Create a GPU embedding layer (no caching, linear table in GPU memory).
+ * Create a GPU embedding layer (no caching, linear table in GPU memory). Plain lookup returns raw
+ * stored rows, including rowwise-quantization metadata. Pooling with a floating-point output type
+ * dequantizes rowwise-quantized storage to the metadata's float precision; cross-precision output
+ * is not supported. Concatenate with the stored quantized output type returns raw rows.
  * @param out Output layer handle.
  * @param key_type Key type (NVE_KEY_INT32 or NVE_KEY_INT64).
  * @param config Layer configuration.
@@ -713,19 +716,21 @@ NVE_C_API nve_status_t nve_layer_lookup(
  * @param output Output buffer for pooled vectors.
  * @param output_stride Spacing in bytes between successive output vectors.
  * @param hitmask Optional output bitmask, see nve_layer_lookup. May be NULL.
- * @param pooling_type Reduction applied per bag. NVE_POOL_CONCATENATE means
- *        no pooling — prefer nve_layer_lookup for that case.
- * @param sparse_type Layout of `key_indices` describing bag membership:
- *        FIXED: key_indices is a single element (the per-bag hotness).
- *        CSR: one offset per bag plus one trailing offset (num_bags + 1).
- *        COO: two elements per key (bag_id, id_in_bag), sorted row-wise.
- * @param key_indices Bag-membership data; layout depends on `sparse_type`. The
- *        element type must match the layer's key type (int32 or int64).
- * @param num_key_indices Number of elements in `key_indices`.
- * @param sparse_weights Optional per-key weights for weighted pooling. May
- *        be NULL when pooling_type is not weighted.
- * @param weight_type Data type of `sparse_weights`; need not match the
- *        layer's value dtype, but not all combinations are supported.
+ * @param pooling_type Reduction applied per bag. NVE_POOL_CONCATENATE emits one output row per
+ *        key without reducing. A different output type requests conversion/dequantization; the
+ *        stored value type requests raw-row passthrough, including quantization metadata.
+ * @param sparse_type Layout describing bag membership. Ignored for Concatenate.
+ * @param csr_offsets One offset per bag plus one trailing offset (num_bags + 1) for CSR.
+ *        The element type must match the layer's key type (int32 or int64). Ignored for Fixed and
+ *        Concatenate.
+ * @param num_csr_offsets Number of elements in `csr_offsets`. Ignored for Fixed and Concatenate.
+ * @param fixed_hotness Number of keys per bag for Fixed. Ignored for CSR and Concatenate.
+ * @param weights Optional per-key weights for weighted pooling. May
+ *        be NULL when pooling_type is not weighted. Ignored for Concatenate.
+ * @param weight_type Data type of `weights`; need not match the
+ *        layer's value dtype, but not all combinations are supported. Ignored for Concatenate.
+ * @param output_type Required data type for the pooled output. NVE_DTYPE_UNKNOWN is invalid.
+ *        Not all stored-value/output combinations are supported by every layer.
  * @param hitrates Optional array sized to the number of internal tables;
  *        receives per-table hit rate. May trigger synchronization.
  */
@@ -735,9 +740,10 @@ NVE_C_API nve_status_t nve_layer_lookup_pooled(
     void* output, int64_t output_stride,
     uint64_t* hitmask,
     nve_pooling_type_t pooling_type, nve_sparse_type_t sparse_type,
-    const void* key_indices, int64_t num_key_indices,
-    const void* sparse_weights,
-    nve_data_type_t weight_type, float* hitrates);
+    const void* csr_offsets, int64_t num_csr_offsets, int64_t fixed_hotness,
+    const void* weights,
+    nve_data_type_t weight_type, nve_data_type_t output_type,
+    float* hitrates);
 
 /**
  * Insert key/value pairs into a specific internal table of the layer.

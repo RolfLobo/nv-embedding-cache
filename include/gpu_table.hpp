@@ -148,6 +148,23 @@ class GpuTable : public Table {
                       int64_t value_size, buffer_ptr<const void> values) override;
 
   /**
+   * Insert keys into the GPU cache, reading each key's value row directly from the backing UVM table
+   * (uvm_table + row_size_in_bytes * key) instead of from a caller-provided values buffer. Requires the
+   * table to be configured with a UVM backing (config.uvm_table != nullptr).
+   *
+   * This is an optimized promotion primitive: it builds the same cache-insert histogram as insert(),
+   * but the per-key row pointers are derived from the dense, key-indexed UVM table - so no values
+   * buffer (and no preceding lookup/gather) is needed. The values it reads are the UVM rows, which are
+   * authoritative unless a prior insert() wrote a fresher value into the cache without a matching
+   * update() (update/update_accumulate write through to UVM).
+   *
+   * @param ctx An execution context for this database.
+   * @param num_keys The number of given keys.
+   * @param keys An array of entry keys. Resides in host memory unless modify_on_gpu was set to true.
+   */
+  void insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys);
+
+  /**
    * Update (overwrite) values for a given set of keys iff they already exist in the database.
    * Values for keys not available in the database will be ignored.
    *
@@ -183,14 +200,22 @@ class GpuTable : public Table {
                                  DataType_t update_dtype) override;
 
   /**
-   * Find entries in the database and combine them.
-   * This operation is only supported for databases that were initialized with a linear UVM table.
-
+   * Find entries in the database and pool / dequantize them. This operation is only supported for
+   * databases that were initialized with a linear UVM table. It routes on pooling_type:
+   *   * PoolingType_t::Concatenate -> no pooling, one dequantized output row per key. Each stored
+   *     row (q[N] + scale [+ offset], per config().value_dtype) is reconstructed as
+   *     float(q) * scale [+ offset]; for non-quantized Float32/Float16 tables this is an identity
+   *     copy. Unlike find(), missing keys are resolved against the UVM table. sparse_type,
+   *     num_offsets, offsets, fixed_hotness, weights, and weight_dtype are ignored.
+   *   * any other pooling type -> bags of keys are combined into one output row per bag.
+   * The table's stored value type comes from config().value_dtype; callers pass the output and
+   * weight types at runtime (the accumulator is always fp32). Offsets are KeyType-typed.
+   *
    * @param ctx An execution context for this database.
    * @param num_keys The number of given keys.
    * @param keys An array of keys to find in the database.
    * This array should reside in UVM (preferably in GPU memory).
-   * @param hot_type The type of hotness used for grouping keys (e.g. Fixed, CSR, COO).
+   * @param sparse_type The type of hotness used for grouping keys (e.g. Fixed, CSR).
    * @param num_offsets The number of offset values in "offsets".
    * @param offsets The offsets used to group keys. Structure will change depending on hotness type.
    * If hotness type is Fixed, this array is ignored.
@@ -198,26 +223,21 @@ class GpuTable : public Table {
    * @param fixed_hotness The hotness value (i.e. bag size) to be used with Fixed hotness.
    * If hotness isn't Fixed, this value is ignored.
    * @param pooling_type The type of combiner to use on entries in the same group.
-   * Note that for the mode "Concat" it is more efficient to use the find() call instead.
    * @param weights An array of weights to use with weighted combiners.
    * This array should reside in UVM (preferably in GPU memory).
+   * @param output_dtype The dequantized output element type.
+   * @param weight_dtype The element type of the weights array (when weighted).
    * @param value_stride The number of bytes between every entry in the output buffer ("values")
    * @param values [Output] An array to write the retrieved entries to. Must be large enough to hold
-   n entries (considering value_stride)
+   the produced rows (considering value_stride).
    * This array should reside in UVM (preferably in GPU memory).
   */
-
-  template <typename OffsetType = KeyType,    // Type used for Offset during lookup of COO/CSR
-            typename ValueType = float,       // Type used for the data vectors
-            typename OutputType = ValueType,  // Type used for output data vectors (can differ from
-                                              // ValueType only when combining multiple rows)
-            typename WeightType =
-                float>  // Type used for weights used by some combiner types (e.g. weighted sum)
-  void find_and_combine(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
-                        SparseType_t sparse_type, int64_t num_offsets,
-                        buffer_ptr<const OffsetType> offsets, int64_t fixed_hotness,
-                        PoolingType_t pooling_type, buffer_ptr<const WeightType> weights,
-                        int64_t value_stride, buffer_ptr<void> values);
+  void find_and_pool(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
+                     SparseType_t sparse_type, int64_t num_offsets,
+                     buffer_ptr<const KeyType> offsets, int64_t fixed_hotness,
+                     PoolingType_t pooling_type, buffer_ptr<const void> weights,
+                     DataType_t output_dtype, DataType_t weight_dtype,
+                     int64_t value_stride, buffer_ptr<void> values);
 
   const GPUTableConfig& config() const { return config_; }
   allocator_ptr_t get_allocator() { return allocator_; }

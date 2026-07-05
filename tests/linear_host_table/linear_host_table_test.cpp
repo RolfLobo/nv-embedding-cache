@@ -102,6 +102,44 @@ public:
         }
     }
 
+    void test_find_counts_only_new_hits() {
+        const auto& params = GetParam();
+        constexpr int64_t num_keys = 70;  // Exercises one full and one partial hitmask word.
+        std::vector<KeyType> keys(static_cast<size_t>(num_keys));
+        for (int64_t i = 0; i < num_keys; ++i) {
+            keys[static_cast<size_t>(i)] = static_cast<KeyType>(i);
+        }
+
+        std::vector<DataType> output(
+            static_cast<size_t>(num_keys) * static_cast<size_t>(params.row_size_bytes) / sizeof(DataType),
+            0.0f);
+        std::vector<max_bitmask_repr_t> hit_mask(
+            static_cast<size_t>(max_bitmask_t::mask_size(num_keys)), 0);
+        constexpr int64_t existing_hit_indices[] = {0, 2, 63, 69};
+        for (const int64_t index : existing_hit_indices) {
+            hit_mask[static_cast<size_t>(index / max_bitmask_t::num_bits)] |=
+                max_bitmask_t::single(index % max_bitmask_t::num_bits);
+        }
+        // Padding bits outside num_keys must not be counted as existing hits.
+        hit_mask.back() |= max_bitmask_t::single(max_bitmask_t::num_bits - 1);
+
+        auto keys_bw = std::make_shared<BufferWrapper<const void>>(
+            ctx_, "keys", keys.data(), keys.size() * sizeof(KeyType));
+        auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
+            ctx_, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(max_bitmask_repr_t));
+        auto values_bw = std::make_shared<BufferWrapper<void>>(
+            ctx_, "values", output.data(),
+            static_cast<size_t>(num_keys * params.row_size_bytes));
+
+        tb_->reset_lookup_counter(ctx_);
+        tb_->find(ctx_, num_keys, std::move(keys_bw), std::move(hit_mask_bw),
+                  params.row_size_bytes, std::move(values_bw), nullptr);
+
+        int64_t hits = 0;
+        tb_->get_lookup_counter(ctx_, &hits);
+        EXPECT_EQ(num_keys - static_cast<int64_t>(std::size(existing_hit_indices)), hits);
+    }
+
     table_ptr_t tb_;
     context_ptr_t ctx_;
     DataType* h_table_;
@@ -176,6 +214,7 @@ TEST_P(LHTFixture_INT64_T, test_name)     \
 }                                         \
 
 TEST_FORMAT(find, test_find);
+TEST_FORMAT(find_counts_only_new_hits, test_find_counts_only_new_hits);
 TEST_FORMAT(update, test_update);
 TEST_FORMAT(update_accumulate, test_update_accumulate);
 #undef TEST_FORMAT

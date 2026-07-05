@@ -138,6 +138,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS "1" CACHE STRING "" FORCE)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE) # Make sure fPIC is set before third_party so it affects those too
 
+option(NVE_DISABLE_TESTS_AND_SAMPLES "Disable building tests and samples" OFF)
+
 # Compile third party stuff first before we taint the compiler flags to our preference (except build_type, AVX and fPIC)
 set(NVE_THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party CACHE INTERNAL "" FORCE)
 add_subdirectory(third_party)
@@ -241,12 +243,19 @@ if(NVE_ORIGIN_RPATH)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
+# Generated FindAndCombine kernel instantiations (see cmake/gen_find_and_combine_instantiations.py
+# and src/CMakeLists.txt). The directory holds find_and_combine_kernel_extern.inc, which the kernel
+# header pulls in, so every target that includes the header needs it on the include path.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(FAC_GEN_DIR ${CMAKE_BINARY_DIR}/src/generated/find_and_combine)
+
 include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/third_party
     ${PROJECT_SOURCE_DIR}/third_party/json/single_include
+    ${FAC_GEN_DIR}
 )
 
 # Set compiler switches for optional features.
@@ -265,6 +274,15 @@ if(NVE_ENABLE_NVTX)
 else()
   message(STATUS "NVTX disabled")
 endif()
+
+# driverless system build flag
+option(NVE_DRIVERLESS_BUILD
+       "Build without the CUDA driver API: (no libcuda)" OFF)
+message(STATUS "NVE_DRIVERLESS_BUILD: ${NVE_DRIVERLESS_BUILD}")
+
+# MPI-less build flag
+option(NVE_DISABLE_MPI "Build without OpenMPI" OFF)
+message(STATUS "NVE_DISABLE_MPI: ${NVE_DISABLE_MPI}")
 
 add_subdirectory(src)
 add_subdirectory(plugins)
@@ -301,7 +319,7 @@ if(NOT NVE_DISABLE_TORCH_BINDINGS)
 endif()
 
 add_subdirectory(python/pynve/bindings)
-if(NOT DEFINED NVE_DISABLE_TESTS_AND_SAMPLES)
+if(NOT NVE_DISABLE_TESTS_AND_SAMPLES)
   message(STATUS "Tests and samples are enabled")
   add_subdirectory(samples)
   add_subdirectory(tests)

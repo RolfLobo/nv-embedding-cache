@@ -25,20 +25,10 @@ namespace nve {
 
 template<typename KeyType, typename CounterType, uint32_t NUM_WAYS>
 __global__ void ComputeSetKernel(uint32_t num_keys, uint32_t num_sets,
-                                const KeyType* __restrict__ keys, uint32_t* __restrict__ sets, CounterType* __restrict__ counters,
-                                float decay_rate) {
+                                const KeyType* __restrict__ keys, uint32_t* __restrict__ sets) {
     const uint32_t offset = blockIdx.x * warpSize * blockDim.y + threadIdx.y * warpSize;
     if ((offset + threadIdx.x) < num_keys) {
         sets[offset + threadIdx.x] = embed_cache_hash_set_idx(keys[offset + threadIdx.x], num_sets);
-    }
-    const uint32_t sets_per_warp = warpSize / NUM_WAYS;
-    const uint32_t set = blockIdx.x * sets_per_warp * blockDim.y + threadIdx.y * sets_per_warp + (threadIdx.x / NUM_WAYS);
-    const uint32_t way = threadIdx.x % NUM_WAYS;
-    if (set < num_sets) {
-        CounterType* set_counters_ptr = counters + set * NUM_WAYS;
-
-        // update set counters
-        set_counters_ptr[way] *= decay_rate;
     }
 }
 
@@ -155,6 +145,9 @@ __global__ void SetReplaceDataKernel(
     const float* __restrict__ priority,
     const TagType* __restrict__ tags,
     CounterType* __restrict__ counters,
+    int64_t* __restrict__ set_timestamps,
+    int64_t global_ts,
+    float decay_rate,
     int8_t* cache_ptr,
     uint32_t embed_width_in_bytes,
     uint32_t num_sets,
@@ -177,6 +170,19 @@ __global__ void SetReplaceDataKernel(
 
         const TagType* set_ways_ptr = tags + set * NUM_WAYS;
         CounterType* set_counters_ptr = counters + set * NUM_WAYS;
+
+        // Lazy decay: age this set's counters by the elapsed calls since it was
+        // last touched, then stamp it current. Done before any counter is read
+        // or incremented below, so eviction sees fully-decayed values. Each way
+        // (threadIdx.x in [0, NUM_WAYS)) decays its own counter.
+        const int64_t delta = global_ts - set_timestamps[set];
+        if (delta > 0 && decay_rate != 1.0f) {
+            set_counters_ptr[threadIdx.x] *= __powf(decay_rate, static_cast<float>(delta));
+        }
+        if (threadIdx.x == 0) {
+            set_timestamps[set] = global_ts;
+        }
+        __syncwarp();
 
         // find NUM_WAYS best candidates
         // process NUM_WAYS candidates each time
@@ -364,6 +370,8 @@ cudaError_t ComputeSetReplaceData(
     const float* priority,
     const TagType* tags,
     CounterType* counters,
+    int64_t* set_timestamps,
+    int64_t global_ts,
     int8_t* cache_ptr,
     uint64_t embed_width_in_bytes,
     float decay_rate,
@@ -436,22 +444,21 @@ cudaError_t ComputeSetReplaceData(
         storageSize -= (4 * num_keys + num_sets + 1 + 1) * sizeof(uint32_t);
 
         const uint32_t num_warps = 1;
-        auto sets_in_block = num_warps * (32 / NUM_WAYS);
         auto keys_in_block = num_warps * 32;
 
         const uint32_t grid_size_keys = (static_cast<uint32_t>(num_keys) + keys_in_block - 1) / keys_in_block;
-        const uint32_t grid_size_sets = (static_cast<uint32_t>(num_sets) + sets_in_block - 1) / sets_in_block;
 
-        dim3 gridSizeComputeSets (std::max(grid_size_keys, grid_size_sets), 1);
+        dim3 gridSizeComputeSets (grid_size_keys, 1);
         dim3 blockSizeComputeSets (32, num_warps);
 
         ComputeSetKernel<KeyType, CounterType, NUM_WAYS><<<gridSizeComputeSets, blockSizeComputeSets, 0, stream>>>(
             static_cast<uint32_t>(num_keys), static_cast<uint32_t>(num_sets), 
-            keys, sets, counters, decay_rate);
+            keys, sets);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             return err;
         }
+
         std::vector<uint32_t> locations(num_keys);
         for (uint32_t i = 0; i < num_keys; i++) {
             locations[i] = i;
@@ -465,14 +472,14 @@ cudaError_t ComputeSetReplaceData(
             sets, sets_sorted, locations_device, inverse_map, num_keys, 0, sizeof(uint32_t)*8, stream);
         if (err != cudaSuccess) {
             return err;
-        }            
+        }
         // Run encoding
         err = cub::DeviceRunLengthEncode::Encode(
             curr_ptr, storageSize,
             sets_sorted, unique_sets, counts_out, numSetsDevice, static_cast<int>(num_keys), stream);
         if (err != cudaSuccess) {
             return err;
-        }        
+        }
         uint32_t num_represented_sets;
         err = cudaMemcpyAsync(&num_represented_sets, numSetsDevice, sizeof(uint32_t), cudaMemcpyDefault, stream);
         if (err != cudaSuccess) {
@@ -496,6 +503,7 @@ cudaError_t ComputeSetReplaceData(
         SetReplaceDataKernel<KeyType, TagType, CounterType, NUM_WAYS><<<gridSize, blockSize, 0, stream>>>(
             data_ptrs, keys, unique_sets, offsets, inverse_map,
             static_cast<uint32_t>(num_keys), priority, tags, counters,
+            set_timestamps, global_ts, decay_rate,
             cache_ptr, static_cast<uint32_t>(embed_width_in_bytes),
             static_cast<uint32_t>(num_sets), num_represented_sets,
             max_update_size, replace_entries, sentinel_key);

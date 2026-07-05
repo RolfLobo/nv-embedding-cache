@@ -34,10 +34,10 @@ namespace nve {
 enum class SparseType_t : uint64_t {
   Fixed,
   CSR,
-  COO,
 
   // Potential additions:
   //   CSR_NoLast: same as CSR but without the last offset
+  //   COO: two elements per key (bag_id, id_in_bag), sorted row-wise.
   //   COO_Transposed: COO but instead of array of pairs {row0,col0,row1,col1,...}, arrays of rows
   //   then all cols {row0,row1,...,col0,col1,...}
 };
@@ -49,6 +49,11 @@ enum class PoolingType_t : uint64_t {
   WeightedSum,
   WeightedMean,
 };
+
+inline constexpr bool is_weighted_pooling(const PoolingType_t pooling_type) noexcept {
+  return pooling_type == PoolingType_t::WeightedSum ||
+         pooling_type == PoolingType_t::WeightedMean;
+}
 
 // We rely on DataTypeID_t being 32bit when converting to DataType_t
 enum class DataTypeID_t : uint32_t {
@@ -139,6 +144,50 @@ static constexpr int64_t dtype_size(const DataType_t dtype) noexcept {
   return static_cast<int64_t>(static_cast<uint64_t>(dtype) >> 32);
 }
 
+// True for the per-row quantized storage types (int8 symmetric / uint8 affine). These store value
+// bytes followed by trailing scale [+ offset] metadata and must be dequantized to float/half on
+// lookup; dtype_size() reports the 1-byte value element for all of them.
+inline constexpr bool is_quant_rowwise(const DataType_t dtype) noexcept {
+  return dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QInt8RowwiseF16 ||
+         dtype == DataType_t::QUint8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF16;
+}
+
+// Float type used for rowwise-quantization parameters and native dequantized output. The F32/F16
+// suffix on a quantized dtype denotes this precision.
+inline DataType_t quant_rowwise_output_dtype(const DataType_t dtype) {
+  switch (dtype) {
+    case DataType_t::QInt8RowwiseF32:
+    case DataType_t::QUint8RowwiseF32: return DataType_t::Float32;
+    case DataType_t::QInt8RowwiseF16:
+    case DataType_t::QUint8RowwiseF16: return DataType_t::Float16;
+    default:
+      NVE_THROW_("Not a rowwise-quantized data type: ", static_cast<uint64_t>(dtype));
+  }
+  return DataType_t::Unknown;
+}
+
+// Number of trailing parameter values stored after each row's quantized values: symmetric QInt8
+// stores only a scale; affine QUint8 stores a scale and offset.
+inline int64_t quant_rowwise_meta_count(const DataType_t dtype) {
+  switch (dtype) {
+    case DataType_t::QInt8RowwiseF32:
+    case DataType_t::QInt8RowwiseF16: return 1;
+    case DataType_t::QUint8RowwiseF32:
+    case DataType_t::QUint8RowwiseF16: return 2;
+    default:
+      NVE_THROW_("Not a rowwise-quantized data type: ", static_cast<uint64_t>(dtype));
+  }
+  return 0;
+}
+
+inline int64_t quant_rowwise_scale_bytes(const DataType_t dtype) {
+  return dtype_size(quant_rowwise_output_dtype(dtype));
+}
+
+inline int64_t quant_rowwise_meta_bytes(const DataType_t dtype) {
+  return quant_rowwise_meta_count(dtype) * quant_rowwise_scale_bytes(dtype);
+}
+
 static constexpr const char* to_string(const DataType_t dtype) { return to_string(dtype_id(dtype)); }
 
 static inline std::ostream& operator<<(std::ostream& o, const DataType_t dtype) {
@@ -148,6 +197,33 @@ static inline std::ostream& operator<<(std::ostream& o, const DataType_t dtype) 
 void to_json(nlohmann::json& json, const DataType_t e);
 
 void from_json(const nlohmann::json& j, DataType_t& e);
+
+static constexpr DataType_t data_type(const DataTypeID_t dtype_id) {
+  switch (dtype_id) {
+    case DataTypeID_t::Float32:
+      return DataType_t::Float32;
+    case DataTypeID_t::Float16:
+      return DataType_t::Float16;
+    case DataTypeID_t::BFloat:
+      return DataType_t::BFloat;
+    case DataTypeID_t::E4M3:
+      return DataType_t::E4M3;
+    case DataTypeID_t::E5M2:
+      return DataType_t::E5M2;
+    case DataTypeID_t::Float64:
+      return DataType_t::Float64;
+    case DataTypeID_t::QInt8RowwiseF32:
+      return DataType_t::QInt8RowwiseF32;
+    case DataTypeID_t::QInt8RowwiseF16:
+      return DataType_t::QInt8RowwiseF16;
+    case DataTypeID_t::QUint8RowwiseF32:
+      return DataType_t::QUint8RowwiseF32;
+    case DataTypeID_t::QUint8RowwiseF16:
+      return DataType_t::QUint8RowwiseF16;
+    default:
+      NVE_THROW_("Unknown data type ID!");
+  }
+}
 
 template <typename T>
 static constexpr DataType_t data_type() {

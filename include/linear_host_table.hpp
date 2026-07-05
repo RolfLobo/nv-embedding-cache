@@ -89,6 +89,21 @@ public:
         NVE_CHECK_(num_keys > 0, "Invalid number of keys");
         const auto* typed_keys = reinterpret_cast<const key_type*>(keys_buf);
         const int64_t num_threads{std::min(ctx->get_thread_pool()->num_workers(), config_.max_threads)};
+
+        // Count existing hits on the hitmask (needed for calculating the hit counter)
+        int64_t previous_hits = 0;
+        if (hit_mask_buf != nullptr) {
+            const int64_t full_words = num_keys / max_bitmask_t::num_bits;
+            for (int64_t i = 0; i < full_words; ++i) {
+                previous_hits += max_bitmask_t::count(hit_mask_buf[i]);
+            }
+            const int64_t remaining_bits = num_keys % max_bitmask_t::num_bits;
+            if (remaining_bits != 0) {
+                previous_hits += max_bitmask_t::count(
+                    max_bitmask_t::clip(hit_mask_buf[full_words], remaining_bits));
+            }
+        }
+
         NVE_CHECK_(cpu_kernel_gather<key_type>(
             ctx->get_thread_pool(),
             static_cast<size_t>(num_keys),
@@ -102,7 +117,7 @@ public:
         ) == 0);
         auto ctx_counter = lookup_counter_storage(ctx);
         NVE_CHECK_(ctx_counter != nullptr, "Invalid key counter");
-        *ctx_counter += num_keys;
+        *ctx_counter += num_keys - previous_hits;
     }
 
     void insert(context_ptr_t& /*ctx*/, int64_t /*num_keys*/, buffer_ptr<const void> /*keys*/, int64_t /*value_stride*/,

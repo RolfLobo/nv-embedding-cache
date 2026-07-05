@@ -59,14 +59,15 @@ The provided [Dockerfile](Dockerfile) satisfies these prerequisites. If you're u
 The [docs](docs/) dir contains our documentation. It's structured as follows:
 ```bash
 docs
-├── advanced.md   # Advanced topics
-├── benchmarks.md # Benchmarking instructions
-├── c_api.md      # C API documentation
-├── cpp_api.md    # C++ API documentation
-├── multi_gpu.md  # Multi-GPU support
-├── overview.md   # SDK Overview            <-- Start Here!
-├── python_api.md # Python bindings documentation
-└── samples.md    # Samples listing and description
+├── advanced.md     # Advanced topics
+├── benchmarks.md   # Benchmarking instructions
+├── build_flags.md  # CMake and Python build configuration
+├── c_api.md        # C API documentation
+├── cpp_api.md      # C++ API documentation
+├── multi_gpu.md    # Multi-GPU support
+├── overview.md     # SDK Overview            <-- Start Here!
+├── python_api.md   # Python bindings documentation
+└── samples.md      # Samples listing and description
 ```
 A good place to start is: [docs/overview.md](docs/overview.md).
 

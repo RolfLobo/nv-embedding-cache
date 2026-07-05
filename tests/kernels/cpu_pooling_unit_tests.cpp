@@ -199,8 +199,7 @@ class CpuPoolingTest : public ::testing::TestWithParam<PoolingTestParams> {
 
     const int64_t in_stride  = input_row_stride(p.in_type, p.row_elements);
     const int64_t out_stride = output_row_stride(p.out_type, p.row_elements);
-    const bool weighted = (p.pooling_type == PoolingType_t::WeightedSum ||
-                           p.pooling_type == PoolingType_t::WeightedMean);
+    const bool weighted = is_weighted_pooling(p.pooling_type);
 
     // Build CSR offsets or derive total_keys for Fixed
     std::vector<int64_t> csr_offsets;
@@ -235,12 +234,12 @@ class CpuPoolingTest : public ::testing::TestWithParam<PoolingTestParams> {
 
     std::vector<int8_t> ref_out(static_cast<size_t>(out_rows * out_stride), 0);
     if (p.sparse_type == SparseType_t::Fixed) {
-      const int64_t key_idx = p.avg_hotness;
       mock.combine(gathered.data(), total_keys, p.pooling_type, p.sparse_type,
-                   &key_idx, 1, weights_ptr, p.weight_type, ref_out.data(), p.out_type);
+                   nullptr, 0, p.avg_hotness, weights_ptr, p.weight_type, ref_out.data(),
+                   p.out_type);
     } else {
       mock.combine(gathered.data(), total_keys, p.pooling_type, p.sparse_type,
-                   csr_offsets.data(), static_cast<int64_t>(csr_offsets.size()),
+                   csr_offsets.data(), static_cast<int64_t>(csr_offsets.size()), 0,
                    weights_ptr, p.weight_type, ref_out.data(), p.out_type);
     }
 
@@ -341,17 +340,16 @@ class CpuPoolingEdgeTest : public ::testing::Test {
     HostTableConfig cfg;
     cfg.max_value_size = in_stride;
     cfg.value_dtype    = in_type;
-    // The reference reads key_indices as OffsetT, matching what we pass to the dispatch.
+    // The reference reads csr_offsets as OffsetT, matching what we pass to the dispatch.
     MockHostTable<OffsetT> mock(cfg, /*functional_ref=*/false);
 
     std::vector<int8_t> ref_out(static_cast<size_t>(out_rows * out_stride), 0);
     if (sparse_type == SparseType_t::Fixed) {
-      const OffsetT fh = static_cast<OffsetT>(fixed_hotness);
       mock.combine(gathered.data(), total_keys, pooling_type, sparse_type,
-                   &fh, 1, weights, weight_type, ref_out.data(), out_type);
+                   nullptr, 0, fixed_hotness, weights, weight_type, ref_out.data(), out_type);
     } else {
       mock.combine(gathered.data(), total_keys, pooling_type, sparse_type,
-                   csr_offsets.data(), static_cast<int64_t>(csr_offsets.size()),
+                   csr_offsets.data(), static_cast<int64_t>(csr_offsets.size()), 0,
                    weights, weight_type, ref_out.data(), out_type);
     }
 

@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <thread>
 #include <numeric>
+#include <cmath>
+#include <map>
 #include "embedding_cache_combined.h"
 #include "embedding_cache_combined.cuh"
 #include "cuda_ops/cuda_utils.cuh"
@@ -75,6 +77,11 @@ class SortAndInsertTest : public ::testing::Test {
         replace_list->ph[0].num_entries = 0;
         replace_list->HtoD(0);
 
+        // Lazy-decay timestamps: zero them and pass global_ts=1 so every touched
+        // set is decayed exactly once (delta = 1) by decay_rate this call.
+        auto set_ts = std::make_shared<TestBuffer<int64_t>>(num_sets * sizeof(int64_t));
+        CHECK_CUDA_ERROR(cudaMemset(set_ts->pd, 0, num_sets * sizeof(int64_t)));
+
         CHECK_CUDA_ERROR((ComputeSetReplaceData<KeyType, TagType, CounterType, NUM_WAYS, true>(
             reinterpret_cast<const int8_t* const*>(data_ptrs->pd),
             unique_keys->pd,
@@ -84,6 +91,8 @@ class SortAndInsertTest : public ::testing::Test {
             priorities->pd,
             tags->pd,
             counters->pd,
+            set_ts->pd,
+            1, // global_ts (decay each touched set once per call)
             nullptr, // cache ptr participates in dst address compute only
             embedding_size,
             decay_rate,
@@ -107,8 +116,10 @@ class SortAndInsertTest : public ::testing::Test {
             num_keys,
             nullptr,
             nullptr,
-            nullptr,
-            nullptr,
+            nullptr,                 // counters
+            nullptr,                 // set_timestamps (unused for size query)
+            0,                       // global_ts
+            nullptr,                 // cache_ptr
             embedding_size,
             0,
             num_sets,
@@ -298,8 +309,13 @@ class SortAndInsertTest : public ::testing::Test {
         CHECK_CUDA_ERROR(cudaFree(extra_mem_buf));
     }
 
-    void LaunchRandomInsertTest(uint32_t num_sets, size_t embedding_size, float decay_rate) {
+    void LaunchRandomInsertTest(uint32_t num_sets, size_t embedding_size, float decay_rate,
+                                int64_t global_ts, int64_t max_delta) {
         const uint32_t num_keys = num_sets * (NUM_WAYS - 1);
+        // delta = global_ts - set_ts must stay in [1, max_delta], so the oldest
+        // stamp we draw cannot predate the clock origin.
+        ASSERT_GE(global_ts, max_delta);
+        ASSERT_GE(max_delta, 1);
 
         auto tags = std::make_shared<TestBuffer<TagType>>(num_sets * NUM_WAYS * sizeof(TagType));
         auto counters = std::make_shared<TestBuffer<CounterType>>(num_sets * NUM_WAYS * sizeof(CounterType));
@@ -315,6 +331,19 @@ class SortAndInsertTest : public ::testing::Test {
 
         std::mt19937 genr(0X753812);
         InitRandomTestInputs(num_keys, unique_keys, priorities, data_ptrs, genr);
+
+        // Lazy-decay clock: give every set its own stale timestamp so a touched set
+        // is aged by decay_rate^delta with delta = global_ts - set_ts varying per set
+        // in [1, max_delta]. This exercises multi-step decay rather than a single
+        // decay_rate step.
+        std::uniform_int_distribution<int64_t> dist_ts(global_ts - max_delta, global_ts - 1);
+        auto set_ts = std::make_shared<TestBuffer<int64_t>>(num_sets * sizeof(int64_t));
+        std::vector<int64_t> delta(num_sets);
+        for (uint32_t i = 0; i < num_sets; i++) {
+            set_ts->ph[i] = dist_ts(genr);
+            delta[i] = global_ts - set_ts->ph[i];
+        }
+        set_ts->HtoD(0);
 
         // reference mimics kernel logic for ease of comparison
 
@@ -340,9 +369,18 @@ class SortAndInsertTest : public ::testing::Test {
         // complete tags and counters for the test
         InitRandomTestCountersAndTags(num_sets, counters, tags, num_hits, genr);
 
-        // counters already copied to device, so we can compute in place 
-        for (uint32_t i=0 ; i < num_sets * NUM_WAYS; i++) {
-            counters->ph[i] *= decay_rate;
+        // counters already copied to device, so we can compute in place.
+        // The kernel only ages sets it actually touches (those with at least one
+        // key), each by decay_rate^delta, so mirror that here: skip empty sets and
+        // use the per-set delta.
+        for (uint32_t i = 0 ; i < num_sets; i++) {
+            if (set_keys[i].empty()) {
+                continue;
+            }
+            const float factor = std::pow(decay_rate, static_cast<float>(delta[i]));
+            for (uint32_t j = 0 ; j < NUM_WAYS; j++) {
+                counters->ph[i * NUM_WAYS + j] *= factor;
+            }
         }
 
         for (uint32_t i = 0 ; i < num_sets; i++) {
@@ -357,6 +395,11 @@ class SortAndInsertTest : public ::testing::Test {
         }
 
         std::vector<ModifyEntry> replace_entries_ref;
+        // expected post-insert counter for every way that gets overwritten by a new
+        // key: the kernel sets it to the incoming key's priority. Keyed by way index
+        // (set * NUM_WAYS + way). Ways absent from this map keep their decayed (and
+        // possibly hit-incremented) value held in counters->ph.
+        std::map<uint64_t, CounterType> replaced_way_counter;
         for (uint32_t i = 0 ; i < num_sets; i++) {
             std::vector<CounterType> set_counters;
             std::vector<uint32_t> set_positions(NUM_WAYS);
@@ -423,6 +466,7 @@ class SortAndInsertTest : public ::testing::Test {
                             .way = j,
                             .tag = replace_tags[j]
                         });
+                    replaced_way_counter[i * NUM_WAYS + j] = priorities->ph[key_loc];
                 }
             }
         }
@@ -437,7 +481,9 @@ class SortAndInsertTest : public ::testing::Test {
         replace_list->ph[0].entries = replace_entries->pd;
         replace_list->ph[0].num_entries = 0; // for atomic
         replace_list->HtoD(0);
-        
+
+        // set_ts (per-set stale timestamps) and global_ts are set up above so the
+        // reference and the kernel age each set by the same decay_rate^delta.
         CHECK_CUDA_ERROR((ComputeSetReplaceData<KeyType, TagType, CounterType, NUM_WAYS, true>(
             reinterpret_cast<const int8_t* const*>(data_ptrs->pd),
             unique_keys->pd,
@@ -447,6 +493,8 @@ class SortAndInsertTest : public ::testing::Test {
             priorities->pd,
             tags->pd,
             counters->pd,
+            set_ts->pd,
+            global_ts,
             nullptr, // cache ptr participates in dst address compute only
             embedding_size,
             decay_rate,
@@ -458,6 +506,11 @@ class SortAndInsertTest : public ::testing::Test {
 
         replace_entries->DtoH(0);
         replace_list->DtoH(0);
+        // read back the per-set timestamps and post-insert counters to verify decay
+        auto counters_dev = std::make_shared<TestBuffer<CounterType>>(num_sets * NUM_WAYS * sizeof(CounterType));
+        CHECK_CUDA_ERROR(cudaMemcpy(counters_dev->ph, counters->pd,
+                                    num_sets * NUM_WAYS * sizeof(CounterType), cudaMemcpyDefault));
+        set_ts->DtoH(0);
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
         CHECK_CUDA_ERROR(cudaFree(extra_mem_buf));
@@ -486,6 +539,26 @@ class SortAndInsertTest : public ::testing::Test {
             EXPECT_TRUE (rep_ref.tag == rep_dev.tag);
             EXPECT_TRUE (rep_ref.src == rep_dev.src);
             EXPECT_TRUE (rep_ref.dst == rep_dev.dst);
+        }
+
+        // verify the lazy decay numerically: every touched set must have been
+        // stamped to global_ts, and each of its way counters must hold the expected
+        // decayed value (decay_rate^delta applied to the original, plus any hit
+        // increment), except ways overwritten by a new key which hold its priority.
+        const float decay_tol = 1e-3f;
+        for (uint32_t i = 0 ; i < num_sets; i++) {
+            if (set_keys[i].empty()) {
+                continue; // untouched set: neither decayed nor re-stamped
+            }
+            EXPECT_EQ(set_ts->ph[i], global_ts);
+            for (uint32_t j = 0 ; j < NUM_WAYS; j++) {
+                uint64_t idx = i * NUM_WAYS + j;
+                auto it = replaced_way_counter.find(idx);
+                CounterType expected = (it != replaced_way_counter.end()) ? it->second
+                                                                          : counters->ph[idx];
+                EXPECT_NEAR(counters_dev->ph[idx], expected,
+                            decay_tol * (std::abs(expected) + 1.0f));
+            }
         }
     }
 };
@@ -521,7 +594,11 @@ TYPED_TEST_P(SortAndInsertTest, TestInsertRandomAgainstRef) {
     const uint32_t num_sets = 511;
     const size_t embedding_size = 507;
     float decay_rate = 0.95f;
-    this->LaunchRandomInsertTest(num_sets, embedding_size, decay_rate);
+    // global_ts past the oldest stamp by up to max_delta calls -> per-set decay
+    // of decay_rate^delta with delta in [1, max_delta].
+    const int64_t global_ts = 8;
+    const int64_t max_delta = 4;
+    this->LaunchRandomInsertTest(num_sets, embedding_size, decay_rate, global_ts, max_delta);
 }
 
 REGISTER_TYPED_TEST_SUITE_P(SortAndInsertTest, TestSortAgainstRef, TestInsertCounters, TestInsertRandomAgainstRef);

@@ -24,6 +24,7 @@ import pynve.torch.nve_export as nve_export
 import pynve.nve as nve
 import pytest
 import tempfile
+import threading
 import torch
 
 
@@ -129,7 +130,8 @@ def test_host_layer_cpu_export_load_roundtrip():
             self.emb = nve_layers.NVEmbedding(
                 num_embeddings, embed_size, torch.float32,
                 layer_type=nve_layers.LayerType.HostLayer,
-                weight_init=weight, optimize_for_training=False)
+                weight_init=weight, optimize_for_training=False,
+                device=torch.device("cpu"))
 
     save_dir = tempfile.mkdtemp()
     nve_export.save_nve(M(), save_dir)
@@ -156,7 +158,8 @@ def test_host_layer_cpu_aot_export_load_roundtrip():
             self.emb = nve_layers.NVEmbedding(
                 num_embeddings, embed_size, torch.float32,
                 layer_type=nve_layers.LayerType.HostLayer,
-                weight_init=weight, optimize_for_training=False)
+                weight_init=weight, optimize_for_training=False,
+                device=torch.device("cpu"))
 
         def forward(self, keys):
             return self.emb(keys)
@@ -206,6 +209,90 @@ def test_embedding_bag_rejects_host_layer():
             device=torch.device("cpu"),
             optimize_for_training=False,
         )
+
+
+def test_host_layer_cpu_concurrent_gather():
+    # Regression: the CPU lookup op used to pass stream=0 for every thread, so all
+    # worker threads keyed into the *same* execution context and raced on its
+    # scratch buffers. get_cpu_stream() now hands each thread a distinct sentinel
+    # (address of a thread_local), giving every thread its own context. Many
+    # threads gathering disjoint, easily-verifiable rows must all see correct
+    # output with no cross-thread corruption.
+    num_embeddings = 4096
+    embed_size = 16
+    # Row i is filled with the value i, so a gathered row immediately reveals
+    # whether another thread's lookup clobbered the shared scratch.
+    weight = (torch.arange(num_embeddings, dtype=torch.float32)
+              .unsqueeze(1).expand(num_embeddings, embed_size).contiguous())
+    layer = _make_layer(num_embeddings, embed_size, weight, storage_kind="memblock")
+
+    num_threads = 8
+    iters_per_thread = 200
+    errors = []
+    barrier = threading.Barrier(num_threads)
+
+    def worker(tid):
+        # Each thread repeatedly gathers its own disjoint slice of rows.
+        keys = torch.arange(tid, num_embeddings, num_threads, dtype=torch.int64)
+        expected = weight[keys]
+        try:
+            barrier.wait()  # maximize overlap to provoke any shared-context race
+            for _ in range(iters_per_thread):
+                out = layer(keys)
+                if not torch.equal(out, expected):
+                    raise AssertionError(
+                        f"thread {tid}: gathered rows did not match expected")
+        except Exception as exc:  # noqa: BLE001 - surface in main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent gather failures: {errors}"
+
+
+def test_host_layer_cpu_concurrent_distinct_layers():
+    # Same race surface, but each thread drives its own layer instance to confirm
+    # the per-thread context keying is correct even when bindings differ. Values
+    # are offset per layer so a leaked context between layers is also caught.
+    num_embeddings = 1024
+    embed_size = 8
+    num_threads = 6
+
+    layers = []
+    weights = []
+    for tid in range(num_threads):
+        w = ((torch.arange(num_embeddings, dtype=torch.float32) + tid * num_embeddings)
+             .unsqueeze(1).expand(num_embeddings, embed_size).contiguous())
+        weights.append(w)
+        layers.append(_make_layer(num_embeddings, embed_size, w, storage_kind="memblock"))
+
+    errors = []
+    barrier = threading.Barrier(num_threads)
+    keys = torch.tensor([0, 5, 17, 256, 1023], dtype=torch.int64)
+
+    def worker(tid):
+        expected = weights[tid][keys]
+        try:
+            barrier.wait()
+            for _ in range(200):
+                out = layers[tid](keys)
+                if not torch.equal(out, expected):
+                    raise AssertionError(
+                        f"thread {tid}: layer output corrupted across threads")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent multi-layer failures: {errors}"
 
 
 def test_host_layer_rejects_optimize_for_training():

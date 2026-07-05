@@ -18,9 +18,10 @@
 // nve_torch_ops_cpu.cpp — CPU dispatch implementations for nve_ops custom ops.
 //
 // Mirrors nve_torch_ops.cu but never calls the CUDA stream shim and creates
-// outputs on a CPU device. The underlying NVE binding receives stream=0; the
-// host layer's execution context gates all CUDA ops on driver availability, so
-// the path is safe on a driverless system.
+// outputs on a CPU device. The underlying NVE binding receives a per-thread
+// sentinel "stream" (see get_cpu_stream) that keys the host execution context;
+// the host layer's execution context gates all CUDA ops on driver availability,
+// so the path is safe on a driverless system.
 //
 // This TU is intentionally CUDA-free: it talks to the binding via free
 // functions declared in nve_registry.hpp (forward-declared NVEmbedBinding).
@@ -29,6 +30,7 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 
 #include "nve_registry.hpp"
@@ -45,6 +47,12 @@ static ts::ScalarType dtype_tag_to_stable(int tag) {
     if (tag == nve::kBindingDtypeFloat32) return ts::ScalarType::Float;
     if (tag == nve::kBindingDtypeFloat16) return ts::ScalarType::Half;
     throw std::runtime_error("nve-torch-ops-cpu: unsupported BindingDtype tag");
+}
+
+// Per-thread sentinel "stream" value. 
+static std::uint64_t get_cpu_stream() {
+    static thread_local char sentinal = 0;
+    return reinterpret_cast<std::uint64_t>(&sentinal);
 }
 
 extern "C" AtenTensorHandle nve_embedding_lookup_cpu(
@@ -64,13 +72,14 @@ extern "C" AtenTensorHandle nve_embedding_lookup_cpu(
         std::nullopt,
         ts::Device(ts::DeviceType::CPU));
 
-    // stream=0 — sentinel for host-only execution context cache key.
+    // Per-thread sentinel stream — keys the host execution context per worker
+    // thread so concurrent lookups don't share (and race on) one context.
     nve::binding_lookup(
         binding,
         static_cast<std::size_t>(num_keys),
         reinterpret_cast<std::uintptr_t>(keys.data_ptr()),
         reinterpret_cast<std::uintptr_t>(output.data_ptr()),
-        /*stream=*/0);
+        get_cpu_stream());
 
     return to_shared_handle(output);
 }
@@ -112,11 +121,11 @@ extern "C" AtenTensorHandle nve_embedding_lookup_with_pooling_cpu(
         reinterpret_cast<std::uintptr_t>(keys.data_ptr()),
         reinterpret_cast<std::uintptr_t>(output.data_ptr()),
         static_cast<std::uint32_t>(pooling_type),
-        static_cast<std::size_t>(num_bags),
+        static_cast<std::size_t>(offsets.numel()),
         reinterpret_cast<std::uintptr_t>(offsets.data_ptr()),
         weight_dtype,
         weight_ptr,
-        /*stream=*/0);
+        get_cpu_stream());
 
     return to_shared_handle(output);
 }

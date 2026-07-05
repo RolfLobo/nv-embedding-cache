@@ -55,6 +55,12 @@ LinearUVMEmbeddingLayer<KeyType>::LinearUVMEmbeddingLayer(const Config& cfg, gpu
       heuristic = std::make_shared<DefaultInsertHeuristic>(std::vector<float>{DefaultInsertHeuristic::DEFAULT_THRESHOLD});
     }
     KeyType invalid_key = static_cast<KeyType>(gpu_table_->get_invalid_key());
+    // Callback used on the pooling path, where no reusable per-key row data is produced: promote the
+    // collected keys by reading their rows directly from the backing UVM table (see insert_from_uvm).
+    AutoInsertHandler::uvm_insert_fn_t uvm_insert_fn =
+      [gpu_tbl = gpu_table_](context_ptr_t& ctx, int64_t n, std::shared_ptr<BufferWrapper<const void>> keys_bw) {
+        gpu_tbl->insert_from_uvm(ctx, n, std::move(keys_bw));
+      };
     auto_insert_handler_ = std::make_shared<AutoInsertHandler>(
       heuristic,
       gpu_table_,
@@ -64,7 +70,8 @@ LinearUVMEmbeddingLayer<KeyType>::LinearUVMEmbeddingLayer(const Config& cfg, gpu
       config_.min_insert_size_gpu,
       sizeof(KeyType),
       gpu_table_->get_device_id(),
-      &invalid_key
+      &invalid_key,
+      std::move(uvm_insert_fn)
     );
 }
 
@@ -78,15 +85,25 @@ void LinearUVMEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t 
                     const PoolingParams* pool_params, float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(gpu_table_->config().device_id);
-  NVE_CHECK_(num_keys >= 0, "Invalid num_keys");
-  NVE_CHECK_(keys != nullptr, "Invalid keys buffer");
-  NVE_CHECK_(output != nullptr, "Invalid output buffer");
-  NVE_CHECK_(hitmask == nullptr, "Hitmask is not supported for the UVM layer");
+  NVE_CHECK_ARG_(num_keys >= 0, "Invalid num_keys");
+  NVE_CHECK_ARG_(keys != nullptr, "Invalid keys buffer");
+  NVE_CHECK_ARG_(output != nullptr, "Invalid output buffer");
+  NVE_CHECK_ARG_(hitmask == nullptr, "Hitmask is not supported for the UVM layer");
 
   auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
   NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
   const cudaStream_t lookup_stream = layer_ctx->get_lookup_stream();
-  const auto output_buffer_size = num_keys * output_stride;
+  if (pool_params) {
+    validate_pool_params(*pool_params);
+  }
+  const bool raw_concatenate = is_pooling_raw_concat(pool_params, gpu_table_->config().value_dtype);
+  if (raw_concatenate) {
+    NVE_CHECK_ARG_(output_stride >= gpu_table_->config().row_size_in_bytes,
+               "Raw Concatenate output stride is smaller than the stored row width");
+  }
+  const int64_t output_rows = get_lookup_output_rows(num_keys, pool_params);
+  const auto output_buffer_size =
+      static_cast<size_t>(output_rows) * static_cast<size_t>(output_stride);
   const auto key_buffer_size = sizeof(KeyType) * num_keys;
 
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
@@ -99,63 +116,55 @@ void LinearUVMEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t 
   }
 
   // Lookup
-  if (pool_params) {
-    auto offsets_buffer_size = pool_params->num_key_indices * sizeof(KeyType);
-    auto offsets_bw = std::make_shared<BufferWrapper<const KeyType>>(ctx, "offsets", static_cast<const KeyType*>(pool_params->key_indices), offsets_buffer_size);
+  if (pool_params && !raw_concatenate) {
+    // find_and_pool routes internally: Concatenate (one dequantized row per key) goes to
+    // find_and_dequant; any other pooling type combines bags via find_and_combine. Same-type
+    // Concatenate bypasses this block and uses the raw find path below.
+    const bool concatenate = pool_params->pooling_type == PoolingType_t::Concatenate;
+    SparseType_t sparse_type = SparseType_t::Fixed;
+    int64_t num_offsets = 0;
+    int64_t hotness = 0;
+    std::shared_ptr<BufferWrapper<const KeyType>> offsets_bw;
+    std::shared_ptr<BufferWrapper<const void>> weights_bw;
 
-    int64_t hotness;
-    switch (pool_params->sparse_type)
-    {
-    case SparseType_t::CSR:
-      hotness = 0;
-      break;
-    case SparseType_t::Fixed:
-      // TODO: can only copy the first element if offsets was on GPU (access_buffer for host can copy the entire array if buffer was only accessed on GPU)
-      hotness = offsets_bw->access_buffer(cudaMemoryTypeHost, true /*copy_content*/, lookup_stream)[0];
-    break;
-    default:
-      NVE_THROW_("Unsupported pooling sparse type");
+    const DataType_t output_dtype = pool_params->output_type;
+    DataType_t weight_dtype = output_dtype;
+    if (!concatenate) {
+      sparse_type = pool_params->sparse_type;
+      if (sparse_type == SparseType_t::Fixed) {
+        hotness = pool_params->fixed_hotness;
+      } else {
+        num_offsets = pool_params->num_csr_offsets - 1;
+        const auto offsets_buffer_size = pool_params->num_csr_offsets * sizeof(KeyType);
+        offsets_bw = std::make_shared<BufferWrapper<const KeyType>>(
+            ctx, "offsets", static_cast<const KeyType*>(pool_params->csr_offsets),
+            offsets_buffer_size);
+      }
+
+      if (pool_params->weights) {
+        const auto weights_buffer_size =
+            static_cast<size_t>(num_keys) * static_cast<size_t>(dtype_size(pool_params->weight_type));
+        weights_bw = std::make_shared<BufferWrapper<const void>>(
+            ctx, "weights", pool_params->weights, weights_buffer_size);
+        weight_dtype = pool_params->weight_type;
+      }
     }
 
-    // TODO: add support for more data type combinations if needed
-    if (pool_params->sparse_weights != nullptr) {
-      NVE_CHECK_(pool_params->weight_type == gpu_table_->config().value_dtype, "Pooling weight type differs from table data type");
-    }
-    switch(gpu_table_->config().value_dtype) {
-      case DataType_t::Float32:
-      {
-        auto weights_buffer_size = num_keys * sizeof(float);
-        std::shared_ptr<BufferWrapper<const float>> weights_bw = 
-          pool_params->sparse_weights ?
-          std::make_shared<BufferWrapper<const float>>(ctx, "weights", reinterpret_cast<const float*>(pool_params->sparse_weights), weights_buffer_size) :
-          nullptr;
-        gpu_table_->template find_and_combine<KeyType, float>(
-            layer_ctx->table_contexts_.at(0), num_keys, keys_bw,
-            pool_params->sparse_type, pool_params->num_key_indices - 1,
-            std::move(offsets_bw), hotness,
-            pool_params->pooling_type, std::move(weights_bw),
-            output_stride, output_bw);
-        break;
-      }
-      case DataType_t::Float16:
-      {
-        auto weights_buffer_size = num_keys * sizeof(__half);
-        std::shared_ptr<BufferWrapper<const __half>> weights_bw = 
-          pool_params->sparse_weights ?
-          std::make_shared<BufferWrapper<const __half>>(ctx, "weights", reinterpret_cast<const __half*>(pool_params->sparse_weights), weights_buffer_size) :
-          nullptr;
-        gpu_table_->template find_and_combine<KeyType, __half>(
-            layer_ctx->table_contexts_.at(0), num_keys, keys_bw,
-            pool_params->sparse_type, pool_params->num_key_indices - 1,
-            std::move(offsets_bw), hotness,
-            pool_params->pooling_type, std::move(weights_bw),
-            output_stride, output_bw);
-        break;
-      }
-      default:
-        NVE_THROW_("Unsupported data type");
-    }
+    gpu_table_->find_and_pool(
+      layer_ctx->table_contexts_.at(0),
+      num_keys,
+      keys_bw,
+      sparse_type,
+      num_offsets,
+      std::move(offsets_bw),
+      hotness,
+      pool_params->pooling_type,
+      std::move(weights_bw),
+      output_dtype, weight_dtype,
+      output_stride, output_bw);
   } else {
+    // Plain lookup and same-type Concatenate both return complete stored rows, including any
+    // rowwise-quantization metadata.
     gpu_table_->find(layer_ctx->table_contexts_.at(0), num_keys, keys_bw, nullptr, output_stride, output_bw, nullptr);
   }
 
@@ -174,12 +183,13 @@ void LinearUVMEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t 
       *hitrates = hitrate;
     }
     // Handle automatic inserts.
-    // Skip auto-insert for pooled lookups: the output buffer holds bag-level pooled vectors
-    // (num_key_indices - 1 rows), not the per-key embeddings, so pairing it with the per-key
-    // `keys_bw` (num_keys entries) would insert pooled/out-of-bounds values into per-key cache
-    // entries and corrupt the GPU cache.
-    if (auto_insert_handler_ && !pool_params) {
-      auto_insert_handler_->auto_insert(std::move(layer_ctx), keys_bw, output_bw, hitrate, num_keys, output_stride);
+    // Real pooling and Concatenate-mode dequant produce output that cannot be reused as raw per-key
+    // cache rows, so those paths collect keys only and promote from UVM. Plain lookup and same-type
+    // Concatenate both produce reusable raw rows.
+    if (auto_insert_handler_) {
+      auto_insert_handler_->auto_insert(std::move(layer_ctx), keys_bw, output_bw, hitrate, num_keys, output_stride,
+                                        nullptr /*hitmask_bw*/,
+                                        pool_params != nullptr && !raw_concatenate /*insert_from_uvm*/);
     }
   }
 }

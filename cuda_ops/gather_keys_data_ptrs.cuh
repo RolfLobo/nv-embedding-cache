@@ -24,7 +24,7 @@
 
 namespace nve {
 
-template<typename KeyType>
+template<typename KeyType, bool LoadIndices>
 __global__ void GatherKeysAndDataPtrs(
       int8_t* data,
       KeyType* __restrict__ mapping,
@@ -44,9 +44,12 @@ __global__ void GatherKeysAndDataPtrs(
 
     float* priority_out = reinterpret_cast<float*>(priorities);
     KeyType entry = mapping[id];
+    KeyType key = keys[entry];
 
-    data_ptrs[id] = data + entry * embed_width_in_bytes;
-    unique_keys[id] = keys[entry];
+    // LoadIndices addresses a dense table indexed directly by the key value (uvm_base + row_size*key);
+    // otherwise the i'th unique key points at the row of its first occurrence in the dense values buffer.
+    data_ptrs[id] = data + (LoadIndices ? key : entry) * embed_width_in_bytes;
+    unique_keys[id] = key;
 
     priority_out[id] = float(priorities[id]) * norm_factor;
 }
@@ -64,7 +67,7 @@ __global__ void GatherLocations(
     idx_mapping_unique[id] =  idx_mapping_all[offsets[id]];
 }
 
-template<typename KeyType>
+template<typename KeyType, bool LoadIndices = false>
 inline void CallGatherKeysAndDataPtrs(
       const int8_t* __restrict__ data,
       KeyType* __restrict__ mapping,
@@ -83,7 +86,7 @@ inline void CallGatherKeysAndDataPtrs(
 
     dim3 grid_size ((static_cast<uint32_t>(num_unique_keys) + indices_per_block - 1) / indices_per_block, 1);
     dim3 block_size (indices_per_block);
-    GatherKeysAndDataPtrs<KeyType><<<grid_size, block_size, 0, stream>>>(
+    GatherKeysAndDataPtrs<KeyType, LoadIndices><<<grid_size, block_size, 0, stream>>>(
         const_cast<int8_t*>(data), mapping, priorities, keys,
         norm_factor, num_unique_keys, embed_width_in_bytes, unique_keys, data_ptrs);
     NVE_CHECK_(cudaGetLastError());
@@ -104,7 +107,9 @@ void CallGatherLocations(
     NVE_CHECK_(cudaGetLastError());
 }
 
-template<typename KeyType>
+// LoadIndices: when true the per-key data pointer is computed as data + key*strideInBytes (a dense
+// table indexed directly by key value, e.g. a UVM backing table) instead of data + position*stride.
+template<typename KeyType, bool LoadIndices = false>
 class DefaultGPUHistogram
 {
 public:
@@ -178,8 +183,8 @@ public:
             "Failed to call cub::DeviceRadixSort::SortPairs");  
 
         // Gather unique keys and data ptrs
-        CallGatherKeysAndDataPtrs<KeyType>(
-            reinterpret_cast<const int8_t*>(data), idx_mapping_sorted, 
+        CallGatherKeysAndDataPtrs<KeyType, LoadIndices>(
+            reinterpret_cast<const int8_t*>(data), idx_mapping_sorted,
             reinterpret_cast<int*>(priority_), keys,
             1.0f / float(num_keys), num_unique_keys_, strideInBytes,
             unique_keys_, data_ptrs_, histStream);

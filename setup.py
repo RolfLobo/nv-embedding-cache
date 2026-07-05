@@ -25,7 +25,10 @@ import distutils.command.build
 # Environment variables:
 # - PYNVE_BUILD_DIR: Build directory path (default: 'build')
 # - PYNVE_BUILD_SAMPLES: Set to '1' to build samples/tests (default: disabled)
-# - PYNVE_DISABLE_AVX512: Set to disable AVX512 in CI builds
+# - PYNVE_DISABLE_AVX512: Set to '1' to disable AVX512 in CI builds
+# - PYNVE_DISABLE_TORCH_BINDINGS: Set to '1' to skip the PyTorch custom op bindings
+# - PYNVE_DRIVERLESS_BUILD: Set to '1' to build without the CUDA driver (libcuda)
+# - PYNVE_DISABLE_MPI: Set to '1' to build without OpenMPI
 _build_dir = os.environ.get('PYNVE_BUILD_DIR', 'build')
 
 
@@ -67,13 +70,23 @@ class CMakeBuild(build_ext):
                 cmake_args.append('-DNVE_DISABLE_TESTS_AND_SAMPLES=1')
 
             # In CI disable AVX512
-            if (os.environ.get('PYNVE_DISABLE_AVX512')):
+            if os.environ.get('PYNVE_DISABLE_AVX512') == '1':
                 cmake_args.append('-DNVE_DISABLE_AVX512=1')
 
             # PyTorch custom op bindings — built by default.
             # Set PYNVE_DISABLE_TORCH_BINDINGS=1 to disable.
             if os.environ.get('PYNVE_DISABLE_TORCH_BINDINGS') == '1':
                 cmake_args.append('-DNVE_DISABLE_TORCH_BINDINGS=ON')
+
+            # Driverless build: drop the CUDA driver (libcuda) and libtorch_cuda
+            # dependencies so the module loads on hosts without an NVIDIA driver.
+            if os.environ.get('PYNVE_DRIVERLESS_BUILD') == '1':
+                cmake_args.append('-DNVE_DRIVERLESS_BUILD=ON')
+                cmake_args.append('-DNVE_SM_VERSION=100')
+
+            # MPI-less build: exclude the OpenMPI dependency Set PYNVE_DISABLE_MPI=1.
+            if os.environ.get('PYNVE_DISABLE_MPI') == '1':
+                cmake_args.append('-DNVE_DISABLE_MPI=ON')
 
             subprocess.check_call(cmake_args)
             build_threads = min(os.cpu_count(), 32)
@@ -127,4 +140,3 @@ setup(
         },
         zip_safe=False,
         )
-

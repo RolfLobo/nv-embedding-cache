@@ -42,6 +42,7 @@ Saved layout::
 import builtins
 import os
 import json
+import warnings
 import torch
 import pynve.nve as _nve_mod
 from pynve.torch import HAS_TORCH_OPS
@@ -68,20 +69,70 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return getattr(torch, dtype_str.removeprefix("torch."))
 
 
+def _gcd_memblock_type(layer_types: set[LayerType]) -> str:
+    """Pick a concrete memblock type usable by every layer sharing a User block.
+
+    A UserMemBlock wraps a raw, process-specific pointer that cannot be
+    serialized, so on reload we reconstruct it as the "greatest common
+    denominator" type accessible to all sharing layers. Only GPULayer,
+    LinearUVM and HostLayer can be backed by a MemBlock (Hierarchical cannot),
+    so every reachable combination is enumerated explicitly:
+
+        {GPULayer}                       -> Linear
+        {GPULayer, LinearUVM}            -> Linear   (both access device memory)
+        {HostLayer}                      -> Host
+        {LinearUVM}                      -> Managed
+        {HostLayer, LinearUVM}           -> Managed
+        {GPULayer, HostLayer}            -> Managed  (+warning: mixed intent)
+        {GPULayer, HostLayer, LinearUVM} -> Managed  (+warning: mixed intent)
+
+    A block shared by both a GPULayer and a HostLayer is an unusual mix of
+    device-only and host-only intent; it is promoted to Managed with a warning.
+    """
+    MB = _nve_mod.MemBlockType
+    G, U, H = LayerType.GPULayer, LayerType.LinearUVM, LayerType.HostLayer
+
+    # GPU and/or LinearUVM only: a device-side Linear block serves both.
+    if layer_types == {G} or layer_types == {G, U}:
+        return MB.Linear.name
+    # Host only.
+    elif layer_types == {H}:
+        return MB.Host.name
+    # LinearUVM only, or Host+LinearUVM: needs a host+device accessible block.
+    elif layer_types == {U} or layer_types == {U, H}:
+        return MB.Managed.name
+    # GPU+Host (optionally +LinearUVM): mixed device-only/host-only intent.
+    elif layer_types == {G, H} or layer_types == {G, U, H}:
+        warnings.warn(
+            f"UserMemBlock shared by both GPULayer and HostLayer "
+            f"({sorted(t.name for t in layer_types)}); promoting to Managed. "
+            f"Mixing device-only and host-only layers on one block is "
+            f"suboptimal.", stacklevel=2)
+        return MB.Managed.name
+    else:
+        raise ValueError(f"Unexpected layer types combination: {layer_types}")
+
+
 def _memblock_resource_descriptor(module: NVEmbeddingBase) -> dict:
     """Build the resource descriptor for a memblock-backed layer.
 
     Geometry is taken from the layer (the memblock has no getters for it).
     No device indices are recorded — topology is resolved at load time.
-    UserMemBlock is normalised to its reconstructable form (Managed/host) since
-    raw pointers are process-specific and cannot be serialised.
+    The recorded type is the memblock's actual type name; User blocks are
+    finalised later by _collect_resources via _gcd_memblock_type (raw pointers
+    are process-specific and cannot be serialised).
     """
-    mb_type = str(module.memblock_type)
-    if "User" in mb_type:
-        # Normalise: rebuild as Managed on reload (same shape, weights from .nve)
-        mb_type = str(_nve_mod.MemBlockType.Managed)
+    MB = _nve_mod.MemBlockType
+    # User is resolved later by _gcd_memblock_type; the rest must be directly
+    # reconstructable on load. Anything else (e.g. a distributed MPI block whose
+    # topology isn't captured) cannot be serialised — fail loudly here.
+    if module.memblock_type not in (MB.User, MB.NVL, MB.Host, MB.Linear, MB.Managed):
+        raise ValueError(
+            f"Cannot serialize memblock of type {module.memblock_type.name!r}; "
+            f"supported types are NVL, Host, Linear, Managed. Distributed types "
+            f"(e.g. MPI) do not serialize their topology.")
     return {
-        "type": mb_type,
+        "type": module.memblock_type.name,
         "row_elements": module.embedding_size,
         "num_rows": module.num_embeddings,
         "dtype": _dtype_str(module.data_type),
@@ -100,6 +151,9 @@ def _collect_resources(model: torch.nn.Module, *,
     resources = {"remote_ps": {}, "memblocks": {}}
     obj_to_key: dict[int, str] = {}
     layer_storage_refs: dict[str, str] = {}
+    # For User blocks (un-serialisable raw pointers) we defer the type decision
+    # to a gcd over the intents of every layer sharing the block.
+    user_block_layer_types: dict[str, set[LayerType]] = {}
 
     for name, module in model.named_modules():
         if not isinstance(module, NVEmbeddingBase):
@@ -111,10 +165,15 @@ def _collect_resources(model: torch.nn.Module, *,
 
         obj_id = builtins.id(storage)
         if isinstance(storage, _nve_mod.MemBlock):
-            if obj_id not in obj_to_key:
+            key = obj_to_key.get(obj_id)
+            if key is None:
                 key = f"mb-{obj_id}"
                 resources["memblocks"][key] = _memblock_resource_descriptor(module)
                 obj_to_key[obj_id] = key
+            if module.memblock_type == _nve_mod.MemBlockType.User:
+                # Real blocks keep their user-given type; only User-converted
+                # blocks are resolved by layer intent.
+                user_block_layer_types.setdefault(key, set()).add(module.layer_type)
         else:
             if not hasattr(storage, 'export_config'):
                 raise ValueError(
@@ -131,6 +190,10 @@ def _collect_resources(model: torch.nn.Module, *,
                 resources["remote_ps"][key]["remote_ps_data"] = {
                     "keys": keys_path, "values": values_path}
         layer_storage_refs[name] = obj_to_key[obj_id]
+
+    # Resolve User blocks to a concrete type usable by all sharing layers.
+    for key, layer_types in user_block_layer_types.items():
+        resources["memblocks"][key]["type"] = _gcd_memblock_type(layer_types)
 
     return resources, obj_to_key, layer_storage_refs
 
@@ -327,17 +390,29 @@ def _build_memblock_from_descriptor(mb_cfg: dict, device_index: int,
     num_rows = mb_cfg["num_rows"]
     nve_dtype = torch_type_to_nve_type(_parse_dtype(mb_cfg["dtype"]))
 
-    if "NVL" in mb_type_str:
+    if "NVL" == mb_type_str:
         gpu_ids = _nve_mod.resolve_memblock_devices(
             _nve_mod.MemBlockType.NVL, device_index,
             nvl_devices_override or [])
         return _nve_mod.NVLMemBlock(row_elements, num_rows, nve_dtype, gpu_ids)
-    if "Host" in mb_type_str or device_type == "cpu":
+    if "Host" == mb_type_str or device_type == "cpu":
         return _nve_mod.HostMemBlock(row_elements, num_rows, nve_dtype)
-    # Managed (default) and UserMemBlock-normalised-to-Managed
-    gpu_ids = _nve_mod.resolve_memblock_devices(
-        _nve_mod.MemBlockType.Managed, device_index, [])
-    return _nve_mod.ManagedMemBlock(row_elements, num_rows, nve_dtype, gpu_ids)
+    if "Linear" == mb_type_str:
+        gpu_ids = _nve_mod.resolve_memblock_devices(
+            _nve_mod.MemBlockType.Linear, device_index, [])
+        if len(gpu_ids) == 0:
+            raise RuntimeError(f"Unable to resolve gpu_ids check machine configuration")
+        return _nve_mod.LinearMemBlock(row_elements, num_rows, nve_dtype, gpu_ids[0])
+    if "Managed" == mb_type_str:
+        gpu_ids = _nve_mod.resolve_memblock_devices(
+            _nve_mod.MemBlockType.Managed, device_index, [])
+        return _nve_mod.ManagedMemBlock(row_elements, num_rows, nve_dtype, gpu_ids)
+    # Anything else (e.g. a distributed MPI block) is not reconstructable from a
+    # type-only descriptor — fail loudly rather than silently downgrade to Managed.
+    raise ValueError(
+        f"Cannot reconstruct memblock of type {mb_type_str!r}; supported types "
+        f"are NVL, Host, Linear, Managed. Distributed types (e.g. MPI) do not "
+        f"serialize their topology and cannot be reloaded from metadata.")
 
 
 def load_nve_layers(save_dir: str, *, gpu_cache_size_override: int = None,

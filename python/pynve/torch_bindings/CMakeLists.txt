@@ -19,12 +19,22 @@ if(NOT TORCH_FOUND)
     message(FATAL_ERROR "Torch package was not found!")
 endif()
 
-add_library(nve-torch-ops SHARED
+# nve_torch_ops.cu (the CUDA op dispatch) calls aoti_torch_get_current_cuda_stream, which is
+# defined only in libtorch_cuda.so — a hard NEEDED that prevents loading on driverless hosts. In a
+# driverless build we drop it (and its torch_binding_cuda.cpp registration) and register only the
+# CPU dispatch, so the library carries no libtorch_cuda dependency. torch_binding.cpp holds the
+# shared op schema + CPU dispatch and is always compiled; the CPU TU uses a sentinel stream and
+# never touches libtorch_cuda.
+set(nve_torch_ops_src
     nve_registry.cu
     torch_binding.cpp
-    nve_torch_ops.cu
     nve_torch_ops_cpu.cpp
 )
+if(NOT NVE_DRIVERLESS_BUILD)
+    list(APPEND nve_torch_ops_src nve_torch_ops.cu torch_binding_cuda.cpp)
+endif()
+
+add_library(nve-torch-ops SHARED ${nve_torch_ops_src})
 
 # Target the minimum torch stable ABI version (set in top-level CMakeLists.txt).
 # This avoids using APIs added in newer versions, so code built against e.g.
@@ -39,7 +49,17 @@ target_include_directories(nve-torch-ops PRIVATE
     ${TORCH_INCLUDE_DIRS}
 )
 
+# The `torch` umbrella target (in ${TORCH_LIBRARIES}) forces libtorch_cuda.so NEEDED via
+# -Wl,--no-as-needed even when no CUDA symbol is used (its interface is
+# "torch_cpu_library;torch_cuda_library"). For a driverless build, link only the CPU torch
+# interface so libnve-torch-ops.so carries no libtorch_cuda dependency.
+if(NVE_DRIVERLESS_BUILD)
+    set(nve_torch_link_libs torch_cpu_library c10)
+else()
+    set(nve_torch_link_libs ${TORCH_LIBRARIES})
+endif()
+
 target_link_libraries(nve-torch-ops
     PUBLIC  nve-common
-    PRIVATE ${TORCH_LIBRARIES}
+    PRIVATE ${nve_torch_link_libs}
 )

@@ -4,6 +4,29 @@ Releases will be listed below, latest at the top.
 
 Releases are named/tagged in the format of `vYY.MM[.P]` e.g. `v26.02.3` means release of February 2026 with patch 3.
 
+## NV Embedding Cache 26.07
+### New Features
+- Extended pooling and rowwise dequantization to GPU, Linear UVM, and hierarchical embedding layers, with fixed-hotness and CSR layouts; sum, mean, weighted-sum, and weighted-mean reductions; and QInt8/QUint8 rowwise storage
+- Added a driverless host-inference build that removes the `libcuda` and `libtorch_cuda` dependencies for C++, Python, and AOTInductor CPU deployments (`NVE_DRIVERLESS_BUILD` / `PYNVE_DRIVERLESS_BUILD=1`)
+- Added optional build without OpenMPI (`NVE_DISABLE_MPI` / `PYNVE_DISABLE_MPI=1`); MPI-dependent APIs remain available as unsupported stubs
+### Improvements
+- Linear UVM pooled lookups now participate in automatic cache insertion
+- Set-associative cache frequency counters now decay lazily per touched set, avoiding a full-cache decay pass on every insert
+- Added centralized build-flag documentation (see: [build_flags.md](docs/build_flags.md))
+- The default thread pool now reserves two hardware threads for non-pool work, with a minimum of one worker
+### Bug Fixes
+- Fixed a race where asynchronous auto-insert work could retain an execution context after its owner released it
+- Fixed Python pooled lookup bag-count handling and isolation of execution contexts between host-layer instances
+- Fixed export and reload of user-provided memory blocks, including shared blocks used by different layer types; unsupported distributed memory blocks now fail explicitly instead of being silently converted
+- Fixed empty CSR bags and weighted-mean bags with a zero weight sum producing NaNs on CUDA paths; they now return zero-filled rows
+- Fixed CUDA pooling output-stride validation that could over-read rows or return corrupt data, while preserving support for padded stored rows
+- Fixed raw concatenate routing on GPU and Linear UVM layers and rejected unsupported PyTorch pooling modes instead of treating them as mean pooling
+- Invalid pooling parameters and unknown pooling or sparse enum values are now rejected instead of being silently accepted or reported as generic runtime failures
+### API Changes
+- Changed C++ `EmbeddingLayerBase::PoolingParams` and C `nve_layer_lookup_pooled`: CSR offsets and fixed hotness are now separate arguments, weights have dedicated fields, and callers must provide an explicit output data type
+- Removed the unsupported COO sparse layout (`SparseType_t::COO` / `NVE_SPARSE_COO`); fixed-hotness and CSR layouts remain supported
+- Invalid lookup and pooling arguments now throw `nve::InvalidArgumentError` in C++ and return `NVE_ERROR_INVALID_ARGUMENT` through the C API
+
 ## NV Embedding Cache 26.06
 ### New Features
 - Host CPU inference layer for C, C++, and Python (`nve_host_embedding_layer_create`, `HostEmbeddingLayer`, `LayerType.HostLayer`)

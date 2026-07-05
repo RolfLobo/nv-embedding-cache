@@ -42,24 +42,24 @@ class EmbeddingLayerBase {
    * This struct defines the parameters needed to perform pooling during a lookup call.
    */
   struct PoolingParams {
-    // Pooling type. Concatenate means no pooling.
-    // In Concatenate mode, the other params are ignored - except output_type, which is useful for dequantize without pooling.
+    // Pooling type. Concatenate means no reduction: use a different output type for
+    // conversion/dequant, or the stored value type for raw-row passthrough.
     PoolingType_t pooling_type {PoolingType_t::Concatenate};
-    // SparseType     | key_indices
-    // Fixed Hotness  | 1 value for the hotness (or batch size)
-    // CSR            | 1 value per batch (bag) + 1 for the last offset
-    // COO            | 2 values perf key (bag_id, id_in_bag) - assumed to be sorted row_wise (bag_id)
+    // Sparse layout used to describe bag membership.
     SparseType_t sparse_type {SparseType_t::Fixed};
-    const void* key_indices {nullptr}; // key_indices must be of the same type as the layer's Key type
-    int64_t num_key_indices {0};
+    // CSR offsets must be of the same type as the layer's Key type. Ignored for Fixed.
+    const void* csr_offsets {nullptr};
+    int64_t num_csr_offsets {0};
+    // Number of keys per bag for Fixed. Ignored for CSR.
+    int64_t fixed_hotness {0};
 
     // Weights for weighted_sum pooling
-    const void* sparse_weights {nullptr};
+    const void* weights {nullptr};
     // Datatype for the provided weights (doesn't have to be the same as Value type, not all combinations supported)
     DataType_t weight_type {DataType_t::Unknown};
 
-    // Datatype to use for the output. Unknown means to keep the same as input.
-    // Not all combinations supported
+    // Datatype to use for the output. Must be set whenever PoolingParams is passed to lookup;
+    // Not all input/output combinations are supported.
     DataType_t output_type {DataType_t::Unknown};
   };
 

@@ -21,6 +21,7 @@
 #include "include/default_allocator.hpp"
 #include "include/thread_pool.hpp"
 #include "include/bit_ops.hpp"
+#include "include/layer_utils.hpp"
 #include "cpu_ops/cpu_pooling.h"
 #include <cstring>
 
@@ -58,10 +59,10 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
                                          const PoolingParams* pool_params,
                                          float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
-  NVE_CHECK_(ctx != nullptr, "Invalid context");
-  NVE_CHECK_(keys != nullptr, "Invalid keys");
-  NVE_CHECK_(output != nullptr, "Invalid output");
-  NVE_CHECK_(num_keys > 0, "Invalid number of keys");
+  NVE_CHECK_ARG_(ctx != nullptr, "Invalid context");
+  NVE_CHECK_ARG_(keys != nullptr, "Invalid keys");
+  NVE_CHECK_ARG_(output != nullptr, "Invalid output");
+  NVE_CHECK_ARG_(num_keys > 0, "Invalid number of keys");
   const cudaStream_t lookup_stream = ctx->get_lookup_stream();
 
   const size_t num_keys_sz = static_cast<size_t>(num_keys);
@@ -71,121 +72,47 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   const size_t key_buffer_size = sizeof(KeyType) * num_keys_sz;
   const size_t row_size = static_cast<size_t>(table_->get_max_row_size());
 
-  // Pooling metadata. When pooling, the table gathers all num_keys raw rows into a
-  // host scratch buffer, then a CPU pooling op reduces them into num_bags output rows.
-  DataType_t in_dtype = DataType_t::Unknown;
-  DataType_t out_dtype = DataType_t::Unknown;
-  int64_t row_width = 0;
-  int64_t num_bags = num_keys;
-  int64_t fixed_hotness = 1;
-  SparseType_t effective_sparse = SparseType_t::Fixed;
-  std::shared_ptr<BufferWrapper<const KeyType>> offsets_bw;
-  const KeyType* offsets_host = nullptr;
   if (pool_params) {
-    // Concatenate means no arithmetic reduction: each key yields one output row,
-    // only converting/dequantizing the raw gathered data to the output type. The
-    // sparse layout and weights are ignored (per the PoolingParams contract).
-    const bool concat = (pool_params->pooling_type == PoolingType_t::Concatenate);
+    validate_pool_params(*pool_params);
+  }
 
-    in_dtype = table_->get_value_type();
-    const bool quant_in = is_quant_rowwise(in_dtype);
-    // For quantized input the result is dequantized to a float type unless the caller
-    // requests same-type Concatenate (passthrough). For float input with no explicit
-    // output type, the output keeps the table's value type.
-    out_dtype = (pool_params->output_type != DataType_t::Unknown) ? pool_params->output_type
-                : quant_in                                         ? DataType_t::Float32
-                                                                   : in_dtype;
-    NVE_CHECK_(in_dtype == DataType_t::Float32 || in_dtype == DataType_t::Float16 || quant_in,
-               "HostEmbeddingLayer pooling supports only fp32/fp16 or QInt8/QUint8Rowwise table "
-               "values, got: ", in_dtype);
-    // Float32/Float16 output is required for all reduction modes. For Concatenate, a
-    // same-type output is also accepted (no dequantization, full row is passed through).
-    NVE_CHECK_(out_dtype == DataType_t::Float32 || out_dtype == DataType_t::Float16 ||
-                   (concat && out_dtype == in_dtype),
-               "HostEmbeddingLayer pooling supports fp32/fp16 output; same-type output is only "
-               "accepted for Concatenate mode");
-    if (quant_in) {
-      // row_size is the full quantized row stride: value bytes + trailing scale[/offset].
-      const int64_t meta_bytes = quant_rowwise_meta_bytes(in_dtype);
-      NVE_CHECK_(static_cast<int64_t>(row_size) > meta_bytes,
-                 "Quantized row size smaller than its scale/offset metadata");
-      row_width = static_cast<int64_t>(row_size) - meta_bytes;
-    } else {
-      NVE_CHECK_(row_size % static_cast<size_t>(dtype_size(in_dtype)) == 0,
-                 "Table row size not a multiple of the value element size");
-      row_width = static_cast<int64_t>(row_size) / dtype_size(in_dtype);
-    }
-    // For same-type Concatenate the output holds a full raw row including quantized
-    // metadata, so the minimum stride is the full row_size. For all other modes the
-    // output holds only the decoded value elements.
-    const int64_t min_output_stride = (concat && out_dtype == in_dtype)
-                                          ? static_cast<int64_t>(row_size)
-                                          : row_width * dtype_size(out_dtype);
-    NVE_CHECK_(output_stride >= min_output_stride,
-               "Output stride is too small for pooling output type: got ", output_stride,
-               " bytes, need at least ", min_output_stride, " bytes for ", row_width,
-               " elements of ", out_dtype);
-
-    if (concat) {
-      // One output row per key: the Concatenate path in cpu_kernel_pooling_dispatch
-      // handles this directly (fixed hotness=1, total_rows == num_keys).
-      effective_sparse = SparseType_t::Fixed;
-      fixed_hotness = 1;
-      num_bags = num_keys;
-    } else {
-      NVE_CHECK_(pool_params->key_indices != nullptr, "Invalid pooling key_indices");
-      NVE_CHECK_(pool_params->num_key_indices > 0, "Invalid pooling num_key_indices");
-      NVE_CHECK_(pool_params->sparse_type == SparseType_t::Fixed ||
-                     pool_params->sparse_type == SparseType_t::CSR,
-                 "HostEmbeddingLayer pooling supports only Fixed and CSR sparse types");
-      effective_sparse = pool_params->sparse_type;
-
-      // key_indices is host-resident for the host layer; wrap so device pointers are
-      // handled too, then read the offsets/hotness on the host.
-      const size_t offsets_buffer_size =
-          static_cast<size_t>(pool_params->num_key_indices) * sizeof(KeyType);
-      offsets_bw = std::make_shared<BufferWrapper<const KeyType>>(
-          ctx, "offsets", static_cast<const KeyType*>(pool_params->key_indices), offsets_buffer_size);
-      offsets_host = offsets_bw->access_buffer(cudaMemoryTypeUnregistered,
-                                               /*copy_content=*/true, lookup_stream);
-      if (pool_params->sparse_type == SparseType_t::Fixed) {
-        fixed_hotness = offsets_host[0];
-        NVE_CHECK_(fixed_hotness > 0, "Invalid fixed hotness");
-        NVE_CHECK_(num_keys % fixed_hotness == 0,
-                   "Number of keys does not divide by fixed hotness");
-        num_bags = num_keys / fixed_hotness;
-      } else {  // CSR
-        num_bags = pool_params->num_key_indices - 1;
-        NVE_CHECK_(num_bags >= 0, "Invalid CSR offsets");
-      }
+  // Same-type Concatenate is a plain per-key memcpy: no scratch buffer, type conversion, or
+  // reduction is needed. Treat it as the no-pooling path by clearing pool_params so the gather
+  // writes final data directly into the caller's output buffer at the correct stride. All other
+  // pooling/dequant work is delegated to pool_gathered_host after the gather.
+  if (pool_params && (pool_params->pooling_type == PoolingType_t::Concatenate)) {
+    const DataType_t in_dtype = table_->get_value_type();
+    const DataType_t out_dtype = pool_params->output_type;
+    if (in_dtype == out_dtype) {
+      NVE_CHECK_ARG_(output_stride >= static_cast<int64_t>(row_size),
+                     "Output stride is too small for same-type Concatenate: got ", output_stride,
+                     " bytes, need at least ", row_size, " bytes (full row)");
+      pool_params = nullptr;
     }
   }
 
-  // Concatenate with identical in/out type is a plain per-key memcpy:
-  // no scratch buffer, no type conversion, and no reduction are needed. Treat it as
-  // the no-pooling path by clearing pool_params — the gather writes final data
-  // directly into the caller's output buffer at the correct stride.
-  if (pool_params && (pool_params->pooling_type == PoolingType_t::Concatenate) &&
-      (in_dtype == out_dtype)) {
-    pool_params = nullptr;
-  }
-
-  const size_t output_buffer_size =
-      static_cast<size_t>(num_bags) * static_cast<size_t>(output_stride);
+  // When pooling, the table gathers all num_keys raw rows into a host scratch buffer (one row per
+  // key), then pool_gathered_host reduces them into the caller's output. Otherwise it gathers
+  // straight into the caller's output buffer (one row per key, num_keys rows).
+  const size_t output_buffer_size = num_keys_sz * static_cast<size_t>(output_stride);
   const size_t gather_buffer_size = pool_params ? num_keys_sz * row_size : output_buffer_size;
 
   // Build buffer wrappers — LinearHostTable accesses them as cudaMemoryTypeUnregistered.
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
-  auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
 
-  // When pooling, the table gathers into a host scratch buffer (one row per key);
-  // otherwise it gathers straight into the caller's output buffer.
+  // When pooling, the table gathers into a host scratch buffer (one row per key) and
+  // pool_gathered_host owns the caller's output; otherwise it gathers straight into the caller's
+  // output buffer (output_bw, which we also push back below if it relocated).
   const int64_t gather_stride = pool_params ? static_cast<int64_t>(row_size) : output_stride;
-  std::shared_ptr<BufferWrapper<void>> gather_bw = output_bw;
+  std::shared_ptr<BufferWrapper<void>> output_bw;
+  std::shared_ptr<BufferWrapper<void>> gather_bw;
   if (pool_params) {
     void* gather_scratch = ctx->get_buffer("pool_gather", gather_buffer_size, /*host_alloc=*/true);
     gather_bw = std::make_shared<BufferWrapper<void>>(ctx, "pool_gather", gather_scratch,
                                                       gather_buffer_size);
+  } else {
+    output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+    gather_bw = output_bw;
   }
 
   // Hitmask handling. We need a hitmask buffer if either the caller wants one,
@@ -253,38 +180,20 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
     thread_pool->execute_n(0, num_tasks, fill_default_task);
   }
 
-  // Pooling/Dequant post-process: reduce the gathered raw rows into the caller's output.
+  // Pooling/Dequant post-process: reduce the gathered raw rows into the caller's output. Shared
+  // with the hierarchical layer's no-GPU-tier path.
   if (pool_params) {
     auto* gather_host = static_cast<int8_t*>(gather_bw->access_buffer(
         cudaMemoryTypeUnregistered, /*copy_content=*/true, lookup_stream));
-    auto* out_host = static_cast<int8_t*>(output_bw->access_buffer(
-        cudaMemoryTypeUnregistered, /*copy_content=*/false, lookup_stream));
-
-    const void* weights = nullptr;
-    std::shared_ptr<BufferWrapper<const void>> weights_bw;
-    if (pool_params->sparse_weights != nullptr) {
-      NVE_CHECK_(pool_params->weight_type == DataType_t::Float32 || pool_params->weight_type == DataType_t::Float16,
-                 "Pooling weight_type must be Float32 or Float16 when sparse_weights is provided");
-      const size_t weights_buffer_size =
-          num_keys_sz * static_cast<size_t>(dtype_size(pool_params->weight_type));
-      weights_bw = std::make_shared<BufferWrapper<const void>>(
-          ctx, "weights", pool_params->sparse_weights, weights_buffer_size);
-      weights = weights_bw->access_buffer(cudaMemoryTypeUnregistered, /*copy_content=*/true,
-                                          lookup_stream);
-    }
-
-    auto thread_pool = ctx->get_thread_pool();
-    const int64_t num_workers = thread_pool->num_workers();
-    cpu_kernel_pooling_dispatch<KeyType>(thread_pool, num_bags, row_width, gather_host, gather_stride,
-                                         out_host, output_stride, effective_sparse, fixed_hotness,
-                                         offsets_host, pool_params->pooling_type, weights,
-                                         pool_params->weight_type, in_dtype, out_dtype, num_workers);
+    pool_gathered_host<KeyType>(ctx, *pool_params, table_->get_value_type(), gather_host,
+                                gather_stride, static_cast<int64_t>(row_size), num_keys, output,
+                                output_stride);
   }
 
-  // Copy back to the caller's output buffer if BufferWrapper picked up a
-  // different host buffer (this happens when the caller's output is GPU /
-  // managed memory — the table only knows how to gather into host; we then
-  // push the host slot back across the lookup stream).
+  // No-pooling path: copy back to the caller's output buffer if BufferWrapper picked up a
+  // different host buffer (this happens when the caller's output is GPU / managed memory — the
+  // table only knows how to gather into host; we then push the host slot back across the lookup
+  // stream). The pooling path's copy-back is handled inside pool_gathered_host.
   //
   // Picking the copy primitive from the buffer's original residency: when
   // BufferWrapper allocated a separate host slot, the user-provided pointer
@@ -292,10 +201,12 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   // cudaMemcpyAsync. Note that the torch CUDA shim returns nullptr for the
   // legacy default stream — that's still a valid CUDA stream argument and
   // cudaMemcpyAsync handles it correctly.
-  auto* final_output = output_bw->get_buffer(cudaMemoryTypeUnregistered);
-  if (final_output != nullptr && final_output != output) {
-    NVE_CHECK_(cudaMemcpyAsync(output, final_output, output_buffer_size,
-                               cudaMemcpyDefault, lookup_stream));
+  if (output_bw != nullptr) {
+    auto* final_output = output_bw->get_buffer(cudaMemoryTypeUnregistered);
+    if (final_output != nullptr && final_output != output) {
+      NVE_CHECK_(cudaMemcpyAsync(output, final_output, output_buffer_size,
+                                 cudaMemcpyDefault, lookup_stream));
+    }
   }
   // Same for hitmask, when the caller supplied one.
   if (output_hitmask != nullptr) {

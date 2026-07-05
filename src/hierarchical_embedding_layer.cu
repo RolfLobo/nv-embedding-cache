@@ -25,6 +25,7 @@
 #include <layer_utils.hpp>
 #include "cuda_ops/scatter.cuh"
 #include "cuda_ops/cuda_common.h"
+#include "cuda_ops/pool_gathered.cuh"
 #include <insert_heuristic.hpp>
 #include <buffer_wrapper.hpp>
 #include <cuda_support.hpp>
@@ -135,18 +136,47 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
   NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
   const cudaStream_t lookup_stream = layer_ctx->get_lookup_stream();
-  if (pool_params) {
-    NVE_THROW_NOT_IMPLEMENTED_();
+  const bool pooling_requested = (pool_params != nullptr);
+  if (pooling_requested) {
+    validate_pool_params(*pool_params);
+    for (const auto& table : tables_) {
+      NVE_CHECK_(table->get_value_type() == tables_.at(0)->get_value_type(),
+                 "All layer tables must have the same value type for pooling");
+    }
   }
+
+  const int64_t row_size = tables_.at(0)->get_max_row_size();
+  // check for avoidable concat with no dequant, then use the lookup path to avoid a redundant copy.
+  const bool avoidable_concat =
+      pooling_requested && pool_params->pooling_type == PoolingType_t::Concatenate &&
+      pool_params->output_type == tables_.at(0)->get_value_type();
+  const bool do_pool = pooling_requested && !avoidable_concat;
+
+  // For pooling/dequant we gather one raw stored row per key into a scratch buffer, then run the
+  // post-processing kernel over it into the user output. Plain lookup and same-type Concatenate
+  // gather straight into the user output. gather_stride is the raw stored row stride for pooling.
+  const int64_t gather_stride = do_pool ? row_size : output_stride;
+
   auto constexpr hitmask_elem_bits = sizeof(max_bitmask_repr_t) * 8;
   const auto hitmask_elements = (num_keys + hitmask_elem_bits - 1) / hitmask_elem_bits;
   const auto hitmask_buffer_size = hitmask_elements * sizeof(max_bitmask_repr_t);
   const auto output_buffer_size = num_keys * output_stride;
+  const auto gather_buffer_size = num_keys * gather_stride;
   const auto key_buffer_size = sizeof(KeyType) * num_keys;
 
   // Prepare buffer wrappers
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
-  auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+  // gather_bw is the target the tiers gather raw rows into: a scratch buffer for post-processing,
+  // or the user output buffer directly for plain lookup / same-type Concatenate.
+  std::shared_ptr<BufferWrapper<void>> gather_bw;
+  if (do_pool) {
+    // With a GPU tier the dequant/combine kernels run on the device, so the scratch is
+    // device-resident; without one the CPU pool path needs it host-resident.
+    auto gather_buf = ctx->get_buffer("pool_gather", gather_buffer_size, gpu_device_ < 0 /*host_alloc*/);
+    gather_bw = std::make_shared<BufferWrapper<void>>(ctx, "pool_gather", gather_buf, gather_buffer_size);
+  } else {
+    gather_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+  }
   std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw(nullptr);
 
   // allocate hitmask buffer if needed
@@ -180,7 +210,7 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
     // Call table->find and collect counters
     table->reset_lookup_counter(table_ctx);
     std::shared_ptr<BufferWrapper<int64_t>> value_sizes{nullptr}; // for now variable value size is not supported at the layer level
-    table->find(table_ctx, num_keys, keys_bw, hitmask_bw, output_stride, output_bw, std::move(value_sizes));
+    table->find(table_ctx, num_keys, keys_bw, hitmask_bw, gather_stride, gather_bw, std::move(value_sizes));
     table->get_lookup_counter(table_ctx, table_hits.data() + i);
   }
 
@@ -216,14 +246,14 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
 
     // Get buffers (shouldn't trigger any copy since last layer was already on host)
     auto* hit_mask_buf = hitmask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, ctx->get_lookup_stream());
-    auto* output_buf = output_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, ctx->get_lookup_stream());
+    auto* output_buf = gather_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, ctx->get_lookup_stream());
 
     // Fill default embedding rows for keys missing from all tables, in parallel via the context's thread pool.
     auto thread_pool = layer_ctx->get_thread_pool();
     const int64_t num_workers = thread_pool->num_workers();
     const int64_t keys_per_task = std::max<int64_t>(1, (num_keys + num_workers - 1) / num_workers);
     const int64_t num_tasks = (num_keys + keys_per_task - 1) / keys_per_task;
-    const auto row_size = static_cast<size_t>(tables_.at(0)->get_max_row_size());
+    const size_t default_row_size = static_cast<size_t>(row_size);
     const uint8_t* default_emb = config_.default_embedding.data();
     auto* output_bytes = static_cast<uint8_t*>(output_buf);
 
@@ -234,7 +264,7 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
         const auto elem = hit_mask_buf[k / hitmask_elem_bits];
         const auto bit = (elem >> (k % hitmask_elem_bits)) & static_cast<max_bitmask_repr_t>(1);
         if (bit == 0) {
-          std::memcpy(output_bytes + k * output_stride, default_emb, row_size);
+          std::memcpy(output_bytes + k * gather_stride, default_emb, default_row_size);
         }
       }
     };
@@ -242,36 +272,51 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   }
 
   // Combine hits
-  auto h_output = output_bw->get_buffer(cudaMemoryTypeHost);
+  auto h_output = gather_bw->get_buffer(cudaMemoryTypeHost);
   bool unregistered_output = false;
   if (h_output == nullptr) {
     // output buffer may be unregistered so we can't assume host output will be cudaMemoryTypeHost
-    h_output = output_bw->get_buffer(cudaMemoryTypeUnregistered);
+    h_output = gather_bw->get_buffer(cudaMemoryTypeUnregistered);
     unregistered_output = true;
   }
-  auto d_output = output_bw->get_buffer(cudaMemoryTypeDevice);
+  auto d_output = gather_bw->get_buffer(cudaMemoryTypeDevice);
 
   if (first_table_on_gpu && last_table_on_host) {
     // Need to scatter reolved hits from host to device
     if (unregistered_output) {
       NVE_LOG_WARNING_("Output buffer isn't CUDA registered, scatter will trigger extra copies!");
-      h_output = output_bw->access_buffer(cudaMemoryTypeHost, true, lookup_stream);
+      h_output = gather_bw->access_buffer(cudaMemoryTypeHost, true, lookup_stream);
     }
     EmbeddingForwardScatter(
       h_output,
-      output_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream), // using access_buffer so last_access is updated in the wrapper
-      static_cast<uint32_t>(tables_.at(0)->get_max_row_size()),
-      static_cast<uint32_t>(output_stride),
-      static_cast<uint32_t>(output_stride),
+      gather_bw->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream), // using access_buffer so last_access is updated in the wrapper
+      static_cast<uint32_t>(row_size),
+      static_cast<uint32_t>(gather_stride),
+      static_cast<uint32_t>(gather_stride),
       reinterpret_cast<uint64_t*>(hitmask_bw->get_buffer(cudaMemoryTypeDevice)), // We use the GPU hitmask to copy everything missed by the GPU table (potentially default values too)
       static_cast<int32_t>(num_keys),
       lookup_stream);
   }
 
-  // Handle copy to output if needed
-  void* final_output = gpu_device_ >= 0 ? d_output : h_output;
-  if (final_output != output) {
-    NVE_CHECK_(cudaMemcpyAsync(output, final_output, output_buffer_size, cudaMemcpyDefault, lookup_stream));
+  if (do_pool) {
+    if (gpu_device_ >= 0) {
+      // The gathered raw rows are now device-resident; pool/dequant on the GPU.
+      pool_gathered_device<KeyType>(ctx, *pool_params, tables_.at(0)->get_value_type(),
+                                    static_cast<const int8_t*>(d_output), gather_stride, num_keys,
+                                    output, output_stride, lookup_stream);
+    } else {
+      // All tables on host
+      auto* gather_host = static_cast<const int8_t*>(
+          gather_bw->access_buffer(cudaMemoryTypeUnregistered, /*copy_content=*/true, lookup_stream));
+      pool_gathered_host<KeyType>(ctx, *pool_params, tables_.at(0)->get_value_type(), gather_host,
+                                  gather_stride, row_size, num_keys, output, output_stride);
+    }
+  } else {
+    // Direct gather: copy to the caller only if BufferWrapper had to use a different residency.
+    void* final_output = gpu_device_ >= 0 ? d_output : h_output;
+    if (final_output != output) {
+      NVE_CHECK_(cudaMemcpyAsync(output, final_output, output_buffer_size, cudaMemcpyDefault, lookup_stream));
+    }
   }
 
   // Handle copy to output hitmask if needed
@@ -280,11 +325,11 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
     NVE_CHECK_(cudaMemcpyAsync(output_hitmask, final_hitmask, hitmask_buffer_size, cudaMemcpyDefault, lookup_stream));
   }
 
-  // Handle automatic inserts
+  // Handle automatic inserts. Use gather_bw as we need the raw unpooled values.
   if (!auto_insert_handlers_.empty()) {
     for (size_t i=0; i<table_hits.size(); i++) {
       auto_insert_handlers_.at(i)->auto_insert(
-        layer_ctx, keys_bw, output_bw, table_hitrates[i], num_keys, output_stride,
+        layer_ctx, keys_bw, gather_bw, table_hitrates[i], num_keys, gather_stride,
         (left_keys > 0) ? hitmask_bw : nullptr // If there are no unbresolved keys then we can skip processing the hitmask
       );
     }

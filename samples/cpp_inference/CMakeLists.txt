@@ -23,7 +23,8 @@ endif()
 
 add_executable(nve_inference inference.cu)
 
-target_include_directories(nve_inference PRIVATE
+# Use system supress torch warnings
+target_include_directories(nve_inference SYSTEM PRIVATE
     ${TORCH_INCLUDE_DIRS}
 )
 

@@ -1260,6 +1260,102 @@ TEST(HostEmbeddingLayer, LookupAndDefaultEmbeddingViaCApi) {
     }
   }
 
+  // The C pooling API requires an explicit output type and propagates it to PoolingParams.
+  const int64_t hotness = 2;
+  const int64_t pooled_keys = 4;
+  const int64_t num_bags = pooled_keys / hotness;
+  std::vector<float> pooled_output(static_cast<size_t>(num_bags) * num_floats, 0.0f);
+  NVE_CHECK(nve_layer_lookup_pooled(
+      layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+      nullptr /*hitmask*/, NVE_POOL_SUM, NVE_SPARSE_FIXED,
+      nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+      nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+      NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+  NVE_CHECK(nve_context_wait(ctx));
+
+  for (size_t c = 0; c < num_floats; ++c) {
+    EXPECT_FLOAT_EQ(201.0f, pooled_output[c]) << "bag 0 comp " << c;
+    EXPECT_FLOAT_EQ(205.0f, pooled_output[num_floats + c]) << "bag 1 comp " << c;
+  }
+
+  // Concatenate uses only keys and output_type. Bag and weight metadata must be ignored even when
+  // it is null, nonsensical, or unsupported for arithmetic pooling.
+  std::vector<float> concat_output(static_cast<size_t>(pooled_keys) * num_floats, 0.0f);
+  const double ignored_weight = 0.0;
+  NVE_CHECK(nve_layer_lookup_pooled(
+      layer, ctx, pooled_keys, lookup_keys.data(), concat_output.data(), ROW_SIZE,
+      nullptr /*hitmask*/, NVE_POOL_CONCATENATE, NVE_SPARSE_CSR,
+      nullptr /*csr_offsets*/, -1 /*num_csr_offsets*/, -1 /*fixed_hotness*/, &ignored_weight,
+      NVE_DTYPE_FLOAT64 /*weight_type*/, NVE_DTYPE_FLOAT32 /*output_type*/,
+      nullptr /*hitrates*/));
+  NVE_CHECK(nve_context_wait(ctx));
+  for (int64_t k = 0; k < pooled_keys; ++k) {
+    for (size_t c = 0; c < num_floats; ++c) {
+      EXPECT_FLOAT_EQ(100.0f + static_cast<float>(k),
+                      concat_output[static_cast<size_t>(k) * num_floats + c])
+          << "key " << k << " comp " << c;
+    }
+  }
+
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+                nullptr /*hitmask*/, NVE_POOL_SUM, NVE_SPARSE_FIXED,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+                nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+                NVE_DTYPE_UNKNOWN /*output_type*/, nullptr /*hitrates*/));
+
+  // Out-of-range pooling/sparse enum values must be rejected, not silently mapped to a valid
+  // operation (a garbage pooling type used to run as Concatenate, and a garbage sparse type as
+  // Fixed). memcpy forges the values a garbage-passing C caller could supply without tripping
+  // C++ enum-range conversion rules in this test.
+  nve_pooling_type_t bad_pooling_type;
+  nve_sparse_type_t bad_sparse_type;
+  const int bad_enum_value = 999;
+  static_assert(sizeof(bad_pooling_type) == sizeof(bad_enum_value));
+  static_assert(sizeof(bad_sparse_type) == sizeof(bad_enum_value));
+  std::memcpy(&bad_pooling_type, &bad_enum_value, sizeof(bad_pooling_type));
+  std::memcpy(&bad_sparse_type, &bad_enum_value, sizeof(bad_sparse_type));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+                nullptr /*hitmask*/, bad_pooling_type, NVE_SPARSE_FIXED,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+                nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+                NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+  // Malformed pooling arguments must be classified as invalid arguments, not generic runtime
+  // failures: zero fixed_hotness, weighted pooling without weights, and a too-small output stride.
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+                nullptr /*hitmask*/, NVE_POOL_SUM, NVE_SPARSE_FIXED,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, 0 /*fixed_hotness*/,
+                nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+                NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+                nullptr /*hitmask*/, NVE_POOL_WEIGHTED_SUM, NVE_SPARSE_FIXED,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+                nullptr /*weights*/, NVE_DTYPE_FLOAT32 /*weight_type*/,
+                NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(),
+                ROW_SIZE / 2 /*too-small output_stride*/,
+                nullptr /*hitmask*/, NVE_POOL_SUM, NVE_SPARSE_FIXED,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+                nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+                NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_layer_lookup_pooled(
+                layer, ctx, pooled_keys, lookup_keys.data(), pooled_output.data(), ROW_SIZE,
+                nullptr /*hitmask*/, NVE_POOL_SUM, bad_sparse_type,
+                nullptr /*csr_offsets*/, 0 /*num_csr_offsets*/, hotness,
+                nullptr /*weights*/, NVE_DTYPE_UNKNOWN /*weight_type*/,
+                NVE_DTYPE_FLOAT32 /*output_type*/, nullptr /*hitrates*/));
+
   nve_context_wait(ctx);
   nve_context_destroy(ctx);
   nve_layer_destroy(layer);

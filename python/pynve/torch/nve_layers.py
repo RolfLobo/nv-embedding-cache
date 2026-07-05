@@ -407,7 +407,7 @@ class NVEmbeddingBag(NVEmbeddingBase):
         embedding_size (int): Size of each embedding vector
         data_type (torch.dtype): Data type of the embedding weights
         layer_type (LayerType): Layer implementation to use
-        mode (str): The operation to use for combining embeddings ('sum', 'mean', 'max', or 'concat')
+        mode (str): The operation to use for combining embeddings ('sum', 'mean', or 'concat'). 'max' is not supported.
         gpu_cache_size (int, optional): Size of GPU cache in bytes. Defaults to 0.
         host_cache_size (int, optional): Size of host cache. Defaults to 0.
         storage (Optional[nve.MemBlock | nve.Table | nve_ps.NVEParameterServer]):
@@ -421,6 +421,8 @@ class NVEmbeddingBag(NVEmbeddingBase):
     Note:
         LayerType.HostLayer is not supported by NVEmbeddingBag — pooled lookups
         are not implemented for the host layer. Use NVEmbedding for HostLayer.
+
+        'max' pooling (unlike torch.nn.EmbeddingBag) is not implemented.
     """
     def __init__(self,
                  num_embeddings: int,
@@ -456,7 +458,7 @@ class NVEmbeddingBag(NVEmbeddingBase):
 
         Returns:
             torch.Tensor: Reduced embedding vectors for each sequence. For 'concat' mode, returns
-                         concatenated embeddings. For other modes ('sum', 'mean', 'max'), returns
+                         concatenated embeddings. For other modes ('sum', 'mean'), returns
                          the reduced embeddings according to the specified mode.
         """
         if not HAS_TORCH_OPS:
@@ -475,12 +477,8 @@ class NVEmbeddingBag(NVEmbeddingBase):
                     self.marker_tensor, input,
                     self.embedding_size, self.dtype_tag)
         else:
-            if per_sample_weights is not None:
-                pooling_type = int(nve.PoolingType_t.WeightedSum) if self.mode == "sum" \
-                               else int(nve.PoolingType_t.WeightedMean)
-            else:
-                pooling_type = int(nve.PoolingType_t.Sum) if self.mode == "sum" \
-                               else int(nve.PoolingType_t.Mean)
+            pooling_type = int(nve_ops.pooling_type_from_mode(
+                self.mode, weighted=per_sample_weights is not None))
             if self.optimize_for_training:
                 return nve_ops.NVEmbeddingBagOpTraining.apply(
                     self.marker_tensor, input, self.weight, offsets,

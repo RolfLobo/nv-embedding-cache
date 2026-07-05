@@ -247,26 +247,26 @@ class MockHostTable final : public HostTable<HostTableConfig> {
     int64_t num_rows,
     PoolingType_t pooling_type,
     SparseType_t sparse_type,
-    const void* key_indices,
-    int64_t num_key_indices,
+    const void* csr_offsets,
+    int64_t num_csr_offsets,
+    int64_t fixed_hotness,
     const void* weights,
     DataType_t weight_type,
     void* output,
     DataType_t out_type = DataType_t::Unknown
   ) {
-    NVE_ASSERT_(num_key_indices > 0);
-    const IndexT* typed_key_indices = static_cast<const IndexT*>(key_indices);
-    const auto fixed_hotness = typed_key_indices[0];
+    const IndexT* typed_csr_offsets = static_cast<const IndexT*>(csr_offsets);
     int64_t num_bags;
     switch (sparse_type)
     {
       case SparseType_t::Fixed:
-        NVE_ASSERT_(num_key_indices == 1);
+        NVE_ASSERT_(fixed_hotness > 0);
         NVE_ASSERT_((num_rows % fixed_hotness) == 0);
         num_bags = num_rows / fixed_hotness;
         break;
       case SparseType_t::CSR:
-        num_bags = num_key_indices - 1;
+        NVE_ASSERT_(num_csr_offsets >= 2);
+        num_bags = num_csr_offsets - 1;
         break;
       default:
         throw std::runtime_error("Invalid sparse type");
@@ -314,8 +314,8 @@ class MockHostTable final : public HostTable<HostTableConfig> {
           bag_end = (b+1) * fixed_hotness;
           break;
         case SparseType_t::CSR:
-          bag_start = typed_key_indices[b];
-          bag_end = typed_key_indices[b+1];
+          bag_start = typed_csr_offsets[b];
+          bag_end = typed_csr_offsets[b+1];
           break;
         default:
           throw std::runtime_error("Not implemented");

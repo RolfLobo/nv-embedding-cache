@@ -17,6 +17,9 @@
 
 #include "emb_layer_utils.hpp"
 #include <cuda_fp16.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace nve {
 
@@ -108,6 +111,57 @@ float load_quant_row_element_as_float(const int8_t* row_ptr, int64_t e, int64_t 
   }
 
   return base_val * scale + offset;
+}
+
+void InitTableRowsQuant(int8_t* table, int64_t row_size, int64_t value_count, uint64_t start_row,
+                        uint64_t end_row, DataType_t dtype, size_t seed) {
+  const bool is_signed = (dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QInt8RowwiseF16);
+  const bool has_offset = (dtype == DataType_t::QUint8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF16);
+  const bool fp32_meta = (dtype == DataType_t::QInt8RowwiseF32 || dtype == DataType_t::QUint8RowwiseF32);
+  NVE_CHECK_(is_signed || has_offset, "InitTableRowsQuant requires a rowwise quant dtype");
+
+  std::mt19937 gen(seed);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> v(static_cast<size_t>(value_count));
+  for (uint64_t r = start_row; r < end_row; ++r) {
+    for (auto& x : v) x = dist(gen);
+    int8_t* row = table + static_cast<int64_t>(r) * row_size;
+
+    float scale = 1.0f, offset = 0.0f;
+    if (is_signed) {  // symmetric, scale only
+      float amax = 0.0f;
+      for (float x : v) amax = std::max(amax, std::fabs(x));
+      scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+      for (int64_t j = 0; j < value_count; ++j) {
+        long q = std::lround(v[static_cast<size_t>(j)] / scale);
+        q = std::min<long>(127, std::max<long>(-127, q));
+        row[j] = static_cast<int8_t>(q);
+      }
+    } else {  // affine min/max, scale + offset
+      float lo = v[0], hi = v[0];
+      for (float x : v) { lo = std::min(lo, x); hi = std::max(hi, x); }
+      scale = hi > lo ? (hi - lo) / 255.0f : 1.0f;
+      offset = lo;
+      for (int64_t j = 0; j < value_count; ++j) {
+        long q = std::lround((v[static_cast<size_t>(j)] - offset) / scale);
+        q = std::min<long>(255, std::max<long>(0, q));
+        reinterpret_cast<uint8_t*>(row)[j] = static_cast<uint8_t>(q);
+      }
+    }
+
+    int8_t* meta = row + value_count;  // value element_size == 1 byte
+    if (fp32_meta) {
+      std::memcpy(meta, &scale, sizeof(float));
+      if (has_offset) std::memcpy(meta + sizeof(float), &offset, sizeof(float));
+    } else {
+      const half hscale = __float2half(scale);
+      std::memcpy(meta, &hscale, sizeof(half));
+      if (has_offset) {
+        const half hoffset = __float2half(offset);
+        std::memcpy(meta + sizeof(half), &hoffset, sizeof(half));
+      }
+    }
+  }
 }
 
 }  // namespace nve
