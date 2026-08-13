@@ -31,7 +31,7 @@
  *
  * The custom table implementation lives in a separate shared object
  * (libnve-plugin-custom_remote.so) and is loaded at runtime via
- * nve_load_host_table_plugin().  This sample uses the C API exclusively.
+ * nve_create_table_factory().  This sample uses the C API exclusively.
  */
 
 #include <nve_c_api.h>
@@ -103,17 +103,14 @@ int main() {
   /* -- Step 2: phmap host table (L2 cache) --------------------------------- */
   printf("\n[2] Creating phmap host table (L2 cache)...\n");
 
-  CHECK_NVE(nve_load_host_table_plugin("libnve-plugin-phmap.so"));
-
-  nve_host_factory_t phmap_factory = nullptr;
-  CHECK_NVE(nve_create_host_table_factory(
-      &phmap_factory, R"({"implementation": "phmap_flat_map"})"));
+  nve_table_factory_t phmap_factory = nullptr;
+  CHECK_NVE(nve_create_table_factory(
+      &phmap_factory, "libnve-plugin-phmap.so", "{}"));
 
   nve_table_t phmap_table = nullptr;
-  CHECK_NVE(nve_host_factory_produce(
+  CHECK_NVE(nve_table_factory_produce(
       phmap_factory, /*table_id=*/1,
       R"({
-        "mask_size"        : 8,
         "key_size"         : 8,
         "max_value_size"   : 128,
         "value_dtype"      : "float32",
@@ -131,17 +128,14 @@ int main() {
   // Load the custom_remote plugin — this is the custom remote table
   // implementation that lives in libnve-plugin-custom_remote.so.
   // See plugins/custom_remote/ for the source.
-  CHECK_NVE(nve_load_host_table_plugin("libnve-plugin-custom_remote.so"));
-
-  nve_host_factory_t remote_factory = nullptr;
-  CHECK_NVE(nve_create_host_table_factory(
-      &remote_factory, R"({"implementation": "custom_remote"})"));
+  nve_table_factory_t remote_factory = nullptr;
+  CHECK_NVE(nve_create_table_factory(
+      &remote_factory, "libnve-plugin-custom_remote.so", "{}"));
 
   nve_table_t remote_table = nullptr;
-  CHECK_NVE(nve_host_factory_produce(
+  CHECK_NVE(nve_table_factory_produce(
       remote_factory, /*table_id=*/2,
       R"({
-        "mask_size"        : 8,
         "key_size"         : 8,
         "max_value_size"   : 128,
         "value_dtype"      : "float32"
@@ -251,8 +245,8 @@ int main() {
   CHECK_NVE(nve_table_destroy(remote_table));
   CHECK_NVE(nve_table_destroy(phmap_table));
   CHECK_NVE(nve_table_destroy(gpu_table));
-  CHECK_NVE(nve_host_factory_destroy(remote_factory));
-  CHECK_NVE(nve_host_factory_destroy(phmap_factory));
+  CHECK_NVE(nve_table_factory_destroy(remote_factory));
+  CHECK_NVE(nve_table_factory_destroy(phmap_factory));
   printf("  Done.\n");
 
   return errors == 0 ? 0 : 1;

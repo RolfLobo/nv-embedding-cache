@@ -61,7 +61,6 @@ public:
         std::vector<int8_t> h_values(params.num_keys * params.row_size_in_bytes);
         
         // Initialize keys with random values
-        std::random_device rd;
         std::mt19937 gen((params.num_keys * params.num_keys_to_insert) % params.row_size_in_bytes); // Fixed seed for reproducible tests
         std::uniform_int_distribution<IndexT> key_dist(0, 9999);
         for (uint64_t i = 0; i < params.num_keys; i++) {
@@ -151,6 +150,7 @@ private:
         cfg.count_misses = true;
         
         cfg.uvm_table = uvm_table_ptr_;
+        cfg.uvm_num_rows = num_embeddings;
         cfg.kernel_mode_type = params.kernel_mode_type;
         if (params.kernel_mode_type == 3) {
             cfg.kernel_mode_value = reinterpret_cast<uintptr_t>(&params_);

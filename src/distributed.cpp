@@ -16,17 +16,19 @@
  */
 
 #include <distributed.hpp>
-#include <common.hpp>
+#include <bit_ops.hpp>
 
 #ifndef NVE_DRIVERLESS_BUILD
 
 #include <cuda_support.hpp>
 #include <cuda_driver_support.hpp>
 #include <cerrno>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <filesystem>
@@ -42,10 +44,6 @@ do { \
   } \
 } while (0);
 
-#define ROUND_UP(n, multiple) \
-    (((n) + ((multiple)-1)) - (((n) + ((multiple)-1)) % (multiple)))
-
-
 // Wrapper for pidfd_open syscall
 static int pidfd_open(pid_t pid, unsigned int flags) {
     return static_cast<int>(syscall(SYS_pidfd_open, pid, flags));
@@ -54,6 +52,36 @@ static int pidfd_open(pid_t pid, unsigned int flags) {
 // Wrapper for pidfd_getfd syscall
 static int pidfd_getfd(int pidfd, int targetfd, unsigned int flags) {
     return static_cast<int>(syscall(SYS_pidfd_getfd, pidfd, targetfd, flags));
+}
+
+// pidfd_getfd() is subject to ptrace access checks. Under Yama ptrace_scope=1,
+// peer ranks launched by torchrun or mpirun are siblings and cannot access one
+// another by default. Rank 0 can nominate their common launcher parent as its
+// ptracer; Yama extends that permission to the launcher's descendants, which
+// includes the other ranks, without granting PR_SET_PTRACER_ANY.
+static void allow_launcher_descendants_to_get_fds() {
+  std::ifstream ptrace_scope_file("/proc/sys/kernel/yama/ptrace_scope");
+  if (!ptrace_scope_file.is_open()) {
+    // Yama is not available. The normal ptrace credential checks still apply.
+    return;
+  }
+
+  int ptrace_scope = 0;
+  ptrace_scope_file >> ptrace_scope;
+  if (!ptrace_scope_file || ptrace_scope != 1) {
+    // Scope 0 needs no exception. Scopes 2 and 3 ignore PR_SET_PTRACER and
+    // require CAP_SYS_PTRACE or disallow this operation entirely.
+    return;
+  }
+
+  const pid_t launcher_pid = getppid();
+  NVE_CHECK_(launcher_pid > 1, "Cannot authorize launcher for pidfd_getfd(): invalid parent PID ", launcher_pid);
+
+  const int result = prctl(PR_SET_PTRACER, static_cast<unsigned long>(launcher_pid), 0, 0, 0);
+  const int error = errno;
+  NVE_CHECK_(result == 0,
+             "prctl(PR_SET_PTRACER) failed for launcher PID ", launcher_pid,
+             ", error: ", error, ": ", std::strerror(error));
 }
 
 namespace nve {
@@ -131,6 +159,10 @@ void CUDADistributedBuffer::init_single_host(uint64_t size, BufferLocation locat
   NVE_CHECK_(num_shards_ > 0);
   const size_t world_size = env_->world_size();
 
+  if (root_proc && world_size > 1) {
+    allow_launcher_descendants_to_get_fds();
+  }
+
   CUmemAllocationProp prop = {};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = (location == BufferLocation::ALLOCATION_SYS_MEM) ? CU_MEM_LOCATION_TYPE_HOST_NUMA : CU_MEM_LOCATION_TYPE_DEVICE;
@@ -140,7 +172,7 @@ void CUDADistributedBuffer::init_single_host(uint64_t size, BufferLocation locat
   size_t granularity = get_device_granularity(prop); // we assume all GPUs will have the same granularity requirements
 
   // Round shard to multiple of num_shards_ * granularity (need every shard to be aligned to granularity)
-  total_size_ = ROUND_UP(size, num_shards_ * granularity);
+  total_size_ = round_up(size, num_shards_ * granularity);
   shard_size_ = num_shards_ ? total_size_ / num_shards_ : 0;
 
   // Rank 0 should do all cuMemCreate and export
@@ -172,7 +204,8 @@ void CUDADistributedBuffer::init_single_host(uint64_t size, BufferLocation locat
     for (size_t i=0 ; i<world_size; i++) {
       if (all_devices_[i] >= 0) {
         int local_fd = pidfd_getfd(root_pidfd, shareable_handles[i], 0);
-        NVE_CHECK_(local_fd != -1, "pidfd_getfd() failed, make sure SYS_PTRACE is available!");
+        const int error = errno;
+        NVE_CHECK_(local_fd != -1, "pidfd_getfd() failed, make sure SYS_PTRACE is available!", " error: ", error, ": ", std::strerror(error));
         shareable_handles[i] = local_fd;
       }
     }
@@ -255,7 +288,7 @@ void CUDADistributedBuffer::init_multi_host(uint64_t size) {
   size_t granularity = get_device_granularity(prop);
 
   // Round shard to multiple of num_shards_ * granularity (need every shard to be aligned to granularity)
-  total_size_ = ROUND_UP(size, num_shards_ * granularity);
+  total_size_ = round_up(size, num_shards_ * granularity);
   shard_size_ = num_shards_ ? total_size_ / num_shards_ : 0;
 
   // Allocate & export handle

@@ -25,7 +25,7 @@
 
 using namespace nve;
 
-// Bit layout for the packed FindAndCombine MASK template parameter. The kernel unpacks these and
+// Bit layout for the packed find_and_combine MASK template parameter. The kernel unpacks these and
 // get_mask() packs them; cmake/gen_find_and_combine_instantiations.py enumerates MASK over
 // [0, 16) with this same layout, so all three must stay in sync.
 constexpr uint32_t NVE_FAC_MASK_FIXED_HOTNESS = 1u << 0;
@@ -34,18 +34,18 @@ constexpr uint32_t NVE_FAC_MASK_IS_WEIGHTED   = 1u << 2;
 constexpr uint32_t NVE_FAC_MASK_LOAD_INDICES  = 1u << 3;
 
 template<DataType_t ELEMENT_TYPE_ID, typename INDEX_TYPE, typename ACC_TYPE, typename WEIGHT_TYPE,
-         typename INPUT_VEC_TYPE,
+         typename OUTPUT_TYPE, typename INPUT_VEC_TYPE, typename OUT_VEC_TYPE,
          typename ELEMENT_VEC_TYPE, typename ACC_VEC_TYPE, typename CacheDataT,
          uint32_t SZ_ACCUM, uint32_t MASK>
 __launch_bounds__(128, 1)
-__global__ void FindAndCombine(const uint32_t batchSz,
+__global__ void find_and_combine(const uint32_t batchSz,
                                const int8_t* __restrict__ table,
                                const INDEX_TYPE* __restrict__ indices,
                                const INDEX_TYPE* __restrict__ offsets,
                                const WEIGHT_TYPE* __restrict__ weights,
                                int32_t num_hot,  CacheDataT cache,
                                int32_t rowSizeInElements,
-                               typename QuantizationHelper<ELEMENT_TYPE_ID>::ParamType* pOutput)
+                               OUTPUT_TYPE* pOutput)
 {
     constexpr bool FIXED_HOTNESS = (MASK & NVE_FAC_MASK_FIXED_HOTNESS) != 0u;
     constexpr bool SUM_POOLING   = (MASK & NVE_FAC_MASK_SUM_POOLING)   != 0u;
@@ -130,7 +130,7 @@ __global__ void FindAndCombine(const uint32_t batchSz,
           }
       }
 
-      ELEMENT_VEC_TYPE* currOut = reinterpret_cast<ELEMENT_VEC_TYPE*>(pOutput + sampleId * rowSizeInElements);
+      OUT_VEC_TYPE* currOut = reinterpret_cast<OUT_VEC_TYPE*>(pOutput + sampleId * rowSizeInElements);
 
       // TODO: try loop on acc size
       for (int32_t j = hotnessTid + base_offset, k = 0; k < SZ_ACCUM; j += SUBWARP_WIDTH, ++k)
@@ -148,19 +148,20 @@ __global__ void FindAndCombine(const uint32_t batchSz,
                   Div(acc[k], acc_weight[k]);
               }
           }
-          currOut[j] = Cast<ACC_VEC_TYPE, ELEMENT_VEC_TYPE>(acc[k]);
+          currOut[j] = Cast<ACC_VEC_TYPE, OUT_VEC_TYPE>(acc[k]);
       }
     }
 }
 
-// Host launch wrapper for one FindAndCombine combination. Kept as a plain (non-__global__) host
+// Host launch wrapper for one find_and_combine combination. Kept as a plain (non-__global__) host
 // function template so it can be explicitly instantiated in a separate translation unit and linked
 // without relocatable device code: the kernel launch (and hence the kernel's device-code
 // instantiation) stays co-located with this wrapper in whichever TU instantiates it. The dispatch
-// in callFindAndCombineKernelTypesResolved routes every launch through this wrapper; the generated
+// in call_find_and_combine_kernel_types_resolved routes every launch through this wrapper; the generated
 // inst_*.cu files provide the definitions and gpu_table.cu sees only the extern declarations below.
 template<DataType_t ELEMENT_TYPE_ID, typename INDEX_TYPE, typename ACC_TYPE, typename WEIGHT_TYPE,
-         typename INPUT_VEC_TYPE, typename ELEMENT_VEC_TYPE, typename ACC_VEC_TYPE, typename CacheDataT,
+         typename OUTPUT_TYPE, typename INPUT_VEC_TYPE, typename OUT_VEC_TYPE,
+         typename ELEMENT_VEC_TYPE, typename ACC_VEC_TYPE, typename CacheDataT,
          uint32_t SZ_ACCUM, uint32_t MASK>
 void nve_fac_launch(const uint32_t batchSz,
                     const int8_t* table,
@@ -175,12 +176,12 @@ void nve_fac_launch(const uint32_t batchSz,
 {
     dim3 gridSize(batchSz, 1);
     dim3 blockSize(32, 1);
-    FindAndCombine<ELEMENT_TYPE_ID, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, INPUT_VEC_TYPE,
-                   ELEMENT_VEC_TYPE, ACC_VEC_TYPE, CacheDataT,
+    find_and_combine<ELEMENT_TYPE_ID, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE,
+                   INPUT_VEC_TYPE, OUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE, CacheDataT,
                    SZ_ACCUM, MASK>
         <<<gridSize, blockSize, 0, stream>>>(batchSz, table, indices, offsets, weights,
                                              num_hot, cache, rowSizeInElements,
-                                             reinterpret_cast<typename QuantizationHelper<ELEMENT_TYPE_ID>::ParamType*>(output));
+                                             reinterpret_cast<OUTPUT_TYPE*>(output));
 }
 
 // extern template declarations of nve_fac_launch for every dispatched combination, generated at
@@ -229,8 +230,8 @@ inline uint32_t get_mask(SparseType_t hot_type, PoolingType_t pooling_type, bool
     return mask;
 }
 
-template<DataType_t ELEMENT_TYPE_ID, typename INDEX_TYPE, typename ACC_TYPE, typename WEIGHT_TYPE, typename CacheDataT>
-void callFindAndCombineKernelTypesResolved(const uint32_t batchSz,
+template<DataType_t ELEMENT_TYPE_ID, typename INDEX_TYPE, typename ACC_TYPE, typename WEIGHT_TYPE, typename OUTPUT_TYPE, typename CacheDataT>
+void call_find_and_combine_kernel_types_resolved(const uint32_t batchSz,
                              const int8_t* __restrict__ table,
                              const INDEX_TYPE* __restrict__ indices,
                              const INDEX_TYPE* __restrict__ offsets,
@@ -245,89 +246,108 @@ void callFindAndCombineKernelTypesResolved(const uint32_t batchSz,
                              cudaStream_t stream)
 {
     uint32_t mask = get_mask(hot_type, pooling_type, load_indices);
-    constexpr int32_t SUBWARP_WIDTH = 32;
 
-    
-#define NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, MASK) \
-    nve_fac_launch<ELEMENT_TYPE_ID, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, INPUT_VEC_TYPE, \
-                   ELEMENT_VEC_T, ACC_VEC_T, CacheDataT, \
+#define NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, MASK) \
+    nve_fac_launch<ELEMENT_TYPE_ID, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, INPUT_VEC_TYPE, \
+                   OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, CacheDataT, \
                    (SZ_ACC_RUNTIME), MASK>( \
         batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, output, stream)
-    
+
+    constexpr int32_t SUBWARP_WIDTH = 32;
+
     // Each thread holds SZ_ACCUM vector accumulators; with SUBWARP_WIDTH (=32) threads per row this
     // covers SUBWARP_WIDTH * SZ_ACCUM * vecSizeInElements row elements per pass. The kernel loops
     // over the row in chunks of that size, so any row length is supported regardless of SZ_ACCUM.
-    // We pick the smallest SZ_ACCUM that fits the row in a single pass, clamped to 4, so small rows
-    // don't waste registers while large rows fall back to multiple passes. The clamp (4) must match
-    // the SZ_ACCUM range instantiated by cmake/gen_find_and_combine_instantiations.py.
-#define NVE_FAC_LAUNCH_MASK(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T)                                                                            \
+    // SZ_ACCUM is therefore purely a performance knob: we pick the smallest SZ_ACCUM that covers the
+    // row in a single pass, clamped per vector width to min(4, 8 / vecSizeInElements) so that
+    // vecSizeInElements * SZ_ACCUM <= 8 (bounded register pressure) and SZ_ACCUM <= 4. The clamped
+    // range instantiated per width must match WIDTH_ACCUM in
+    // cmake/gen_find_and_combine_instantiations.py.
+#define NVE_FAC_LAUNCH_MASK(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T)                                                                          \
     do {                                                                                                                                                          \
         switch (mask) {                                                                                                                                           \
-            case 0b0000: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0000); break;                                            \
-            case 0b0001: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0001); break;                                            \
-            case 0b0010: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0010); break;                                            \
-            case 0b0011: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0011); break;                                            \
-            case 0b0100: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0100); break;                                            \
-            case 0b0101: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0101); break;                                            \
-            case 0b0110: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0110); break;                                            \
-            case 0b0111: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b0111); break;                                            \
-            case 0b1000: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1000); break;                                            \
-            case 0b1001: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1001); break;                                            \
-            case 0b1010: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1010); break;                                            \
-            case 0b1011: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1011); break;                                            \
-            case 0b1100: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1100); break;                                            \
-            case 0b1101: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1101); break;                                            \
-            case 0b1110: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1110); break;                                            \
-            case 0b1111: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T, 0b1111); break;                                            \
+            case 0b0000: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0000); break;                                            \
+            case 0b0001: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0001); break;                                            \
+            case 0b0010: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0010); break;                                            \
+            case 0b0011: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0011); break;                                            \
+            case 0b0100: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0100); break;                                            \
+            case 0b0101: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0101); break;                                            \
+            case 0b0110: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0110); break;                                            \
+            case 0b0111: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b0111); break;                                            \
+            case 0b1000: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1000); break;                                            \
+            case 0b1001: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1001); break;                                            \
+            case 0b1010: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1010); break;                                            \
+            case 0b1011: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1011); break;                                            \
+            case 0b1100: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1100); break;                                            \
+            case 0b1101: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1101); break;                                            \
+            case 0b1110: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1110); break;                                            \
+            case 0b1111: NVE_FAC_LAUNCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T, 0b1111); break;                                            \
             default:                                                                                                                                               \
                 NVE_THROW_("Unsupported mask ", mask);                                                                                                             \
         }                                                                                                                                                         \
     } while (0)
 
-#define NVE_FAC_DISPATCH(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T)               \
+    // Dispatch the runtime-selected SZ_ACCUM. Each vector width only instantiates SZ_ACCUM up to its
+    // per-width clamp (min(4, 8 / vecSizeInElements)), so Vec4 switches over {1,2} while Vec2/Vec1
+    // switch over {1..4}; referencing an un-instantiated SZ_ACCUM here would be a link error.
+#define NVE_FAC_DISPATCH_2(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T)   \
     do {                                                                                        \
         switch (SZ_ACC_RUNTIME) {                                                                \
-          case 1: NVE_FAC_LAUNCH_MASK(1, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T); break;       \
-          case 2: NVE_FAC_LAUNCH_MASK(2, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T); break;       \
-          case 3: NVE_FAC_LAUNCH_MASK(3, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T); break;       \
-          case 4: NVE_FAC_LAUNCH_MASK(4, INPUT_VEC_TYPE, ELEMENT_VEC_T, ACC_VEC_T); break;       \
+          case 1: NVE_FAC_LAUNCH_MASK(1, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
+          case 2: NVE_FAC_LAUNCH_MASK(2, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
           default: NVE_THROW_("Unsupported kernel dimensions ", SZ_ACC_RUNTIME);                 \
         }                                                                                       \
     } while (0)
-    
-    constexpr int32_t MAX_SZ_ACCUM = 4;
+
+#define NVE_FAC_DISPATCH_4(SZ_ACC_RUNTIME, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T)   \
+    do {                                                                                        \
+        switch (SZ_ACC_RUNTIME) {                                                                \
+          case 1: NVE_FAC_LAUNCH_MASK(1, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
+          case 2: NVE_FAC_LAUNCH_MASK(2, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
+          case 3: NVE_FAC_LAUNCH_MASK(3, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
+          case 4: NVE_FAC_LAUNCH_MASK(4, INPUT_VEC_TYPE, OUT_VEC_T, ELEMENT_VEC_T, ACC_VEC_T); break; \
+          default: NVE_THROW_("Unsupported kernel dimensions ", SZ_ACC_RUNTIME);                 \
+        }                                                                                       \
+    } while (0)
+
+    // Smallest SZ_ACCUM covering the row in one pass, clamped per width to min(4, 8 / vecWidth).
+    // Keep the clamps in sync with WIDTH_ACCUM in gen_find_and_combine_instantiations.py.
     if (get_row_size_in_bytes<ELEMENT_TYPE_ID>(rowSizeInElements) % sizeof(typename QuantizationHelper<ELEMENT_TYPE_ID>::Vec4) == 0 && rowSizeInElements % 4 == 0)
     {
-        const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 4), MAX_SZ_ACCUM);
+        const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 4), 2u);
         using INPUT_VEC_TYPE = typename QuantizationHelper<ELEMENT_TYPE_ID>::Vec4;
         using ELEMENT_VEC_TYPE = typename VecWidthHelper<typename QuantizationHelper<ELEMENT_TYPE_ID>::ParamType>::Vec4;
         using ACC_VEC_TYPE = typename VecWidthHelper<ACC_TYPE>::Vec4;
-        NVE_FAC_DISPATCH(SZ_ACCUM, INPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
+        using OUTPUT_VEC_TYPE = typename VecWidthHelper<OUTPUT_TYPE>::Vec4;
+        NVE_FAC_DISPATCH_2(SZ_ACCUM, INPUT_VEC_TYPE, OUTPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
     }
     else if (get_row_size_in_bytes<ELEMENT_TYPE_ID>(rowSizeInElements) % sizeof(typename QuantizationHelper<ELEMENT_TYPE_ID>::Vec2) == 0 && rowSizeInElements % 2 == 0)
     {
-      const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 2), MAX_SZ_ACCUM);
+      const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 2), 4u);
       using INPUT_VEC_TYPE = typename QuantizationHelper<ELEMENT_TYPE_ID>::Vec2;
       using ELEMENT_VEC_TYPE = typename VecWidthHelper<typename QuantizationHelper<ELEMENT_TYPE_ID>::ParamType>::Vec2;
       using ACC_VEC_TYPE = typename VecWidthHelper<ACC_TYPE>::Vec2;
-      NVE_FAC_DISPATCH(SZ_ACCUM, INPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
+      using OUTPUT_VEC_TYPE = typename VecWidthHelper<OUTPUT_TYPE>::Vec2;
+      NVE_FAC_DISPATCH_4(SZ_ACCUM, INPUT_VEC_TYPE, OUTPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
     }
     else
     {
-      const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 1), MAX_SZ_ACCUM);
+      const uint32_t SZ_ACCUM = std::min<uint32_t>(DivRoundUp(rowSizeInElements, SUBWARP_WIDTH * 1), 4u);
       using INPUT_VEC_TYPE = typename QuantizationHelper<ELEMENT_TYPE_ID>::Vec1;
       using ELEMENT_VEC_TYPE = typename VecWidthHelper<typename QuantizationHelper<ELEMENT_TYPE_ID>::ParamType>::Vec1;
       using ACC_VEC_TYPE = typename VecWidthHelper<ACC_TYPE>::Vec1;
-      NVE_FAC_DISPATCH(SZ_ACCUM, INPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
+      using OUTPUT_VEC_TYPE = typename VecWidthHelper<OUTPUT_TYPE>::Vec1;
+      NVE_FAC_DISPATCH_4(SZ_ACCUM, INPUT_VEC_TYPE, OUTPUT_VEC_TYPE, ELEMENT_VEC_TYPE, ACC_VEC_TYPE);
     }
-#undef NVE_FAC_DISPATCH
+#undef NVE_FAC_DISPATCH_2
+#undef NVE_FAC_DISPATCH_4
 #undef NVE_FAC_LAUNCH
 #undef NVE_FAC_LAUNCH_MASK
     NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
 }
 
-template<typename ACC_TYPE,typename WEIGHT_TYPE,typename INDEX_TYPE, typename CacheDataT>
-void callFindAndCombineKernelAccWeightType(const uint32_t batchSz,
+template<typename ACC_TYPE, typename WEIGHT_TYPE, typename OUTPUT_TYPE, typename INDEX_TYPE, typename CacheDataT>
+void call_find_and_combine_kernel_acc_weight_type(const uint32_t batchSz,
                               const int8_t* __restrict__ table,
                               const INDEX_TYPE* __restrict__ indices,
                               const INDEX_TYPE* __restrict__ offsets,
@@ -344,22 +364,22 @@ void callFindAndCombineKernelAccWeightType(const uint32_t batchSz,
 {
     switch (element_type) {
       case DataType_t::Float32:
-        callFindAndCombineKernelTypesResolved<DataType_t::Float32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::Float32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       case DataType_t::Float16:
-        callFindAndCombineKernelTypesResolved<DataType_t::Float16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::Float16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       case DataType_t::QUint8RowwiseF32:
-        callFindAndCombineKernelTypesResolved<DataType_t::QUint8RowwiseF32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::QUint8RowwiseF32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       case DataType_t::QInt8RowwiseF32:
-        callFindAndCombineKernelTypesResolved<DataType_t::QInt8RowwiseF32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::QInt8RowwiseF32, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       case DataType_t::QUint8RowwiseF16:
-        callFindAndCombineKernelTypesResolved<DataType_t::QUint8RowwiseF16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::QUint8RowwiseF16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       case DataType_t::QInt8RowwiseF16:
-        callFindAndCombineKernelTypesResolved<DataType_t::QInt8RowwiseF16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
+        call_find_and_combine_kernel_types_resolved<DataType_t::QInt8RowwiseF16, INDEX_TYPE, ACC_TYPE, WEIGHT_TYPE, OUTPUT_TYPE, CacheDataT>(batchSz, table, indices, offsets, weights, num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, output, stream);
         break;
       default:
         NVE_THROW_("Unsupported element type ", element_type);
@@ -367,7 +387,7 @@ void callFindAndCombineKernelAccWeightType(const uint32_t batchSz,
 }
 
 template<typename INDEX_TYPE, typename CacheDataT>
-void callFindAndCombineKernel(const uint32_t num_keys,
+void call_find_and_combine_kernel(const uint32_t num_keys,
                               const uint32_t num_offsets,
                               const int8_t* __restrict__ table,
                               const INDEX_TYPE* __restrict__ indices,
@@ -382,7 +402,7 @@ void callFindAndCombineKernel(const uint32_t num_keys,
                               DataType_t element_type,
                               DataType_t weight_type,
                               DataType_t acc_type,
-                              DataType_t /*output_type*/,
+                              DataType_t output_type,
                               void* output,
                               cudaStream_t stream)
 {
@@ -399,32 +419,34 @@ void callFindAndCombineKernel(const uint32_t num_keys,
       default:
         NVE_THROW_("Unsupported sparse type ", static_cast<uint32_t>(hot_type));
     }
+    // Resolve the output type for a fixed (ACC_T, WEIGHT_T) pair. Output precision is independent of
+    // acc/weight, so each supported (acc, weight) combination fans out over both output types.
+#define FAC_DISPATCH_OUTPUT(ACC_T, WEIGHT_T)                                                                                                                                                                                                              \
+    do {                                                                                                                                                                                                                                                  \
+        switch (output_type) {                                                                                                                                                                                                                            \
+          case DataType_t::Float32:                                                                                                                                                                                                                       \
+            call_find_and_combine_kernel_acc_weight_type<ACC_T, WEIGHT_T, float, INDEX_TYPE, CacheDataT>(batchSz, table, indices, offsets, static_cast<const WEIGHT_T*>(weights), num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, element_type, output, stream); \
+            break;                                                                                                                                                                                                                                        \
+          case DataType_t::Float16:                                                                                                                                                                                                                       \
+            call_find_and_combine_kernel_acc_weight_type<ACC_T, WEIGHT_T, __half, INDEX_TYPE, CacheDataT>(batchSz, table, indices, offsets, static_cast<const WEIGHT_T*>(weights), num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, element_type, output, stream); \
+            break;                                                                                                                                                                                                                                        \
+          default:                                                                                                                                                                                                                                        \
+            NVE_THROW_("Unsupported output type ", output_type);                                                                                                                                                                                          \
+        }                                                                                                                                                                                                                                                 \
+    } while (0)
+
     switch (acc_type) {
       case DataType_t::Float32:
         switch (weight_type) {
-          case DataType_t::Float32:
-            callFindAndCombineKernelAccWeightType<float, float, INDEX_TYPE, CacheDataT>(batchSz, table, indices, offsets, static_cast<const float*>(weights), num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, element_type, output, stream);
-            break;
-          case DataType_t::Float16:
-            callFindAndCombineKernelAccWeightType<float, __half, INDEX_TYPE, CacheDataT>(batchSz, table, indices, offsets, static_cast<const __half*>(weights), num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, element_type, output, stream);
-            break;
-          default:
-            NVE_THROW_("Unsupported weight type ", weight_type);
-            break;
-        }
-        break;
-      case DataType_t::Float16:
-        switch (weight_type) {
-          case DataType_t::Float32:
-            NVE_THROW_("Unsupported weight type precision < acc type precision ", weight_type, " < ", acc_type);
-          case DataType_t::Float16:
-            callFindAndCombineKernelAccWeightType<__half, __half, INDEX_TYPE, CacheDataT>(batchSz, table, indices, offsets, static_cast<const __half*>(weights), num_hot, cache, rowSizeInElements, hot_type, pooling_type, load_indices, element_type, output, stream);
-            break;
+          case DataType_t::Float32: FAC_DISPATCH_OUTPUT(float, float);   break;
+          case DataType_t::Float16: FAC_DISPATCH_OUTPUT(float, __half);  break;
           default:
             NVE_THROW_("Unsupported weight type ", weight_type);
         }
         break;
       default:
-        NVE_THROW_("Unsupported acc type ", acc_type);
+        NVE_THROW_("Unsupported acc type ", acc_type, ": only Float32 accumulation is supported");
     }
+
+#undef FAC_DISPATCH_OUTPUT
 }

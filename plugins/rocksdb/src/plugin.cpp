@@ -15,27 +15,9 @@
  * limitations under the License.
  */
 
-#include <plugin.hpp>
+#include <plugin/nve_internal_plugin.hpp>
 #include <rocksdb_table.hpp>
 
-extern "C" const char* plugin_ident() noexcept { return "MVIDIA plugin Facebook RocksDB"; }
-
-extern "C" const char* plugin_developer() noexcept { return "NVIDIA Corporation"; }
-
-extern "C" void enum_host_table_implementations(void* dll,
-                                                void (*callback)(void*, const char*)) noexcept {
-  callback(dll, "rocksdb");
-}
-
-using namespace nve;
-using namespace nve::plugin;
-
-#pragma GCC diagnostic push
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-extern "C" host_table_factory_ptr_t create_rocksdb_table_factory(const nlohmann::json& json) {
-#pragma GCC diagnostic pop
-  return {new RocksDBTableFactory(static_cast<RocksDBTableFactoryConfig>(json)),
-          [](RocksDBTableFactory* const p) { delete p; }};
-}
+NVE_DEFINE_INTERNAL_PLUGIN("NVIDIA plugin for Facebook RocksDB", "NVIDIA Corporation",
+                           nve::plugin::RocksDBTableFactory,
+                           nve::plugin::RocksDBTableFactoryConfig)

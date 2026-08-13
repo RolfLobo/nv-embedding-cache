@@ -23,6 +23,7 @@
 #include <gpu_table.hpp>
 #include <host_table.hpp>
 #include <insert_heuristic.hpp>
+#include <plugin/external_plugin_table.hpp>
 #include <thread_pool.hpp>
 #include <allocator.hpp>
 
@@ -43,6 +44,10 @@ nve_status_t nve_set_error(nve_status_t status, const std::string& message);
 #define NVE_C_TRY try {
 
 #define NVE_C_CATCH                                                 \
+  }                                                                 \
+  catch (const nve::ExternalPluginError& e) {                       \
+    /* round-trip the external plugin's validated status category */\
+    return nve_set_error(e.status(), e.what());                     \
   }                                                                 \
   catch (const std::bad_alloc&) {                                   \
     return nve_set_error(NVE_ERROR_OUT_OF_MEMORY, "Out of memory"); \
@@ -90,14 +95,17 @@ struct nve_heuristic_s {
   std::shared_ptr<nve::InsertHeuristic> ptr;
 };
 
-struct nve_host_factory_s {
-  nve::host_table_factory_ptr_t ptr;
+struct nve_table_factory_s {
+  nve::table_factory_ptr_t ptr;
 };
 
 /* ============================================================================
  * Enum conversion helpers
  * ============================================================================ */
 
+/* Thin wrapper over nve::convert_external_dtype (plugin/external_plugin_table.hpp),
+ * the mapping shared with the external-plugin adapter: out-of-range values
+ * become Unknown instead of throwing. */
 nve::DataType_t convert_dtype(nve_data_type_t dt);
 nve::SparseType_t convert_sparse_type(nve_sparse_type_t st);
 nve::PoolingType_t convert_pooling_type(nve_pooling_type_t pt);

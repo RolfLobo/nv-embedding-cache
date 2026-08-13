@@ -20,6 +20,15 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
+
+// Validates a caller-supplied argument and throws std::invalid_argument when it does not hold.
+#define CHECK_ARG(_expr_, _msg_)                                                  \
+  do {                                                                            \
+    if (!(_expr_)) {                                                              \
+      throw std::invalid_argument(std::string("custom_remote plugin: ") + (_msg_)); \
+    }                                                                             \
+  } while (false)
 
 namespace nve {
 
@@ -40,12 +49,12 @@ int64_t CustomRemoteTable::size(context_ptr_t& /*ctx*/, bool /*exact*/) const {
 
 /* -- find ------------------------------------------------------------------ */
 void CustomRemoteTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-                             buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+                             buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
                              buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const {
   auto lookup_stream = ctx->get_lookup_stream();
   const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
                               : nullptr;
-  max_bitmask_repr_t* hit_mask_buf =
+  bitmask64_t* hit_mask_buf =
       hit_mask ? hit_mask->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
                : nullptr;
   void* values_buf = values ? values->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/, lookup_stream)
@@ -56,6 +65,8 @@ void CustomRemoteTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const voi
   const auto* typed_keys = static_cast<const int64_t*>(keys_buf);
   auto*       out        = static_cast<char*>(values_buf);
   int64_t     hits       = 0;
+
+  CHECK_ARG(n == 0 || typed_keys != nullptr, "find requires a non-null keys buffer");
 
   for (int64_t i = 0; i < n; ++i) {
     if (hit_mask_buf && ((hit_mask_buf[i / 64] >> (i % 64)) & 1)) continue;
@@ -89,6 +100,9 @@ void CustomRemoteTable::insert(context_ptr_t& ctx, int64_t n,
   const auto* typed_keys = static_cast<const int64_t*>(keys_buf);
   const auto* in         = static_cast<const char*>(values_buf);
 
+  CHECK_ARG(n == 0 || (typed_keys != nullptr && in != nullptr),
+            "insert requires non-null keys and values buffers");
+
   for (int64_t i = 0; i < n; ++i) {
     auto& slot = store_[typed_keys[i]];
     slot.assign(in + i * value_stride,
@@ -109,6 +123,9 @@ void CustomRemoteTable::update(context_ptr_t& ctx, int64_t n,
   const auto* typed_keys = static_cast<const int64_t*>(keys_buf);
   const auto* in         = static_cast<const char*>(values_buf);
 
+  CHECK_ARG(n == 0 || (typed_keys != nullptr && in != nullptr),
+            "update requires non-null keys and values buffers");
+
   for (int64_t i = 0; i < n; ++i) {
     auto it = store_.find(typed_keys[i]);
     if (it == store_.end()) continue;
@@ -124,10 +141,8 @@ void CustomRemoteTable::update_accumulate(context_ptr_t& ctx, int64_t n,
                                           int64_t update_size,
                                           buffer_ptr<const void> updates,
                                           DataType_t update_dtype) {
-  if (update_dtype != DataType_t::Float32) {
-    throw std::invalid_argument(
-        "custom_remote plugin only supports update_dtype=Float32 in update_accumulate");
-  }
+  CHECK_ARG(update_dtype == DataType_t::Float32,
+            "only update_dtype=Float32 is supported in update_accumulate");
   auto modify_stream = ctx->get_modify_stream();
   const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                               : nullptr;
@@ -138,6 +153,9 @@ void CustomRemoteTable::update_accumulate(context_ptr_t& ctx, int64_t n,
   const auto* in             = static_cast<const float*>(updates_buf);
   const int64_t floats_per_row = update_size / static_cast<int64_t>(sizeof(float));
   const int64_t float_stride   = update_stride / static_cast<int64_t>(sizeof(float));
+
+  CHECK_ARG(n == 0 || (typed_keys != nullptr && in != nullptr),
+            "update_accumulate requires non-null keys and updates buffers");
 
   for (int64_t i = 0; i < n; ++i) {
     auto it = store_.find(typed_keys[i]);
@@ -158,6 +176,7 @@ void CustomRemoteTable::erase(context_ptr_t& ctx, int64_t n,
                                                     ctx->get_modify_stream())
                               : nullptr;
   const auto* typed_keys = static_cast<const int64_t*>(keys_buf);
+  CHECK_ARG(n == 0 || typed_keys != nullptr, "erase requires a non-null keys buffer");
   for (int64_t i = 0; i < n; ++i) store_.erase(typed_keys[i]);
 }
 
@@ -165,32 +184,20 @@ void CustomRemoteTable::erase(context_ptr_t& ctx, int64_t n,
  * CustomRemoteTableFactory
  * ============================================================================ */
 
-host_table_ptr_t CustomRemoteTableFactory::produce(table_id_t id,
-                                                   const nlohmann::json& json) {
+table_ptr_t CustomRemoteTableFactory::produce(table_id_t id,
+                                              const nlohmann::json& json) {
   if (json.contains("key_size")) {
     int64_t key_size = json.at("key_size").get<int64_t>();
-    if (key_size != 8) {
-      throw std::invalid_argument(
-          "custom_remote plugin only supports key_size=8 (int64_t), got " +
-          std::to_string(key_size));
-    }
-  }
-  if (json.contains("mask_size")) {
-    int64_t mask_size = json.at("mask_size").get<int64_t>();
-    if (mask_size != 8) {
-      throw std::invalid_argument(
-          "custom_remote plugin only supports mask_size=8, got " +
-          std::to_string(mask_size));
-    }
+    CHECK_ARG(key_size == 8,
+              "only key_size=8 (int64_t) is supported, got " + std::to_string(key_size));
   }
 
   int64_t max_value_size = 128;
   if (json.contains("max_value_size")) {
     max_value_size = json.at("max_value_size").get<int64_t>();
   }
-  if (max_value_size <= 0) {
-    throw std::invalid_argument("max_value_size must be positive");
-  }
+  CHECK_ARG(max_value_size > 0,
+            "max_value_size must be positive, got " + std::to_string(max_value_size));
   return std::make_shared<CustomRemoteTable>(id, max_value_size);
 }
 

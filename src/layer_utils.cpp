@@ -22,7 +22,7 @@
 #include <buffer_wrapper.hpp>
 #include <table.hpp>
 #include <resizeable_buffer.hpp>
-#include "cpu_ops/cpu_pooling.h"
+#include "cpu_ops/cpu_pooling.hpp"
 #include <algorithm>
 #include <cstring>
 
@@ -98,7 +98,7 @@ void AutoInsertHandler::auto_insert(
   const float hitrate,
   const int64_t num_keys,
   const int64_t output_stride,
-  std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw,
+  std::shared_ptr<BufferWrapper<bitmask64_t>> hitmask_bw,
   const bool insert_from_uvm
 ) {
   if ((heuristic_ == nullptr) || !insert_lock_.try_lock()) {
@@ -145,7 +145,7 @@ void AutoInsertHandler::auto_insert(
 void AutoInsertHandler::collect_keys_and_data(
   std::shared_ptr<BufferWrapper<const void>>& keys_bw,
   std::shared_ptr<BufferWrapper<void>>& output_bw,
-  std::shared_ptr<BufferWrapper<max_bitmask_repr_t>>& hitmask_bw,
+  std::shared_ptr<BufferWrapper<bitmask64_t>>& hitmask_bw,
   cudaStream_t lookup_stream,
   const int64_t num_keys) {
 
@@ -177,7 +177,7 @@ void AutoInsertHandler::collect_keys_and_data(
   // Make the hitmask host-visible so we can rewrite missed keys to the sentinel after the sync below.
   // access_buffer queues a D2H copy on lookup_stream when the last access was on device, so it's covered
   // by the existing stream sync.
-  max_bitmask_repr_t* h_hitmask = nullptr;
+  bitmask64_t* h_hitmask = nullptr;
   if (hitmask_bw) {
     h_hitmask = hitmask_bw->access_buffer(cudaMemoryTypeHost, true /*copy_content*/, lookup_stream);
   }
@@ -187,7 +187,7 @@ void AutoInsertHandler::collect_keys_and_data(
   if (!collection_is_uvm_) {
     NVE_CHECK_(cudaMemcpyAsync(
       reinterpret_cast<uint8_t*>(insert_data_->get_ptr(static_cast<size_t>(collection_total_size * collected_output_stride_))) + (collected_keys_ * collected_output_stride_),
-      output_bw->get_buffer(keys_bw->get_last_access()),
+      output_bw->get_buffer(output_bw->get_last_access()),
       static_cast<size_t>(collection_part_size * collected_output_stride_),
       cudaMemcpyDefault,
       lookup_stream));
@@ -201,10 +201,10 @@ void AutoInsertHandler::collect_keys_and_data(
   // contaminated with garbage values from unresolved slots. Per-call hitmask indices [0, collection_part_size)
   // map to insert_keys_ slots [collected_keys_, collected_keys_ + collection_part_size).
   if (h_hitmask) {
-    constexpr auto hitmask_elem_bits = sizeof(max_bitmask_repr_t) * 8;
+    constexpr auto hitmask_elem_bits = sizeof(bitmask64_t) * 8;
     for (int64_t j = 0; j < collection_part_size; ++j) {
       const auto word = h_hitmask[static_cast<uint64_t>(j) / hitmask_elem_bits];
-      const auto bit = (word >> (static_cast<uint64_t>(j) % hitmask_elem_bits)) & static_cast<max_bitmask_repr_t>(1);
+      const auto bit = (word >> (static_cast<uint64_t>(j) % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
       if (!bit) {
         std::memcpy(dst_keys + j * key_size_, invalid_key_bytes_.data(), static_cast<size_t>(key_size_));
       }
@@ -237,11 +237,14 @@ void AutoInsertHandler::launch_insert(
   auto ctx = std::dynamic_pointer_cast<ExecutionContext>(layer_ctx);
   // insert_lock_ is held until the task completes, so collection_is_uvm_ is stable - capture the decision.
   const bool from_uvm = collection_is_uvm_;
-  auto insert_keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "insert_keys", insert_keys_->get_ptr(0), insert_keys_->get_size());
+  const std::string buffer_suffix = "_" + std::to_string(table_id_);
+  auto insert_keys_bw = std::make_shared<BufferWrapper<const void>>(
+    ctx, "insert_keys" + buffer_suffix, insert_keys_->get_ptr(0), insert_keys_->get_size());
   // In UVM mode no per-key data was collected; the insert reads rows from the backing UVM table.
   std::shared_ptr<BufferWrapper<const void>> insert_output_bw;
   if (!from_uvm) {
-    insert_output_bw = std::make_shared<BufferWrapper<const void>>(ctx, "insert_data", insert_data_->get_ptr(0), insert_data_->get_size());
+    insert_output_bw = std::make_shared<BufferWrapper<const void>>(
+      ctx, "insert_data" + buffer_suffix, insert_data_->get_ptr(0), insert_data_->get_size());
   }
 
   // Now schedule the insert on the threapool
@@ -485,7 +488,7 @@ void pool_gathered_host(context_ptr_t& ctx,
 
   auto thread_pool = ctx->get_thread_pool();
   const int64_t num_workers = thread_pool->num_workers();
-  cpu_kernel_pooling_dispatch<KeyType>(thread_pool, num_bags, row_width, gather_host, gather_stride,
+  cpu_kernel_pooling_dispatch<KeyType>(std::move(thread_pool), num_bags, row_width, gather_host, gather_stride,
                                        output_host, output_stride, effective_sparse, fixed_hotness,
                                        offsets_host, pool_params.pooling_type, weights,
                                        pool_params.weight_type, in_dtype, out_dtype, num_workers);

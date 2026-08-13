@@ -23,8 +23,8 @@
 #include <nve_types.hpp>
 #include <execution_context.hpp>
 #include <common.hpp>
-#include "cpu_ops/cpu_gather.h"
-#include "cpu_ops/cpu_update.h"
+#include "cpu_ops/cpu_gather.hpp"
+#include "cpu_ops/cpu_update.hpp"
 #include <vector>
 #include <memory>
 #include <limits>
@@ -36,7 +36,7 @@ struct LinearHostTableConfig : public HostTableConfig {
 
     void* emb_table{nullptr};                               // Pointer to host accessible buffer of the embedding table (preferably cudaMallocHost)
                                                             // Caller is responsible for allocating/freeing this buffer
-                                                            // Caller is responsible for not accessing indices beyond the allocated size
+    int64_t num_rows{0};                                    // Number of rows allocated in emb_table
     int64_t max_threads{std::numeric_limits<int64_t>::max()}; // Max amount of threads used (up to #threads in the machine)
 
     void check() const;
@@ -67,14 +67,14 @@ public:
         NVE_LOG_INFO_("Clearing linear host table has no effect");
     }
 
-    int64_t size(context_ptr_t&, bool) const override { return -1; }
+    int64_t size(context_ptr_t&, bool) const override { return config_.num_rows; }
 
     void erase(context_ptr_t& /*ctx*/, int64_t /*num_keys*/, buffer_ptr<const void> /*keys*/) override {
         NVE_NVTX_SCOPED_FUNCTION_COL5_();
         NVE_LOG_INFO_("Erasing from linear host table has no effect");
     }
 
-    void find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, buffer_ptr<max_bitmask_repr_t> hit_mask,
+    void find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, buffer_ptr<bitmask64_t> hit_mask,
               int64_t value_stride, buffer_ptr<void> values, buffer_ptr<int64_t> /*value_sizes*/) const override {
         NVE_NVTX_SCOPED_FUNCTION_COL1_();
         NVE_CHECK_(ctx != nullptr, "Invalid context");
@@ -82,7 +82,7 @@ public:
         const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream) : nullptr;
         // hit_mask is optional — callers that don't need per-key hit info pass null,
         // and the kernel below treats null as "no pre-existing hits, don't record hits".
-        max_bitmask_repr_t* hit_mask_buf = hit_mask ? hit_mask->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream) : nullptr;
+        bitmask64_t* hit_mask_buf = hit_mask ? hit_mask->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream) : nullptr;
         void* values_buf = values ? values->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/, lookup_stream) : nullptr;
         NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
         NVE_CHECK_(values_buf != nullptr, "Invalid values");
@@ -90,21 +90,7 @@ public:
         const auto* typed_keys = reinterpret_cast<const key_type*>(keys_buf);
         const int64_t num_threads{std::min(ctx->get_thread_pool()->num_workers(), config_.max_threads)};
 
-        // Count existing hits on the hitmask (needed for calculating the hit counter)
-        int64_t previous_hits = 0;
-        if (hit_mask_buf != nullptr) {
-            const int64_t full_words = num_keys / max_bitmask_t::num_bits;
-            for (int64_t i = 0; i < full_words; ++i) {
-                previous_hits += max_bitmask_t::count(hit_mask_buf[i]);
-            }
-            const int64_t remaining_bits = num_keys % max_bitmask_t::num_bits;
-            if (remaining_bits != 0) {
-                previous_hits += max_bitmask_t::count(
-                    max_bitmask_t::clip(hit_mask_buf[full_words], remaining_bits));
-            }
-        }
-
-        NVE_CHECK_(cpu_kernel_gather<key_type>(
+        const int64_t resolved_hits = cpu_kernel_gather<key_type>(
             ctx->get_thread_pool(),
             static_cast<size_t>(num_keys),
             typed_keys,
@@ -113,11 +99,12 @@ public:
             values_buf,
             static_cast<int8_t*>(config_.emb_table),
             static_cast<uint64_t>(config_.max_value_size),
+            static_cast<uint64_t>(config_.num_rows),
             static_cast<uint64_t>(num_threads)
-        ) == 0);
+        );
         auto ctx_counter = lookup_counter_storage(ctx);
         NVE_CHECK_(ctx_counter != nullptr, "Invalid key counter");
-        *ctx_counter += num_keys - previous_hits;
+        *ctx_counter += resolved_hits;
     }
 
     void insert(context_ptr_t& /*ctx*/, int64_t /*num_keys*/, buffer_ptr<const void> /*keys*/, int64_t /*value_stride*/,
@@ -149,6 +136,7 @@ public:
             typed_values,
             static_cast<int8_t*>(config_.emb_table),
             static_cast<uint64_t>(config_.max_value_size),
+            static_cast<uint64_t>(config_.num_rows),
             static_cast<uint64_t>(num_threads)
         ) == 0);
     }
@@ -177,6 +165,7 @@ public:
             static_cast<int8_t*>(config_.emb_table),
             static_cast<uint64_t>(config_.max_value_size),
             update_dtype,
+            static_cast<uint64_t>(config_.num_rows),
             static_cast<uint64_t>(num_threads)
         );
     }

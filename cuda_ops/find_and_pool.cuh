@@ -55,13 +55,11 @@ inline void validate_find_and_pool_data_types(PoolingType_t pooling_type, DataTy
     return;
   }
 
-  NVE_CHECK_(acc_dtype == DataType_t::Float32 || acc_dtype == DataType_t::Float16,
-             "Unsupported find_and_pool accumulator type ", acc_dtype);
+  NVE_CHECK_(acc_dtype == DataType_t::Float32,
+             "Unsupported find_and_pool accumulator type ", acc_dtype,
+             ": only Float32 accumulation is supported");
   NVE_CHECK_ARG_(weight_dtype == DataType_t::Float32 || weight_dtype == DataType_t::Float16,
                  "Unsupported find_and_pool weight type ", weight_dtype);
-  NVE_CHECK_(acc_dtype != DataType_t::Float16 || weight_dtype == DataType_t::Float16,
-             "Unsupported find_and_pool accumulator/weight type combination: Float16 accumulator "
-             "requires Float16 weights");
 }
 
 // Validate the output row stride the CUDA pool/dequant kernels will use against the stored row
@@ -115,19 +113,18 @@ void find_and_pool(uint32_t num_keys, const IndexT* keys, const int8_t* table, C
     return;
   }
   if (pooling_type == PoolingType_t::Concatenate) {
-    // No pooling: one dequantized row per key. The number of value elements per row is derived from
-    // the output stride and the stored (input) element size, matching GpuTable::find_and_dequant.
+    // No pooling: one dequantized row per key. value_stride is the output row stride, 
     const uint32_t row_size_in_elements =
-        static_cast<uint32_t>(value_stride / value_size_in_bytes(value_dtype));
+        static_cast<uint32_t>(value_stride / value_size_in_bytes(output_dtype));
     const cudaError_t status = call_find_and_dequant<IndexT, CacheDataT>(
         keys, static_cast<size_t>(num_keys), static_cast<int8_t*>(output), table, value_dtype,
-        row_size_in_elements, cache, stream, static_cast<size_t>(value_stride), load_indices,
-        0 /*curr_table*/);
+        output_dtype, row_size_in_elements, cache, stream, static_cast<size_t>(value_stride),
+        load_indices, 0 /*curr_table*/);
     NVE_CHECK_(status, "find_and_dequant failed");
   } else {
     const int32_t num_elements =
         static_cast<int32_t>(value_stride / value_size_in_bytes(output_dtype));
-    callFindAndCombineKernel<IndexT, CacheDataT>(
+    call_find_and_combine_kernel<IndexT, CacheDataT>(
         num_keys, num_offsets, table, keys, offsets, weights, fixed_hotness, cache, num_elements,
         sparse_type, pooling_type, load_indices, value_dtype, weight_dtype, acc_dtype, output_dtype,
         output, stream);

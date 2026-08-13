@@ -17,6 +17,9 @@ set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 include(FetchContent)
 set(FETCHCONTENT_QUIET FALSE)
 
+# Always built: replaces the former built-in STL map registry aliases.
+add_subdirectory(stl_map)
+
 list(FIND NVE_FEATURES "nvhm_plugin" NVE_FEATURE_ENABLED)
 if(${NVE_FEATURE_ENABLED} GREATER -1)
   add_subdirectory(nvhm)
@@ -46,3 +49,8 @@ if(${NVE_FEATURE_ENABLED} GREATER -1)
   add_subdirectory(rocksdb)
 endif()
 unset(NVE_FEATURE_ENABLED)
+
+# Internal (NVIDIA-only) plugins.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/internal")
+  add_subdirectory(internal)
+endif()

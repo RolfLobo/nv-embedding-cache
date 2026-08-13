@@ -17,10 +17,10 @@
 
 #pragma once
 
+#include <array>
 #include <cstdlib>
 #include <exception>
 #include <ostream>
-#include <random>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -146,21 +146,26 @@ namespace nve {
  * https://en.cppreference.com/w/cpp/language/if
  */
 template <typename>
-inline constexpr bool dependent_false_v = false;
+inline constexpr bool dependent_false_v{false};
 
 /**
- * Make std::to_array (C++20) available in C++17. This will only work for primitive types.
+ * Emulate std::experimental::make_array (C++20, abandoned). This will only work for primitive types.
  */
-template <typename T, typename... Args>
-constexpr std::array<T, sizeof...(Args)> to_array(Args&&... args) {
-  return {static_cast<T>(args)...};
+template <typename Arg0, typename... Args>
+constexpr std::array<std::decay_t<Arg0>, 1 + sizeof...(Args)> make_array(Arg0&& arg0, Args&&... args) {
+  static_assert(
+    (std::is_convertible_v<std::decay_t<Args>, std::decay_t<Arg0>> && ...),
+    "Every argument must be convertible to Arg0");
+  return {std::forward<Arg0>(arg0), std::forward<Args>(args)...};
 }
 
 inline std::string to_string() noexcept { return {}; }
 
 template <typename T>
 inline std::string to_string(const T& arg) {
-  return (std::ostringstream{} << arg).str();
+  std::ostringstream o;
+  o << arg;
+  return o.str();
 }
 
 template <>
@@ -178,16 +183,10 @@ inline std::string to_string<std::string_view>(const std::string_view& arg) {
   return static_cast<std::string>(arg);
 }
 
-template <typename TArg0, typename TArg1>
-inline std::string to_string(const TArg0& arg0, const TArg1& arg1) {
-  return (std::ostringstream{} << arg0 << arg1).str();
-}
-
-template <typename TArg0, typename TArg1, typename... TArgs>
-inline std::string to_string(const TArg0& arg0, const TArg1& arg1, TArgs&&... args) {
+template <typename Arg0, typename... Args>
+inline std::string to_string(const Arg0& arg0, Args&&... args) {
   std::ostringstream o;
   o << arg0;
-  o << arg1;
   (o << ... << args);
   return o.str();
 }
@@ -206,26 +205,10 @@ class Exception : public std::exception {
   Exception() = delete;
 
   inline Exception(const char file[], const int64_t line, const char expr[],
-                   const std::string& hint = {}) noexcept
+                   const std::string& hint = {})
       : file_{file}, line_{line}, expr_{expr}, hint_{hint}, thread_{this_thread_name()} {
     NVE_ASSERT_(file_);
     NVE_ASSERT_(expr_);
-  }
-
-  inline Exception(const Exception& that) noexcept
-      : file_{that.file_},
-        line_{that.line_},
-        expr_{that.expr_},
-        hint_{that.hint_},
-        thread_{that.thread_} {}
-
-  inline Exception& operator=(const Exception& that) noexcept {
-    file_ = that.file_;
-    line_ = that.line_;
-    expr_ = that.expr_;
-    hint_ = that.hint_;
-    thread_ = that.thread_;
-    return *this;
   }
 
   inline const char* file() const noexcept { return file_; }
@@ -292,15 +275,8 @@ class RuntimeError<bool> : public Exception {
   RuntimeError() = delete;
 
   inline RuntimeError(const char file[], const int line, const char expr[], const bool&,
-                      const std::string& hint) noexcept
+                      const std::string& hint)
       : base_type(file, line, expr, hint) {}
-
-  inline RuntimeError(const RuntimeError& that) noexcept : base_type(that) {}
-
-  inline RuntimeError& operator=(const RuntimeError& that) noexcept {
-    base_type::operator=(that);
-    return *this;
-  }
 
   virtual std::string to_string() const override;
 };
@@ -316,18 +292,11 @@ class InvalidArgumentError : public Exception {
   InvalidArgumentError() = delete;
 
   inline InvalidArgumentError(const char file[], const int line, const char expr[],
-                              const std::string& hint) noexcept
+                              const std::string& hint)
       : base_type(file, line, expr, hint) {}
-
-  inline InvalidArgumentError(const InvalidArgumentError& that) noexcept : base_type(that) {}
-
-  inline InvalidArgumentError& operator=(const InvalidArgumentError& that) noexcept {
-    base_type::operator=(that);
-    return *this;
-  }
 };
 
-static std::random_device random_device;
+uint32_t random_seed();
 
 using table_id_t = int64_t;
 

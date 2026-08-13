@@ -23,6 +23,7 @@ void LinearHostTableConfig::check() const {
   base_type::check();
 
   NVE_CHECK_(emb_table != nullptr, "UVM table pointer was not initialized in config");
+  NVE_CHECK_(num_rows > 0, "Number of rows needs to be greater than 0.");
   NVE_CHECK_(max_threads > 0, "Max threads need to be greater than 0.");
 }
 
@@ -32,6 +33,7 @@ void from_json(const nlohmann::json& json, LinearHostTableConfig& conf) {
 
   // NVE_READ_JSON_FIELD_(emb_table); Not supported right now.
   NVE_READ_JSON_FIELD_(value_dtype);
+  NVE_READ_JSON_FIELD_(num_rows);
   NVE_READ_JSON_FIELD_(max_threads);
   
   NVE_THROW_("LinearHostTable always requires a dynamically allocated pointer and cannot be configured from JSON");
@@ -43,6 +45,7 @@ void to_json(nlohmann::json& json, const LinearHostTableConfig& conf) {
 
   // NVE_WRITE_JSON_FIELD_(emb_table); Not supported right now.
   NVE_WRITE_JSON_FIELD_(value_dtype);
+  NVE_WRITE_JSON_FIELD_(num_rows);
   NVE_WRITE_JSON_FIELD_(max_threads);
 
   NVE_THROW_("LinearHostTable always requires a dynamically allocated pointer and cannot be configured from JSON");

@@ -39,7 +39,7 @@ struct RedisClusterTableConfig final : public HostTableConfig {
   using base_type = HostTableConfig;
 
   int64_t max_batch_size{16'384};  // Maximum batch size to use for queries into the column family.
-                                   // Must be a multiple of `mask_size`.
+                                   // Must be a multiple of `64`.
 
   int64_t num_partitions{
       1};  // Either 0 or a power of 2.
@@ -76,12 +76,10 @@ using redis_cluster_ptr_t = std::shared_ptr<sw::redis::RedisCluster>;
 using redis_ptr_t = std::shared_ptr<sw::redis::Redis>;
 using redis_conn_ptr_t = std::shared_ptr<RedisConn>;
 
-template <typename MaskType, typename KeyType, typename MetaType, typename PartitionerType>
+template <typename KeyType, typename MetaType, typename PartitionerType>
 class RedisClusterTable final : public HostTable<RedisClusterTableConfig> {
  public:
   using base_type = HostTable<RedisClusterTableConfig>;
-  using mask_type = MaskType;
-  using mask_repr_type = typename mask_type::repr_type;
   using key_type = KeyType;
   using meta_type = MetaType;
   static constexpr PartitionerType partitioner{};
@@ -101,7 +99,7 @@ class RedisClusterTable final : public HostTable<RedisClusterTableConfig> {
   void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) override;
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t value_stride,

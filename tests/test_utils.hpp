@@ -25,6 +25,9 @@
 #include <string>
 
 #include <host_table.hpp>
+#include <nlohmann/json.hpp>
+#include <plugin/plugin_loader.hpp>
+#include <table_utils.hpp>
 
 namespace nve_test {
 
@@ -34,7 +37,7 @@ inline std::string plugin_so(const std::string& plugin_name) {
 
 inline std::filesystem::path nve_library_dir() {
   Dl_info dli;
-  if (dladdr(reinterpret_cast<const void*>(nve::load_host_table_plugin), &dli) == 0) {
+  if (dladdr(reinterpret_cast<const void*>(&nve::create_table_from_plugin), &dli) == 0) {
     throw std::runtime_error("Could not locate nve-common shared library");
   }
   return std::filesystem::path{dli.dli_fname}.parent_path();
@@ -42,6 +45,16 @@ inline std::filesystem::path nve_library_dir() {
 
 inline std::string plugin_full_path(const std::string& plugin_name) {
   return (nve_library_dir() / plugin_so(plugin_name)).string();
+}
+
+/* Creates a table factory from an in-tree plugin by short name ("stl-map",
+ * "phmap", ...). The stack Plugin dies before the factory is returned, so
+ * every caller also exercises the library lease that keeps the SO loaded. */
+inline nve::table_factory_ptr_t plugin_factory(
+    const std::string& plugin_name,
+    const nlohmann::json& factory_config = nlohmann::json::object()) {
+  nve::Plugin plugin{plugin_full_path(plugin_name)};
+  return plugin.create_table_factory(factory_config);
 }
 
 }  // namespace nve_test

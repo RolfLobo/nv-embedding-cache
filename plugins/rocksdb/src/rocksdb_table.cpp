@@ -26,7 +26,7 @@ namespace plugin {
 void RocksDBTableConfig::check() const {
   base_type::check();
 
-  NVE_CHECK_(max_batch_size > 0 && max_batch_size % mask_size == 0);
+  NVE_CHECK_(max_batch_size > 0 && max_batch_size % 64 == 0);
 
   NVE_CHECK_(!column_family.empty());
 }
@@ -51,8 +51,7 @@ void to_json(nlohmann::json& json, const RocksDBTableConfig& conf) {
   NVE_WRITE_JSON_FIELD_(verify_checksums);
 }
 
-template <typename MaskType>
-RocksDBTable<MaskType>::RocksDBTable(const table_id_t id, const RocksDBTableConfig& config,
+RocksDBTable::RocksDBTable(const table_id_t id, const RocksDBTableConfig& config,
                                      rdb_ctx_ptr_t& rdb_ctx,
                                      rocksdb::ColumnFamilyHandle* const cf)
     : base_type(id, config),
@@ -62,16 +61,17 @@ RocksDBTable<MaskType>::RocksDBTable(const table_id_t id, const RocksDBTableConf
   write_opts_.sync = false;
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::clear(context_ptr_t&) {
+void RocksDBTable::clear(context_ptr_t&) {
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
 
-  NVE_CHECK_(db->DeleteRange(write_opts_, cf, "", "~"));
+  // Keys are fixed-width binary under the default bytewise comparator, so
+  // `key_size + 1` bytes of 0xFF sorts strictly after every possible key.
+  const std::string end_key(static_cast<size_t>(config_.key_size) + 1, '\xFF');
+  NVE_CHECK_(db->DeleteRange(write_opts_, cf, "", end_key));
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::erase(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw) {
+void RocksDBTable::erase(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw) {
   if (n <= 0) return;
 
   const void* const keys_vptr{
@@ -107,9 +107,8 @@ void RocksDBTable<MaskType>::erase(context_ptr_t& ctx, const int64_t n, buffer_p
   }
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys_bw,
-                                  buffer_ptr<max_bitmask_repr_t> hit_mask_bw,
+void RocksDBTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys_bw,
+                                  buffer_ptr<bitmask64_t> hit_mask_bw,
                                   const int64_t value_stride, buffer_ptr<void> values_bw,
                                   buffer_ptr<int64_t> value_sizes_bw) const {
   if (n <= 0) return;
@@ -118,7 +117,7 @@ void RocksDBTable<MaskType>::find(context_ptr_t& ctx, int64_t n, buffer_ptr<cons
   const void* const keys_vptr{
       keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
               : nullptr};
-  max_bitmask_repr_t* const hit_mask{
+  bitmask64_t* const hit_mask{
       hit_mask_bw ? hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
                                                lookup_stream)
                   : nullptr};
@@ -153,8 +152,7 @@ void RocksDBTable<MaskType>::find(context_ptr_t& ctx, int64_t n, buffer_ptr<cons
   *counter += n;
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::insert(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
+void RocksDBTable::insert(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
                                     const int64_t value_stride, const int64_t value_size,
                                     buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
@@ -199,8 +197,7 @@ void RocksDBTable<MaskType>::insert(context_ptr_t& ctx, const int64_t n, buffer_
   }
 }
 
-template <typename MaskType>
-int64_t RocksDBTable<MaskType>::size(context_ptr_t&, const bool exact) const {
+int64_t RocksDBTable::size(context_ptr_t&, const bool exact) const {
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
 
@@ -216,8 +213,7 @@ int64_t RocksDBTable<MaskType>::size(context_ptr_t&, const bool exact) const {
   return static_cast<int64_t>(n);
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::update(context_ptr_t& ctx, const int64_t n,
+void RocksDBTable::update(context_ptr_t& ctx, const int64_t n,
                                     buffer_ptr<const void> keys_bw, const int64_t value_stride,
                                     const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
@@ -233,7 +229,7 @@ void RocksDBTable<MaskType>::update(context_ptr_t& ctx, const int64_t n,
   const char* const __restrict values{reinterpret_cast<const char*>(values_vptr)};
 
   // TODO: Prone to memory fragmentation. Also inefficient. Could we do this with MergeOperator's?
-  std::vector<max_bitmask_repr_t> hit_mask(static_cast<uint64_t>(max_bitmask_t::mask_size(n)), {});
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), {});
   char* const __restrict hm{reinterpret_cast<char*>(hit_mask.data())};
   const int64_t num_hits{find_<false, false>(n, keys, hm, value_stride, nullptr, nullptr)};
   if (!num_hits) return;
@@ -253,9 +249,9 @@ void RocksDBTable<MaskType>::update(context_ptr_t& ctx, const int64_t n,
   rocksdb::Slice v_view{nullptr, static_cast<uint64_t>(value_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i < n; i += mask_type::num_bits) {
-    for (auto it{mask_type::load(hm, i)}; mask_type::has_next(it); it = mask_type::skip(it)) {
-      const int64_t ij{i + mask_type::next(it)};
+  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
+    for (auto it{bitmask64::load(hm, i)}; it; it = bitmask64::skip(it)) {
+      const int64_t ij{i + bitmask64::next(it)};
 
       k_view.data_ = &keys[ij * key_size];
       v_view.data_ = &values[ij * value_stride];
@@ -272,8 +268,7 @@ void RocksDBTable<MaskType>::update(context_ptr_t& ctx, const int64_t n,
   }
 }
 
-template <typename MaskType>
-void RocksDBTable<MaskType>::update_accumulate(
+void RocksDBTable::update_accumulate(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw, const int64_t update_stride,
     const int64_t update_size, buffer_ptr<const void> updates_bw, const DataType_t update_dtype) {
   if (n <= 0) return;
@@ -289,7 +284,7 @@ void RocksDBTable<MaskType>::update_accumulate(
   const char* const __restrict updates{reinterpret_cast<const char*>(updates_vptr)};
 
   // TODO: Prone to memory fragmentation. Also inefficient. Could we do this with MergeOperator's?
-  std::vector<max_bitmask_repr_t> hit_mask(static_cast<uint64_t>(max_bitmask_t::mask_size(n)), {});
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), {});
   char* const __restrict hm{reinterpret_cast<char*>(hit_mask.data())};
   const int64_t value_stride{config_.max_value_size};
   std::vector<char> values_vec(static_cast<uint64_t>(n * value_stride));
@@ -314,10 +309,9 @@ void RocksDBTable<MaskType>::update_accumulate(
   rocksdb::Slice k_view{nullptr, static_cast<uint64_t>(key_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i < n; i += mask_type::num_bits) {
-    for (mask_repr_type it{mask_type::load(hm, i)}; mask_type::has_next(it);
-         it = mask_type::skip(it)) {
-      const int64_t ij{i + mask_type::next(it)};
+  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
+    for (auto it{bitmask64::load(hm, i)}; it; it = bitmask64::skip(it)) {
+      const int64_t ij{i + bitmask64::next(it)};
       update_kernel(&values[ij * value_stride], &updates[ij * update_stride], update_size);
 
       k_view.data_ = &keys[ij * key_size];
@@ -336,9 +330,8 @@ void RocksDBTable<MaskType>::update_accumulate(
   }
 }
 
-template <typename MaskType>
 template <bool HasValues, bool HasValueSizes>
-int64_t RocksDBTable<MaskType>::find_(int64_t n, const char* const __restrict keys, char* const __restrict hm,
+int64_t RocksDBTable::find_(int64_t n, const char* const __restrict keys, char* const __restrict hm,
   int64_t value_stride, char* const __restrict values, int64_t* const __restrict value_sizes) const {
   const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
@@ -363,7 +356,7 @@ int64_t RocksDBTable<MaskType>::find_(int64_t n, const char* const __restrict ke
                  k_views, v_views, nullptr, statuses);
 
     int64_t prev_i{-1};
-    mask_repr_type mask;
+    bitmask64_t mask{};
 
     for (int64_t k{}; k < batch_size; ++k) {
       const rocksdb::Status& __restrict status{statuses[k]};
@@ -372,22 +365,17 @@ int64_t RocksDBTable<MaskType>::find_(int64_t n, const char* const __restrict ke
 
       // Reconstruct ij from the key view.
       const int64_t ij{(k_views[k].data() - keys) / key_size};
-      const int64_t i{ij & ~mask_type::num_bits_mask};
-      const int64_t j{ij & mask_type::num_bits_mask};
+      const int64_t i{ij & ~bitmask64::num_bits_mask};
+      const int64_t j{ij & bitmask64::num_bits_mask};
 
       if (i != prev_i) {
         if (prev_i >= 0) {
-          mask_type::store(hm, prev_i, mask);
+          bitmask64::store(hm, prev_i, mask);
         }
         prev_i = i;
-        mask = mask_type::load(hm, i);
+        mask = bitmask64::load(hm, i);
       }
-#pragma GCC diagnostic push
-#if !defined(__clang__)
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
-      mask = mask_type::insert(mask, j);
-#pragma GCC diagnostic pop
+      mask |= bitmask64::single(j);
       ++num_hits;
 
       const rocksdb::PinnableSlice& __restrict v_view{v_views[k]};
@@ -402,21 +390,21 @@ int64_t RocksDBTable<MaskType>::find_(int64_t n, const char* const __restrict ke
     }
 
     if (prev_i >= 0) {
-      mask_type::store(hm, prev_i, mask);
+      bitmask64::store(hm, prev_i, mask);
     }
   }};
   
-  for (int64_t i{}; i < n; i += mask_type::num_bits) {
-    auto it{mask_type::clip(mask_type::invert(mask_type::load(hm, i)), n - i)};
+  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
+    auto it{bitmask64::clip(~bitmask64::load(hm, i), n - i)};
 
     // Run query if the batch is about to overflow.
-    if (batch_size + mask_type::count(it) > max_batch_size) {
+    if (batch_size + bitmask64::count(it) > max_batch_size) {
       process_batch();
       batch_size = {};
     }
 
-    for (; mask_type::has_next(it); it = mask_type::skip(it)) {
-      const int64_t ij{i + mask_type::next(it)};
+    for (; it; it = bitmask64::skip(it)) {
+      const int64_t ij{i + bitmask64::next(it)};
       k_views[batch_size++].data_ = &keys[ij * key_size];
     }
   }
@@ -476,25 +464,7 @@ host_table_ptr_t RocksDBTableFactory::produce(const table_id_t id,
     }
   }
 
-  switch (config.mask_size) {
-#if defined(NVE_FEATURE_HT_MASK_8)
-    case bitmask8_t::size:
-      return std::make_shared<RocksDBTable<bitmask8_t>>(id, config, ctx, cf);
-#endif
-#if defined(NVE_FEATURE_HT_MASK_16)
-    case bitmask16_t::size:
-      return std::make_shared<RocksDBTable<bitmask16_t>>(id, config, ctx, cf);
-#endif
-#if defined(NVE_FEATURE_HT_MASK_32)
-    case bitmask32_t::size:
-      return std::make_shared<RocksDBTable<bitmask32_t>>(id, config, ctx, cf);
-#endif
-#if defined(NVE_FEATURE_HT_MASK_64)
-    case bitmask64_t::size:
-      return std::make_shared<RocksDBTable<bitmask64_t>>(id, config, ctx, cf);
-#endif
-  }
-  NVE_THROW_("`config.mask_size` (", config.mask_size, ") is out of bounds!");
+  return std::make_shared<RocksDBTable>(id, config, ctx, cf);
 }
 
 }  // namespace plugin

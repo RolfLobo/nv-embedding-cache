@@ -21,6 +21,7 @@
 #include <linear_embedding_layer.hpp>
 #include <gpu_table.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
 #include <insert_heuristic.hpp>
 #include <memory>
 #include <string>
@@ -120,19 +121,17 @@ int main(int argc, char* argv[]) {
 
     // Create host table
     LogVerbose(verbose, std::string("Creating Host table"));
-    std::vector<std::string> plugin_names{"libnve-plugin-nvhm.so"};
-    nve::load_host_table_plugins(plugin_names.begin(), plugin_names.end());
+    nve::Plugin nvhm_plugin("libnve-plugin-nvhm.so");
     // We don't limit the size of the host table (to do that, use the overflow policy arg)
-    nlohmann::json nvhm_conf = {{"mask_size", 8},
-                                {"key_size", sizeof(IndexT)},
+    nlohmann::json nvhm_conf = {{"key_size", sizeof(IndexT)},
                                 {"max_value_size", row_size},
                                 {"value_dtype", "float32"},
                                 {"num_partitions", 1},
                                 {"initial_capacity", 1024},
                                 {"value_alignment", 32},
                             };
-    nve::host_table_factory_ptr_t nvhm_fac{
-        nve::create_host_table_factory(R"({"implementation": "nvhm_map"})"_json)};
+    nve::table_factory_ptr_t nvhm_fac{
+        nvhm_plugin.create_table_factory(nlohmann::json::object())};
     auto host_tab = nvhm_fac->produce(0, nvhm_conf);
 
     // Create hierarchical embedding layer

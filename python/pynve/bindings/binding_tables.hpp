@@ -80,7 +80,7 @@ public:
         table_->erase(ctx, n, std::move(keys));
     }
     void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-                 buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+                 buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
                  buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override {
         NVE_CHECK_(table_ != nullptr, "Table is not initialized");
         table_->find(ctx, n, std::move(keys), std::move(hit_mask), value_stride, std::move(values), std::move(value_sizes));

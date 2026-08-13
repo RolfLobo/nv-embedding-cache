@@ -16,12 +16,23 @@
  */
 
 #include "serialization.hpp"
+#include <cctype>
+#include <limits>
 #include <regex>
 #include <string>
 #include <stdexcept>
 #include "common.hpp"
 
 namespace nve {
+
+// Multiply header-derived sizes with an overflow check so a crafted shape
+// cannot wrap the row/data size computations.
+uint64_t checked_mul(uint64_t a, uint64_t b, const char* what)
+{
+    NVE_CHECK_(b == 0 || a <= std::numeric_limits<uint64_t>::max() / b,
+               "Numpy ", what, " computation overflows uint64");
+    return a * b;
+}
 
 const std::string NumpyTensorFileFormat::NPY_MAGIC_NUMBER("\x93NUMPY");
 
@@ -52,6 +63,8 @@ uint64_t InputFileStreamWrapper::size() {
     auto streampos = file_.tellg(); // capture current position
     auto endpos = file_.seekg(0, std::ios::end).tellg();
     file_.seekg(streampos); // Restore position
+    // A failed tellg() returns -1, which would cast to UINT64_MAX.
+    NVE_CHECK_(endpos != std::streampos(-1) && file_.good(), "Failed to get size of file " + filename_);
     return static_cast<uint64_t>(endpos);
 }
 
@@ -118,15 +131,27 @@ void NumpyTensorFileFormat::load_header() {
         std::string shape_str = match[1].str();
         std::stringstream ss(shape_str);
         std::string token;
-        while (std::getline(ss, token, ',')) 
+        while (std::getline(ss, token, ','))
         {
-            try 
-            {
-                header_.shape.push_back(std::stoul(token));
-            } catch (std::exception& e) {
-                NVE_LOG_ERROR_("Failed to load shape: ", e.what());
+            const auto first = token.find_first_not_of(" \t");
+            if (first == std::string::npos) {
+                continue; // blank piece, e.g. after the trailing comma in "(5,)"
             }
+            size_t parsed = 0;
+            uint64_t dim = 0;
+            try
+            {
+                dim = std::stoull(token, &parsed);
+            } catch (std::exception&) {
+                NVE_THROW_("Failed to parse numpy shape: '", shape_str, "'");
+            }
+            // Reject signs and trailing non-whitespace that std::stoull would otherwise accept.
+            NVE_CHECK_(std::isdigit(static_cast<unsigned char>(token[first])) &&
+                           token.find_first_not_of(" \t", parsed) == std::string::npos,
+                       "Failed to parse numpy shape: '", shape_str, "'");
+            header_.shape.push_back(dim);
         }
+        NVE_CHECK_(!header_.shape.empty(), "Empty numpy shape");
     }
 
     {
@@ -146,9 +171,17 @@ NumpyTensorFileFormat::NumpyTensorFileFormat(std::shared_ptr<StreamWrapperBase> 
     vec_size_ = 1;
     for (uint64_t i = 1; i < header_.shape.size(); ++i)
     {
-        vec_size_ *= header_.shape[i];
+        vec_size_ = checked_mul(vec_size_, header_.shape[i], "vector size");
     }
-    row_size_in_bytes_ = vec_size_ * header_.dtype_size_in_bytes;
+    row_size_in_bytes_ = checked_mul(vec_size_, header_.dtype_size_in_bytes, "row size");
+    // Fail fast on truncated files instead of hitting EOF mid-insert in load_batch().
+    const uint64_t data_size = checked_mul(header_.shape[0], row_size_in_bytes_, "data size");
+    const uint64_t file_size = stream_->size();
+    NVE_CHECK_(file_size >= offset_, "Numpy stream size is smaller than header offset");
+    const uint64_t available = file_size - offset_;
+    NVE_CHECK_(available >= data_size,
+               "Numpy file too small for declared shape: needs ", data_size,
+               " bytes after header, has ", available);
 }
 
 void NumpyTensorFileFormat::reset() {

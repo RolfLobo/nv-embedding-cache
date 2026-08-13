@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "include/key_utils.hpp"
 #include "include/common.hpp"
 #include "include/thread_pool.hpp"
 #include "include/nve_types.hpp"
@@ -31,6 +32,7 @@ int cpu_kernel_update(thread_pool_ptr_t thread_pool,
               const void* values, 
               int8_t* uvm_table_ptr,
               size_t row_size_in_bytes,
+              uint64_t num_rows,
               uint64_t num_threads)
 {
     auto keys_per_task = (n + num_threads - 1)/ num_threads;
@@ -43,6 +45,9 @@ int cpu_kernel_update(thread_pool_ptr_t thread_pool,
                 break;
             }
             IndexT key = reinterpret_cast<const IndexT*>(keys)[base_key + i];
+            if (!key_in_range(key, num_rows)) {
+                continue;
+            }
             int8_t* dst_ptr = uvm_table_ptr + (static_cast<size_t>(key) * row_size_in_bytes);
             const int8_t* src_ptr = reinterpret_cast<const int8_t*>(values) + (base_key + i) * value_stride;
             memcpy(dst_ptr, src_ptr, row_size_in_bytes);
@@ -66,6 +71,7 @@ int cpu_kernel_update_accumulate(thread_pool_ptr_t thread_pool,
               const void* updates, 
               int8_t* uvm_table_ptr,
               size_t row_size_in_bytes,
+              uint64_t num_rows,
               uint64_t num_threads)
 {
     auto keys_per_task = (n + num_threads - 1)/ num_threads;
@@ -79,6 +85,9 @@ int cpu_kernel_update_accumulate(thread_pool_ptr_t thread_pool,
                 break;
             }
             IndexT key = reinterpret_cast<const IndexT*>(keys)[base_key + i];
+            if (!key_in_range(key, num_rows)) {
+                continue;
+            }
             ValueT* dst_ptr = reinterpret_cast<ValueT*>(uvm_table_ptr + (static_cast<size_t>(key) * row_size_in_bytes));
             const UpdateT* src_ptr = reinterpret_cast<const UpdateT*>(reinterpret_cast<const int8_t*>(updates) + (base_key + i) * value_stride);
             
@@ -102,6 +111,7 @@ void cpu_kernel_update_accumulate_dispatch(thread_pool_ptr_t thread_pool,
               int8_t* uvm_table_ptr,
               size_t row_size_in_bytes,
               DataType_t update_dtype,
+              uint64_t num_rows,
               uint64_t num_threads)
 {
     // Dispatch based on update_dtype
@@ -109,7 +119,8 @@ void cpu_kernel_update_accumulate_dispatch(thread_pool_ptr_t thread_pool,
         case DataType_t::Float32:
         {   
             int res = cpu_kernel_update_accumulate<IndexT, float, float>(
-                std::move(thread_pool), n, keys, value_stride, updates, uvm_table_ptr, row_size_in_bytes, num_threads);
+                std::move(thread_pool), n, keys, value_stride, updates, uvm_table_ptr,
+                row_size_in_bytes, num_rows, num_threads);
             NVE_CHECK_(res == 0);
             break;
         }

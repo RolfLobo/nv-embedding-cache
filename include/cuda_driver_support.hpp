@@ -46,16 +46,8 @@ class RuntimeError<CUresult> : public Exception {
   RuntimeError() = delete;
 
   inline RuntimeError(const char file[], const int line, const char expr[], const CUresult& result,
-                      const std::string& hint) noexcept
+                      const std::string& hint)
       : base_type(file, line, expr, hint), result_{result} {}
-
-  inline RuntimeError(const RuntimeError& that) noexcept : base_type(that), result_{that.result_} {}
-
-  inline RuntimeError& operator=(const RuntimeError& that) noexcept {
-    base_type::operator=(that);
-    result_ = that.result_;
-    return *this;
-  }
 
   inline CUresult result() const noexcept { return result_; }
 

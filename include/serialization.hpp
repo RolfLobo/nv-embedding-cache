@@ -124,7 +124,6 @@ private:
         static constexpr uint64_t ROW_SIZE_BITS = 16;
         static constexpr uint64_t DATA_TYPE_BITS = 4;
         static constexpr uint64_t ROWS_BITS = 64 - (ROW_SIZE_BITS + DATA_TYPE_BITS);
-        static constexpr uint64_t ID_BITS = 64;
         uint64_t key1{0}; // stores row_size, data_type and rows
         uint64_t key2{0}; // stores id
     };

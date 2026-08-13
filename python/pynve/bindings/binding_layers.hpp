@@ -25,6 +25,7 @@
 #include "include/execution_context.hpp"
 #include "include/gpu_table.hpp"
 #include "include/host_table.hpp"
+#include "include/plugin/plugin_loader.hpp"
 #include "include/linear_host_table.hpp"
 #include "include/insert_heuristic.hpp"
 #include <iostream>
@@ -52,11 +53,13 @@ struct EmbedLayerConfig {
     int64_t kernel_mode_value_1 = 0;
     int64_t kernel_mode_value_2 = 0;
     int64_t max_modify_size = 0; // means tables default
+    int64_t default_row_index = -1; // Row returned for keys outside the table, negative disables the check
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EmbedLayerConfig,
-    logging_interval, kernel_mode, kernel_mode_value_1, kernel_mode_value_2, max_modify_size)
+    logging_interval, kernel_mode, kernel_mode_value_1, kernel_mode_value_2, max_modify_size,
+    default_row_index)
 
 template<typename IndexT>
 class NVEmbedBinding
@@ -131,7 +134,7 @@ public:
         auto stream = reinterpret_cast<cudaStream_t>(stream_);
 
         if (!backprop_runner_) {
-            backprop_runner_ = std::make_shared<GradientCalculator<IndexT, MAX_RUN_SIZE>>();
+            backprop_runner_ = std::make_shared<GradientCalculator<IndexT, MAX_RUN_SIZE>>(allocator_);
         }
         //TRTREC-55 handle increases in num_keys
         if (num_keys > max_num_keys_) {
@@ -193,7 +196,7 @@ public:
         auto stream = reinterpret_cast<cudaStream_t>(stream_);
 
         if (!backprop_runner_) {
-            backprop_runner_ = std::make_shared<GradientCalculator<IndexT, MAX_RUN_SIZE>>();
+            backprop_runner_ = std::make_shared<GradientCalculator<IndexT, MAX_RUN_SIZE>>(allocator_);
         }
         // handle increases in num_keys
         if (num_keys > max_num_keys_) {
@@ -440,7 +443,7 @@ public:
         insert_heuristic_thresholds.push_back(DefaultInsertHeuristic::DEFAULT_THRESHOLD);
 
         if (host_cache_size > 0) {
-            host_table_ptr_t nvhm_table = create_nvhm_table(host_cache_size, this->row_size_in_bytes_, dtype);
+            table_ptr_t nvhm_table = create_nvhm_table(host_cache_size, this->row_size_in_bytes_, dtype);
             tables.push_back(nvhm_table);
             if (remote) {
                 // Host cache is L2 with remote being L3, set target hitrate to be proportional by size.
@@ -471,9 +474,9 @@ public:
         ps_table_->set_table(table);
     }
 
-    host_table_ptr_t create_nvhm_table(uint64_t table_size, uint64_t row_size, nve::DataType_t data_type)
+    table_ptr_t create_nvhm_table(uint64_t table_size, uint64_t row_size, nve::DataType_t data_type)
     {
-        load_host_table_plugin("libnve-plugin-nvhm.so");
+        nve::Plugin plugin("libnve-plugin-nvhm.so");
 
         constexpr int64_t num_partitions = 1; // Single partition is better for inference, increase if lock contention is an issue during insert
         const int64_t keys_per_partition = table_size / row_size / num_partitions;
@@ -494,8 +497,8 @@ public:
             }
           }
         };
-        nve::host_table_factory_ptr_t nvhm_fac{
-          nve::create_host_table_factory(R"({"implementation": "nvhm_map"})"_json)};
+        nve::table_factory_ptr_t nvhm_fac{
+          plugin.create_table_factory(nlohmann::json::object())};
         return nvhm_fac->produce(0, nvhm_conf);
     }
 
@@ -553,6 +556,7 @@ private:
         }
 
         cfg.uvm_table = mem_block_->get_ptr();
+        cfg.uvm_num_rows = num_embeddings;
 
         // handle kernel mode
         cfg.kernel_mode_type = config.kernel_mode;
@@ -570,6 +574,7 @@ private:
         auto gpu_table = std::make_shared<nve::GpuTable<IndexT>>(cfg, nullptr /* using default allocator for device 0*/);
 
         typename layer_type::Config layer_cfg = {"uvm_layer", std::make_shared<DefaultInsertHeuristic>(std::vector<float>{DefaultInsertHeuristic::DEFAULT_THRESHOLD})};
+        layer_cfg.default_row_index = config.default_row_index;
         this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, gpu_table, nullptr /* using default allocator for device 0*/);
 
         uvm_table_.col = row_size;
@@ -674,6 +679,7 @@ private:
         layer_cfg.embedding_table = gpu_table_.data;
         layer_cfg.value_dtype = this->data_type_;
         layer_cfg.layer_name = "gpu_layer";
+        layer_cfg.default_row_index = config.default_row_index;
         this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, nullptr /* using default allocator for device 0*/);
     }
 
@@ -740,6 +746,7 @@ public:
         cfg.value_dtype = dtype;
         cfg.max_value_size = static_cast<int64_t>(this->row_size_in_bytes_);
         cfg.key_size = sizeof(IndexT);
+        cfg.num_rows = static_cast<int64_t>(num_embeddings);
         cfg.emb_table = host_table_.data;
         auto linear_host_tab = std::make_shared<nve::LinearHostTable<IndexT>>(cfg);
 

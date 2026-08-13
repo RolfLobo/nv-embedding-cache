@@ -141,7 +141,7 @@ def _build_hierarchical_model(output_dir):
         embedding_size=EMB_SIZE,
         data_type=torch.float32,
         plugin_name="libnve-plugin-custom_remote.so",
-        factory_config={"implementation": "custom_remote"},
+        factory_config={},
         table_config={"key_size": 8, "max_value_size": EMB_SIZE * 4},
     )
     keys = torch.arange(NUM_EMB, dtype=torch.int64)

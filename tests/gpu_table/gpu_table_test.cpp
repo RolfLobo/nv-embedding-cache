@@ -20,7 +20,9 @@
 #include <buffer_wrapper.hpp>
 #include <cmath>
 #include <common.hpp>
+#include <algorithm>
 #include <cstring>
+#include <thread>
 #include <cuda_support.hpp>
 #include <gpu_table.hpp>
 #include <default_allocator.hpp>
@@ -32,7 +34,7 @@ namespace nve {
 
 #define GT_TEST_DEVICE (0)
 #define GT_TEST_KEY (1337)
-#define GT_TEST_HITMASK_SIZE_BYTES (sizeof(max_bitmask_repr_t))
+#define GT_TEST_HITMASK_SIZE_BYTES (sizeof(bitmask64_t))
 #define GT_TEST_SORT_GATHER_THRESHOLD (4096)
 #define GT_TEST_KERNEL_MODE_INDEX_THERSHOLD (0)
 
@@ -265,6 +267,7 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
         h_table_[i] = float(10000 + i);
       }
       cfg.uvm_table = h_table_;
+      cfg.uvm_num_rows = params.num_rows;
     } else {
       h_table_ = nullptr;
     }
@@ -336,8 +339,8 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
     // find the inserted key-data
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
       ctx_, "keys", d_keys_, sizeof(KeyType) * static_cast<size_t>(num_keys));
-    auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-      ctx_, "hit_mask", static_cast<max_bitmask_repr_t*>(d_hitmask_), hit_mask_size_in_bytes_);
+    auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+      ctx_, "hit_mask", static_cast<bitmask64_t*>(d_hitmask_), hit_mask_size_in_bytes_);
     auto values_bw = std::make_shared<BufferWrapper<void>>(
       ctx_, "values", d_data_, static_cast<size_t>(row_size) * static_cast<size_t>(num_keys));
     tb_->find(ctx_, num_keys, std::move(keys_bw), std::move(hit_mask_bw), row_size,
@@ -472,7 +475,7 @@ TEST(GpuTableInvalidKey, ValidKeysSurviveBatchWithSentinel) {
   constexpr int64_t row_size = 1l << 7;  // 128 bytes = 32 floats
   constexpr int64_t batch_size = 4;
   constexpr KeyType invalid_key = static_cast<KeyType>(0x7fffffffffffffffLL);
-  constexpr int64_t hit_mask_bytes = sizeof(max_bitmask_repr_t);
+  constexpr int64_t hit_mask_bytes = sizeof(bitmask64_t);
 
   GPUTableConfig cfg;
   cfg.device_id = GT_TEST_DEVICE;
@@ -527,8 +530,8 @@ TEST(GpuTableInvalidKey, ValidKeysSurviveBatchWithSentinel) {
   {
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
       ctx, "keys", d_keys, sizeof(KeyType) * batch_size);
-    auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-      ctx, "hit_mask", static_cast<max_bitmask_repr_t*>(d_hitmask), hit_mask_bytes);
+    auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+      ctx, "hit_mask", static_cast<bitmask64_t*>(d_hitmask), hit_mask_bytes);
     auto values_bw = std::make_shared<BufferWrapper<void>>(
       ctx, "values", d_values, static_cast<size_t>(row_size) * batch_size);
     tab.find(ctx, batch_size, std::move(keys_bw), std::move(hit_mask_bw), row_size,
@@ -538,7 +541,7 @@ TEST(GpuTableInvalidKey, ValidKeysSurviveBatchWithSentinel) {
   NVE_CHECK_(cudaPeekAtLastError());
 
   std::vector<float> out(static_cast<size_t>(batch_size) * row_floats, 0.0f);
-  max_bitmask_repr_t hitmask_host = 0;
+  bitmask64_t hitmask_host = 0;
   NVE_CHECK_(cudaMemcpy(out.data(), d_values,
                         static_cast<size_t>(row_size) * batch_size, cudaMemcpyDefault));
   NVE_CHECK_(cudaMemcpy(&hitmask_host, d_hitmask, hit_mask_bytes, cudaMemcpyDefault));
@@ -566,7 +569,7 @@ TEST(GpuTableInvalidKey, MinusOneRoundTripsWhenSentinelIsCustom) {
   constexpr int64_t batch_size = 3;
   constexpr KeyType custom_sentinel = static_cast<KeyType>(0x7fffffffffffffffLL);
   constexpr KeyType target_key = static_cast<KeyType>(-1);
-  constexpr int64_t hit_mask_bytes = sizeof(max_bitmask_repr_t);
+  constexpr int64_t hit_mask_bytes = sizeof(bitmask64_t);
 
   GPUTableConfig cfg;
   cfg.device_id = GT_TEST_DEVICE;
@@ -616,8 +619,8 @@ TEST(GpuTableInvalidKey, MinusOneRoundTripsWhenSentinelIsCustom) {
   {
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
       ctx, "keys", d_keys, sizeof(KeyType) * batch_size);
-    auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-      ctx, "hit_mask", static_cast<max_bitmask_repr_t*>(d_hitmask), hit_mask_bytes);
+    auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+      ctx, "hit_mask", static_cast<bitmask64_t*>(d_hitmask), hit_mask_bytes);
     auto values_bw = std::make_shared<BufferWrapper<void>>(
       ctx, "values", d_values, static_cast<size_t>(row_size) * batch_size);
     tab.find(ctx, batch_size, std::move(keys_bw), std::move(hit_mask_bw), row_size,
@@ -627,7 +630,7 @@ TEST(GpuTableInvalidKey, MinusOneRoundTripsWhenSentinelIsCustom) {
   NVE_CHECK_(cudaPeekAtLastError());
 
   std::vector<float> out(static_cast<size_t>(batch_size) * row_floats, 0.0f);
-  max_bitmask_repr_t hitmask_host = 0;
+  bitmask64_t hitmask_host = 0;
   NVE_CHECK_(cudaMemcpy(out.data(), d_values,
                         static_cast<size_t>(row_size) * batch_size, cudaMemcpyDefault));
   NVE_CHECK_(cudaMemcpy(&hitmask_host, d_hitmask, hit_mask_bytes, cudaMemcpyDefault));
@@ -646,6 +649,129 @@ TEST(GpuTableInvalidKey, MinusOneRoundTripsWhenSentinelIsCustom) {
   allocator->device_free(d_keys);
   allocator->device_free(d_values);
   allocator->device_free(d_hitmask);
+}
+
+// Update/accumulate must ignore keys outside [0, uvm_num_rows) rather than write past the table.
+// The UVM buffer holds `guard_rows` extra rows past uvm_num_rows: out of range keys are aimed at
+// them, so an unchecked write shows up as a modified guard row.
+template <typename KeyType>
+static void RunUvmOutOfRangeKeysTest(bool accumulate, bool uvm_cpu_accumulate, int64_t num_keys) {
+  const int64_t num_rows = num_keys;  // one key per row keeps the in-range keys unique
+  constexpr int64_t guard_rows = 8;
+  constexpr int64_t row_size = 128;  // bytes == 32 floats
+  const size_t row_floats = static_cast<size_t>(row_size) / sizeof(float);
+  const size_t total_floats = static_cast<size_t>(num_rows + guard_rows) * row_floats;
+
+  float* h_table = nullptr;
+  NVE_CHECK_(cudaMallocHost(&h_table, static_cast<size_t>(num_rows + guard_rows) * row_size));
+  for (size_t i = 0; i < total_floats; ++i) {
+    h_table[i] = static_cast<float>(i);
+  }
+  std::vector<float> ref_table(h_table, h_table + total_floats);
+
+  GPUTableConfig cfg;
+  cfg.device_id = GT_TEST_DEVICE;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = row_size;
+  cfg.value_dtype = DataType_t::Float32;
+  cfg.uvm_table = h_table;
+  cfg.uvm_num_rows = num_rows;
+  cfg.uvm_cpu_accumulate = uvm_cpu_accumulate;
+  GpuTable<KeyType> tab(cfg);
+  auto ctx = tab.create_execution_context(0, 0, nullptr, nullptr);
+
+  // Every 7th key is out of range: negative, or aimed at a guard row past the end of the table.
+  std::vector<KeyType> keys(static_cast<size_t>(num_keys));
+  for (int64_t i = 0; i < num_keys; ++i) {
+    if ((i % 7) == 1) {
+      keys[static_cast<size_t>(i)] = static_cast<KeyType>(-(i + 1));
+    } else if ((i % 7) == 3) {
+      keys[static_cast<size_t>(i)] = static_cast<KeyType>(num_rows + (i % guard_rows));
+    } else {
+      keys[static_cast<size_t>(i)] = static_cast<KeyType>(i);
+    }
+  }
+
+  std::vector<float> updates(static_cast<size_t>(num_keys) * row_floats);
+  for (int64_t i = 0; i < num_keys; ++i) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      updates[static_cast<size_t>(i) * row_floats + j] = static_cast<float>(1000 + i) + static_cast<float>(j);
+    }
+  }
+
+  // Reference: apply the in-range keys only
+  for (int64_t i = 0; i < num_keys; ++i) {
+    const KeyType key = keys[static_cast<size_t>(i)];
+    if (key < 0 || static_cast<int64_t>(key) >= num_rows) {
+      continue;
+    }
+    for (size_t j = 0; j < row_floats; ++j) {
+      float& dst = ref_table[static_cast<size_t>(key) * row_floats + j];
+      const float src = updates[static_cast<size_t>(i) * row_floats + j];
+      dst = accumulate ? (dst + src) : src;
+    }
+  }
+
+  const size_t keys_bytes = sizeof(KeyType) * static_cast<size_t>(num_keys);
+  const size_t updates_bytes = static_cast<size_t>(row_size) * static_cast<size_t>(num_keys);
+  auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys.data(), keys_bytes);
+  auto updates_bw = std::make_shared<BufferWrapper<const void>>(ctx, "updates", updates.data(), updates_bytes);
+  if (accumulate) {
+    tab.update_accumulate(ctx, num_keys, std::move(keys_bw), row_size, row_size,
+                          std::move(updates_bw), DataType_t::Float32);
+  } else {
+    tab.update(ctx, num_keys, std::move(keys_bw), row_size, row_size, std::move(updates_bw));
+  }
+  NVE_CHECK_(cudaDeviceSynchronize());
+  NVE_CHECK_(cudaPeekAtLastError());
+
+  for (int64_t r = 0; r < num_rows + guard_rows; ++r) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      const size_t idx = static_cast<size_t>(r) * row_floats + j;
+      ASSERT_FLOAT_EQ(ref_table[idx], h_table[idx])
+          << (r >= num_rows ? "guard row " : "row ") << r << " float " << j;
+    }
+  }
+
+  NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+// Batch large enough to take update_accumulate's multi-copy CPU path
+// (it triggers at num_workers * 512 / 2 keys).
+static int64_t large_accumulate_batch() {
+  return static_cast<int64_t>(std::max(8u, std::thread::hardware_concurrency())) * 512;
+}
+
+TEST(GpuTableOutOfRangeKeys, UpdateInt64) {
+  RunUvmOutOfRangeKeysTest<int64_t>(false /*accumulate*/, true /*uvm_cpu_accumulate*/, 64);
+}
+
+TEST(GpuTableOutOfRangeKeys, UpdateInt32) {
+  RunUvmOutOfRangeKeysTest<int32_t>(false /*accumulate*/, true /*uvm_cpu_accumulate*/, 64);
+}
+
+TEST(GpuTableOutOfRangeKeys, AccumulateOnCpu) {
+  RunUvmOutOfRangeKeysTest<int64_t>(true /*accumulate*/, true /*uvm_cpu_accumulate*/, 64);
+}
+
+TEST(GpuTableOutOfRangeKeys, AccumulateOnCpuLargeBatch) {
+  RunUvmOutOfRangeKeysTest<int64_t>(true /*accumulate*/, true /*uvm_cpu_accumulate*/,
+                                    large_accumulate_batch());
+}
+
+TEST(GpuTableOutOfRangeKeys, AccumulateOnGpu) {
+  RunUvmOutOfRangeKeysTest<int64_t>(true /*accumulate*/, false /*uvm_cpu_accumulate*/, 64);
+}
+
+// A UVM table without a row count would make every key look out of range, so it is rejected.
+TEST(GpuTableOutOfRangeKeys, RejectsUvmTableWithoutNumRows) {
+  std::vector<float> table(64 * 32);
+  GPUTableConfig cfg;
+  cfg.device_id = GT_TEST_DEVICE;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = 128;
+  cfg.uvm_table = table.data();
+  EXPECT_THROW(std::make_shared<GpuTable<int64_t>>(cfg), nve::Exception);
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +865,7 @@ static void RunFindAndDequantQuant(DataType_t dtype) {
   cfg.row_size_in_bytes = row_bytes;
   cfg.value_dtype = dtype;
   cfg.uvm_table = h_table;
+  cfg.uvm_num_rows = num_rows;
   GpuTable<KeyType> tab(cfg);
   auto ctx = tab.create_execution_context(0, 0, nullptr, nullptr);
 
@@ -798,6 +925,7 @@ static void RunFindAndCombineQuant(DataType_t dtype) {
   cfg.row_size_in_bytes = row_bytes;
   cfg.value_dtype = dtype;
   cfg.uvm_table = h_table;
+  cfg.uvm_num_rows = num_rows;
   GpuTable<KeyType> tab(cfg);
   auto ctx = tab.create_execution_context(0, 0, nullptr, nullptr);
 

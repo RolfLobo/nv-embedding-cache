@@ -17,8 +17,8 @@
 # samples/common/custom_remote_plugin (added to the build before this
 # directory in samples/CMakeLists.txt) and shared with the pytorch and
 # cpp_inference_custom_ps samples. The sample loads it at runtime via
-# nve_load_host_table_plugin("libnve-plugin-custom_remote.so"), so no explicit link step is
-# needed here.
+# nve_create_table_factory(&factory, "libnve-plugin-custom_remote.so", "{}"),
+# so no explicit link step is needed here.
 
 # Sample executable
 add_executable(c_api_custom_remote_sample c_api_custom_remote_sample.cpp)

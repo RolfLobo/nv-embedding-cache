@@ -19,6 +19,7 @@
 
 #include "include/buffer_wrapper.hpp"
 #include "include/common.hpp"
+#include "include/host_table.hpp"
 #include "include/serialization.hpp"
 #include "include/table_utils.hpp"
 
@@ -63,7 +64,9 @@ table_id_t ParameterServerTable::resolve_ps_type(
             // Using random eviction, assuming gpu cache handles all host keys. Otherwise, replace with "evict_lru".
             {"handler", "evict_random"},
             // (num_rows_ == 0) implies unlimited size (grow until OOM). Use erase_keys() to remove data manually.
-            {"overflow_margin", (num_rows_ > 0) ? keys_per_partition : INT64_MAX},
+            {"overflow_margin", (num_rows_ > 0)
+                                    ? keys_per_partition
+                                    : OverflowPolicyConfig{}.overflow_margin},
             {"resolution_margin", 0.95}
         }
         },
@@ -96,23 +99,22 @@ table_id_t ParameterServerTable::resolve_ps_type(
             [[fallthrough]];
         case ParameterServerTable::PSType_t::NVHashMap:
             plugin_name_    = "libnve-plugin-nvhm.so";
-            factory_config_ = R"({"implementation": "nvhm_map"})"_json;
+            factory_config_ = nlohmann::json::object();
             return 100;
         case ParameterServerTable::PSType_t::Abseil:
             plugin_name_    = "libnve-plugin-abseil.so";
-            factory_config_ = R"({"implementation": "abseil_flat_map"})"_json;
+            factory_config_ = nlohmann::json::object();
             return 200;
         case ParameterServerTable::PSType_t::ParallelHash:
             plugin_name_    = "libnve-plugin-phmap.so";
-            factory_config_ = R"({"implementation": "phmap_flat_map"})"_json;
+            factory_config_ = nlohmann::json::object();
             return 300;
         case ParameterServerTable::PSType_t::Redis:
             plugin_name_    = "libnve-plugin-redis.so";
-            factory_config_ = R"({"address": "localhost:7000", "implementation": "redis_cluster"})"_json;
+            factory_config_ = R"({"address": "localhost:7000"})"_json;
             factory_config_.merge_patch(extra_params_plugin);
             // Redis uses a different table-config shape than the in-memory plugins.
             table_config_ = {
-                {"mask_size", sizeof(uint64_t)},
                 {"key_size", sizeof(KeyType)},
                 {"max_value_size", row_bytes_},
                 {"value_dtype", to_string(data_type_)},

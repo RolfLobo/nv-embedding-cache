@@ -26,7 +26,7 @@ using namespace nve::plugin;
 using namespace nlohmann::literals;
 
 TEST(nvhm_plugin, parse_table_conf) {
-  const NvhmMapTableConfig conf{{4, sizeof(int32_t), 16, DataType_t::BFloat},
+  const NvhmMapTableConfig conf{{sizeof(int32_t), 16, DataType_t::BFloat},
                                      2, Partitioner_t::AlwaysZero, {1}, 128,
                                      16, 1337, 32,
                                      4, false,
@@ -35,7 +35,6 @@ TEST(nvhm_plugin, parse_table_conf) {
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"({
-    "mask_size": 4,
     "key_size": 4,
     "max_value_size": 16,
     "value_dtype": "bfloat",

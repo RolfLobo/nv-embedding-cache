@@ -16,28 +16,8 @@
  */
 
 #include <custom_remote_table.hpp>
-#include <plugin.hpp>
+#include <plugin/nve_internal_plugin.hpp>
 
-extern "C" const char* plugin_ident() noexcept {
-  return "std::map-backed remote table plugin (sample)";
-}
-
-extern "C" const char* plugin_developer() noexcept { return "NVIDIA Corporation"; }
-
-extern "C" void enum_host_table_implementations(void* dll,
-                                                void (*callback)(void*, const char*)) noexcept {
-  callback(dll, "custom_remote");
-}
-
-using namespace nve;
-
-#pragma GCC diagnostic push
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-extern "C" host_table_factory_ptr_t create_custom_remote_table_factory(
-    const nlohmann::json& /*json*/) {
-#pragma GCC diagnostic pop
-  return {new CustomRemoteTableFactory(),
-          [](CustomRemoteTableFactory* const p) { delete p; }};
-}
+/* The factory is default-constructed and intentionally ignores factory JSON. */
+NVE_DEFINE_INTERNAL_PLUGIN_NO_CONFIG("std::map-backed remote table plugin (sample)",
+                                     "NVIDIA Corporation", nve::CustomRemoteTableFactory)

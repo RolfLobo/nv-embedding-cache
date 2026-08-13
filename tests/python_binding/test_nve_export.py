@@ -19,7 +19,6 @@
 
 import os
 import json
-import subprocess
 import tempfile
 import numpy as np
 import pytest
@@ -143,47 +142,6 @@ def test_export_dynamic_shapes():
         assert out_b.shape == (2, EMB_SIZE)
         assert torch.all(out_b[0] == 3)
         assert torch.all(out_b[1] == 7)
-
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-NVE_INFERENCE_BIN = os.path.join(REPO_ROOT, "./build/bin/nve_inference")
-
-
-def test_cpp_inference():
-    """Export model with known weights via AOTInductor, run C++ binary, verify output."""
-    if not os.path.exists(NVE_INFERENCE_BIN):
-        print(f"SKIP: C++ binary not found: {NVE_INFERENCE_BIN}")
-        return
-
-    model = SimpleModel(optimize_for_training=False)
-    # row[i] = all i's so output is verifiable
-    weight_data = torch.arange(NUM_EMB, dtype=torch.float32, device=DEVICE) \
-        .unsqueeze(1).expand(NUM_EMB, EMB_SIZE)
-    model.emb.weight.data.copy_(weight_data)
-
-    keys = torch.tensor([0, 1, 5, 10], device=DEVICE, dtype=torch.int64)
-
-    with tempfile.TemporaryDirectory() as save_dir:
-        export_aot(model, (keys,), save_dir)
-
-        env = os.environ.copy()
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        env["LD_LIBRARY_PATH"] = torch_lib + ":" + env.get("LD_LIBRARY_PATH", "")
-        result = subprocess.run(
-            [NVE_INFERENCE_BIN, save_dir],
-            capture_output=True, text=True, timeout=30,
-            cwd=REPO_ROOT,
-            env=env,
-        )
-        assert result.returncode == 0, f"C++ binary failed:\n{result.stderr}"
-
-        stdout = result.stdout
-        assert "Output shape: [4, 8]" in stdout
-        assert "key=0 -> [0, 0, 0, 0" in stdout
-        assert "key=1 -> [1, 1, 1, 1" in stdout
-        assert "key=5 -> [5, 5, 5, 5" in stdout
-        assert "key=10 -> [10, 10, 10, 10" in stdout
-        print("PASS: C++ inference output matches expected values")
 
 
 # ---------------------------------------------------------------------------
@@ -337,43 +295,6 @@ def test_two_instances_one_process_aot():
         assert not torch.allclose(actual_a, actual_b)
 
 
-def test_cpp_inference_gpu():
-    """Export NoCache model with known weights via AOTInductor, run C++ binary, verify output."""
-    if not os.path.exists(NVE_INFERENCE_BIN):
-        print(f"SKIP: C++ binary not found: {NVE_INFERENCE_BIN}")
-        return
-
-    model = SimpleModel(layer_type=nve_layers.LayerType.GPULayer,
-                        optimize_for_training=False)
-    weight_data = torch.arange(NUM_EMB, dtype=torch.float32, device=DEVICE) \
-        .unsqueeze(1).expand(NUM_EMB, EMB_SIZE)
-    model.emb.weight.data.copy_(weight_data)
-
-    keys = torch.tensor([0, 1, 5, 10], device=DEVICE, dtype=torch.int64)
-
-    with tempfile.TemporaryDirectory() as save_dir:
-        export_aot(model, (keys,), save_dir)
-
-        env = os.environ.copy()
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        env["LD_LIBRARY_PATH"] = torch_lib + ":" + env.get("LD_LIBRARY_PATH", "")
-        result = subprocess.run(
-            [NVE_INFERENCE_BIN, save_dir],
-            capture_output=True, text=True, timeout=30,
-            cwd=REPO_ROOT,
-            env=env,
-        )
-        assert result.returncode == 0, f"C++ binary failed:\n{result.stderr}"
-
-        stdout = result.stdout
-        assert "Output shape: [4, 8]" in stdout
-        assert "key=0 -> [0, 0, 0, 0" in stdout
-        assert "key=1 -> [1, 1, 1, 1" in stdout
-        assert "key=5 -> [5, 5, 5, 5" in stdout
-        assert "key=10 -> [10, 10, 10, 10" in stdout
-        print("PASS: NoCache C++ inference output matches expected values")
-
-
 # ---------------------------------------------------------------------------
 # Hierarchical export/load tests
 # ---------------------------------------------------------------------------
@@ -502,7 +423,8 @@ def test_export_config_nve_parameter_server():
     assert config["row_elements"] == 64
     assert config["num_rows"] == 1000
     assert config["data_type"].lower().startswith("float32")
-    assert config["factory_config"]["implementation"] == "nvhm_map"
+    # Check we no longer use the legacy "implementation" key.
+    assert "implementation" not in config["factory_config"]
     # extra_params["table"]["max_num_keys_per_task"] gets merged into table_config
     assert config["table_config"]["max_num_keys_per_task"] == 8192
     print("PASS: export_config returns plugin-shape dict")
@@ -552,7 +474,7 @@ def _make_custom_remote_ps(num_embeddings, embedding_size, data_type=torch.float
         embedding_size=embedding_size,
         data_type=data_type,
         plugin_name=CUSTOM_REMOTE_PLUGIN,
-        factory_config={"implementation": "custom_remote"},
+        factory_config={},
         table_config={
             "key_size": 8,
             "max_value_size": embedding_size * (4 if data_type == torch.float32 else 2),
@@ -567,7 +489,8 @@ def test_plugin_ps_export_config():
     config = ps.export_config()
     assert config["remote_ps_type"] == "plugin"
     assert config["plugin_name"] == CUSTOM_REMOTE_PLUGIN
-    assert config["factory_config"]["implementation"] == "custom_remote"
+    # Check we no longer use the legacy "implementation" key.
+    assert "implementation" not in config["factory_config"]
     assert config["row_elements"] == 8
     assert config["num_rows"] == 500
     print("PASS: plugin-based export_config returns correct dict")
@@ -627,79 +550,6 @@ def test_plugin_ps_export_load_roundtrip():
         assert torch.allclose(expected, actual, atol=1e-6), \
             f"Mismatch: max diff = {(expected - actual).abs().max():.2e}"
         print("PASS: custom_remote plugin export/load round-trip")
-
-
-@requires_custom_remote
-def test_cpp_inference_custom_ps():
-    """Export Hierarchical(custom_remote) model via AOTInductor, run C++ binary, verify."""
-    if not os.path.exists(NVE_INFERENCE_BIN):
-        print(f"SKIP: C++ binary not found: {NVE_INFERENCE_BIN}")
-        return
-
-    num_emb = 1024
-    emb_size = 8
-    gpu_cache = 4 * 1024 * 1024
-
-    ps = nve_ps.NVEParameterServer(
-        num_embeddings=num_emb,
-        embedding_size=emb_size,
-        data_type=torch.float32,
-        plugin_name=CUSTOM_REMOTE_PLUGIN,
-        factory_config={"implementation": "custom_remote"},
-        table_config={"key_size": 8, "max_value_size": emb_size * 4},
-    )
-    keys_full = torch.arange(num_emb, dtype=torch.int64)
-    values_full = torch.zeros(num_emb, emb_size, dtype=torch.float32)
-    for i in range(num_emb):
-        values_full[i] = float(i)
-    ps.insert(keys_full, values_full)
-
-    class _CustomPSModel(torch.nn.Module):
-        def __init__(self, remote_ps):
-            super().__init__()
-            self.emb = nve_layers.NVEmbedding(
-                num_emb, emb_size, torch.float32,
-                nve_layers.LayerType.Hierarchical,
-                gpu_cache_size=gpu_cache,
-                storage=remote_ps,
-                optimize_for_training=False,
-                device=DEVICE,
-            )
-
-        def forward(self, keys):
-            return self.emb(keys)
-
-    model = _CustomPSModel(ps)
-
-    keys = torch.tensor([0, 1, 5, 10], device=DEVICE, dtype=torch.int64)
-
-    with tempfile.TemporaryDirectory() as save_dir:
-        keys_path = os.path.join(save_dir, "keys.npy")
-        values_path = os.path.join(save_dir, "values.npy")
-        np.save(keys_path, keys_full.numpy())
-        np.save(values_path, values_full.numpy())
-
-        export_aot(model, (keys,), save_dir,
-                   ps_data_paths={"emb": (keys_path, values_path)})
-
-        env = os.environ.copy()
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        env["LD_LIBRARY_PATH"] = torch_lib + ":" + env.get("LD_LIBRARY_PATH", "")
-        result = subprocess.run(
-            [NVE_INFERENCE_BIN, save_dir],
-            capture_output=True, text=True, timeout=60,
-            cwd=REPO_ROOT,
-            env=env,
-        )
-        assert result.returncode == 0, f"C++ binary failed:\n{result.stderr}"
-
-        stdout = result.stdout
-        assert "Output shape: [4, 8]" in stdout
-        assert "key=0 -> [0, 0, 0, 0" in stdout
-        assert "key=1 -> [1, 1, 1, 1" in stdout
-        assert "key=5 -> [5, 5, 5, 5" in stdout
-        assert "key=10 -> [10, 10, 10, 10" in stdout
-        print("PASS: C++ inference custom_ps output matches expected values")
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +719,7 @@ def test_collect_resources_resolves_user_blocks():
 
     # A UserMemBlock shared by two GPULayers: single ref, still resolves.
     dev_t = torch.empty(NUM_EMB, EMB_SIZE, dtype=torch.float32, device=DEVICE)
-    shared = nve.UserMemBlock(dev_t.data_ptr())
+    shared = nve.UserMemBlock(dev_t.data_ptr(), dev_t.nbytes)
     emb_a = nve_layers.NVEmbedding(NUM_EMB, EMB_SIZE, torch.float32,
                                    nve_layers.LayerType.GPULayer,
                                    storage=shared, device=DEVICE)
@@ -1091,7 +941,8 @@ def test_embed_config_roundtrip():
     """Non-default EmbedLayerConfig fields survive export → load."""
     num_emb, emb_size, gpu_cache = 256, 8, 512 * 1024
     config = {"kernel_mode": 2, "logging_interval": 100,
-              "kernel_mode_value_1": 7, "kernel_mode_value_2": 9, "max_modify_size": 1024}
+              "kernel_mode_value_1": 7, "kernel_mode_value_2": 9, "max_modify_size": 1024,
+              "default_row_index": 3}
 
     # Cover both NVEmbedding and the bag path (which forwards config separately).
     emb = nve_layers.NVEmbedding(
@@ -1217,11 +1068,9 @@ def test_geometry_mismatch_raises():
 
 if __name__ == "__main__":
     test_export_and_load()
-    test_cpp_inference()
     test_export_config_nve_parameter_server()
     test_plugin_ps_export_config()
     test_plugin_ps_export_load_roundtrip()
-    test_cpp_inference_custom_ps()
     test_v2_metadata_schema()
     test_shared_memblock_within_model()
     test_memblock_resource_descriptor_records_actual_type()

@@ -30,7 +30,7 @@ using namespace nve::plugin;
 using namespace nlohmann::literals;
 
 TEST(redis_plugin, parse_table_conf) {
-  const RedisClusterTableConfig conf{{4, sizeof(int32_t), 16, DataType_t::BFloat},
+  const RedisClusterTableConfig conf{{sizeof(int32_t), 16, DataType_t::BFloat},
                                      1024,
                                      2,
                                      Partitioner_t::AlwaysZero,
@@ -42,7 +42,6 @@ TEST(redis_plugin, parse_table_conf) {
 
   nlohmann::json json(R"(
     {
-      "mask_size": 4,
       "key_size": 4,
       "max_value_size": 16,
       "value_dtype": "bfloat",
@@ -109,13 +108,12 @@ TEST(redis_plugin, single_node_string_crud) {
 
   // String mode: unpartitioned, no shared hash key, namespaced by `string_namespace_id`.
   const int64_t max_value_size{16};
-  nlohmann::json table_conf{{"mask_size", sizeof(max_bitmask_repr_t)},
-                            {"key_size", sizeof(key_type)},
+  nlohmann::json table_conf{{"key_size", sizeof(key_type)},
                             {"max_value_size", max_value_size},
                             {"value_dtype", "float32"},
                             {"num_partitions", 0},
                             {"string_namespace_id", 987654321}};
-  host_table_ptr_t tab{fac.produce(7, table_conf)};
+  host_table_ptr_t tab{std::dynamic_pointer_cast<HostTableLike>(fac.produce(7, table_conf))};
   auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
 
   // Probe connectivity; redis-plus-plus connects lazily, so the first command reveals an outage.
@@ -140,19 +138,18 @@ TEST(redis_plugin, single_node_string_crud) {
     }
   }
 
-  std::vector<max_bitmask_repr_t> hit_mask(static_cast<uint64_t>(max_bitmask_t::mask_size(n)));
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)));
   std::vector<char> out_values(static_cast<size_t>(n * value_stride));
   std::vector<int64_t> out_value_sizes(static_cast<size_t>(n));
 
   const size_t keys_bytes{static_cast<size_t>(n) * sizeof(key_type)};
-  const size_t hit_mask_bytes{static_cast<size_t>(max_bitmask_t::mask_size(n)) *
-                              sizeof(max_bitmask_repr_t)};
+  const size_t hit_mask_bytes{hit_mask.size() * sizeof(bitmask64_t)};
 
   auto keys_bw = [&](const key_type* p) {
     return std::make_shared<BufferWrapper<const void>>(ctx, "keys", p, keys_bytes);
   };
   auto hit_mask_bw = [&]() {
-    return std::make_shared<BufferWrapper<max_bitmask_repr_t>>(ctx, "hit_mask", hit_mask.data(),
+    return std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hit_mask", hit_mask.data(),
                                                                hit_mask_bytes);
   };
   auto values_in_bw = [&]() {
@@ -228,8 +225,7 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
   const int64_t max_value_size{16};
   const int64_t value_stride{max_value_size};
   auto make_table_conf = [&](int64_t string_namespace_id) {
-    return nlohmann::json{{"mask_size", sizeof(max_bitmask_repr_t)},
-                          {"key_size", sizeof(key_type)},
+    return nlohmann::json{{"key_size", sizeof(key_type)},
                           {"max_value_size", max_value_size},
                           {"value_dtype", "float32"},
                           {"num_partitions", 0},
@@ -238,8 +234,8 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
 
   // Two tables that differ only by their key prefix (table id is irrelevant to key naming in string
   // mode, so isolation must come from the prefix alone).
-  host_table_ptr_t tab_a{fac.produce(1, make_table_conf(111))};
-  host_table_ptr_t tab_b{fac.produce(2, make_table_conf(222))};
+  host_table_ptr_t tab_a{std::dynamic_pointer_cast<HostTableLike>(fac.produce(1, make_table_conf(111)))};
+  host_table_ptr_t tab_b{std::dynamic_pointer_cast<HostTableLike>(fac.produce(2, make_table_conf(222)))};
   auto ctx_a = tab_a->create_execution_context(0, 0, nullptr, nullptr);
   auto ctx_b = tab_b->create_execution_context(0, 0, nullptr, nullptr);
 
@@ -279,13 +275,12 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
   // asserts the returned payloads match it byte-for-byte. Void return so ASSERT_* is allowed.
   auto find_check = [&](host_table_ptr_t& tab, context_ptr_t& ctx, const std::vector<char>* expected,
                         int64_t& cnt_out) {
-    std::vector<max_bitmask_repr_t> hm(static_cast<uint64_t>(max_bitmask_t::mask_size(n)), 0);
+    std::vector<bitmask64_t> hm(to_uint(ceil_div(n, bitmask64::num_bits)), 0);
     std::vector<char> out(static_cast<size_t>(n * value_stride), 0);
     auto kbw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys.data(),
                                                            static_cast<size_t>(n) * sizeof(key_type));
-    auto hbw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-        ctx, "hit_mask", hm.data(),
-        static_cast<size_t>(max_bitmask_t::mask_size(n)) * sizeof(max_bitmask_repr_t));
+    auto hbw = std::make_shared<BufferWrapper<bitmask64_t>>(
+        ctx, "hit_mask", hm.data(), hm.size() * sizeof(bitmask64_t));
     auto vbw = std::make_shared<BufferWrapper<void>>(ctx, "values", out.data(), out.size());
     tab->reset_lookup_counter(ctx);
     tab->find(ctx, n, std::move(kbw), std::move(hbw), value_stride,
@@ -342,13 +337,12 @@ TEST(redis_plugin, single_node_string_parallel_crud) {
   const int64_t max_value_size{24};
   const int64_t value_stride{max_value_size};
   // num_partitions == 4 -> 4 parallel work partitions over plain Redis strings.
-  nlohmann::json table_conf{{"mask_size", sizeof(max_bitmask_repr_t)},
-                            {"key_size", sizeof(key_type)},
+  nlohmann::json table_conf{{"key_size", sizeof(key_type)},
                             {"max_value_size", max_value_size},
                             {"value_dtype", "e4m3"},
                             {"num_partitions", 4},
                             {"string_namespace_id", 555}};
-  host_table_ptr_t tab{fac.produce(11, table_conf)};
+  host_table_ptr_t tab{std::dynamic_pointer_cast<HostTableLike>(fac.produce(11, table_conf))};
   auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
 
   try {
@@ -369,7 +363,7 @@ TEST(redis_plugin, single_node_string_parallel_crud) {
     }
   }
 
-  std::vector<max_bitmask_repr_t> hit_mask(static_cast<uint64_t>(max_bitmask_t::mask_size(n)));
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)));
   std::vector<char> out_values(static_cast<size_t>(n * value_stride));
 
   auto keys_bw = [&]() {
@@ -377,9 +371,8 @@ TEST(redis_plugin, single_node_string_parallel_crud) {
                                                        static_cast<size_t>(n) * sizeof(key_type));
   };
   auto hit_mask_bw = [&]() {
-    return std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-        ctx, "hit_mask", hit_mask.data(),
-        static_cast<size_t>(max_bitmask_t::mask_size(n)) * sizeof(max_bitmask_repr_t));
+    return std::make_shared<BufferWrapper<bitmask64_t>>(
+        ctx, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(bitmask64_t));
   };
 
   int64_t cnt{};

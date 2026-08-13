@@ -26,6 +26,7 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <common.hpp>
 
 namespace nve {
 
@@ -50,8 +51,7 @@ class FeatureGenerator {
       this->inverse_permutation_.resize(static_cast<size_t>(num_categories) + 1);
       std::iota(this->permutation_.begin(), this->permutation_.end(), 0);
 
-      std::random_device rd;
-      std::mt19937 g(rd());
+      std::mt19937 g(random_seed());
       std::shuffle(this->permutation_.begin(), this->permutation_.end(), g);
 
       for (IndexType i = 0; i < num_categories + 1; ++i) {
@@ -162,8 +162,7 @@ class UniformFeatureGenerator : public FeatureGenerator<IndexType> {
     }
 
     if (this->shuffle_) {
-      std::random_device rd;
-      std::mt19937 g(rd());
+      std::mt19937 g(random_seed());
       std::shuffle(indices.begin(), indices.end(), g);
     }
 
@@ -222,8 +221,7 @@ class PowerLawFeatureGenerator : public FeatureGenerator<IndexType> {
     }
 
     if (this->shuffle_) {
-      std::random_device rd;
-      std::mt19937 g(rd());
+      std::mt19937 g(random_seed());
       std::shuffle(indices.begin(), indices.end(), g);
     }
 

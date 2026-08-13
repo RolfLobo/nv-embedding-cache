@@ -62,7 +62,7 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
   ~HierarchicalEmbeddingLayer() override;
 
   void lookup(context_ptr_t& ctx, const int64_t num_keys, const void* keys, void* output,
-              const int64_t output_stride, max_bitmask_repr_t* hitmask,
+              const int64_t output_stride, bitmask64_t* hitmask,
               const PoolingParams* pool_params, float* hitrates) override;
   void insert(context_ptr_t& ctx, const int64_t num_keys, const void* keys,
               const int64_t value_stride, const int64_t value_size, const void* values,

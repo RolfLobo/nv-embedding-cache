@@ -27,6 +27,7 @@
 #include <hierarchical_embedding_layer.hpp>
 #include <gpu_table.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
 #include <linear_host_table.hpp>
 #include <memory>
 #include <string>
@@ -147,9 +148,7 @@ class HierLayerTest {
       case HostTableType::None:
         break;// do nothing
       case HostTableType::NVHashMap: {
-        std::vector<std::string> plugin_names{nve_test::plugin_full_path("nvhm")};
-        load_host_table_plugins(plugin_names.begin(), plugin_names.end());
-        nlohmann::json nvhm_conf = {{"mask_size", 8},
+        nlohmann::json nvhm_conf = {
                                   {"key_size", sizeof(IndexT)},
                                   {"max_value_size", row_size},
                                   {"value_dtype", to_string(data_type)},
@@ -162,56 +161,43 @@ class HierLayerTest {
                                   {{"overflow_margin", (table_size / row_size)},
                                     {"handler", "evict_lru"},
                                     {"resolution_margin", 0.5}}}};
-        host_table_factory_ptr_t nvhm_fac{
-            create_host_table_factory(R"({"implementation": "nvhm_map"})"_json)};
+        table_factory_ptr_t nvhm_fac{nve_test::plugin_factory("nvhm")};
         m_host_tab = nvhm_fac->produce(4711, nvhm_conf);
         break;
       }
       case HostTableType::Redis: {
         check_redis_ready(7000);
-        std::vector<std::string> plugin_names{nve_test::plugin_full_path("redis")};
-        load_host_table_plugins(plugin_names.begin(), plugin_names.end());
         nlohmann::json redis_conf = {
                                       {"num_partitions", 1},
-                                      {"mask_size", 8},
                                       {"key_size", sizeof(IndexT)},
                                       {"max_value_size", row_size},
                                       {"value_dtype", to_string(data_type)},
                                     };
-        host_table_factory_ptr_t redis_fac{
-            create_host_table_factory(R"(
+        table_factory_ptr_t redis_fac{nve_test::plugin_factory("redis", R"(
             {
-              "address": "localhost:7000",
-              "implementation": "redis_cluster"
+              "address": "localhost:7000"
             })"_json)};
         m_host_tab = redis_fac->produce(4712, redis_conf);
         break;
       }
       case HostTableType::Redis_String: {
         check_redis_ready(6379);
-        std::vector<std::string> plugin_names{nve_test::plugin_full_path("redis")};
-        load_host_table_plugins(plugin_names.begin(), plugin_names.end());
         nlohmann::json redis_conf = {
                                       {"num_partitions", 0},
-                                      {"mask_size", 8},
                                       {"key_size", sizeof(IndexT)},
                                       {"max_value_size", row_size},
                                       {"value_dtype", to_string(data_type)},
                                     };
-        host_table_factory_ptr_t redis_fac{
-            create_host_table_factory(R"(
+        table_factory_ptr_t redis_fac{nve_test::plugin_factory("redis", R"(
             {
               "address": "localhost:6379",
-              "single_node": true,
-              "implementation": "redis_cluster"
+              "single_node": true
             })"_json)};
         m_host_tab = redis_fac->produce(4715, redis_conf);
         break;
       }
       case HostTableType::Abseil: {
-        std::vector<std::string> plugin_names{nve_test::plugin_full_path("abseil")};
-        load_host_table_plugins(plugin_names.begin(), plugin_names.end());
-        nlohmann::json abseil_conf = {{"mask_size", 8},
+        nlohmann::json abseil_conf = {
                                   {"key_size", sizeof(IndexT)},
                                   {"max_value_size", row_size},
                                   {"value_dtype", to_string(data_type)},
@@ -222,15 +208,12 @@ class HierLayerTest {
                                   {{"overflow_margin", (table_size / row_size)},
                                     {"handler", "evict_lru"},
                                     {"resolution_margin", 0.5}}}};
-        host_table_factory_ptr_t abseil_fac{
-            create_host_table_factory(R"({"implementation": "abseil_flat_map"})"_json)};
+        table_factory_ptr_t abseil_fac{nve_test::plugin_factory("abseil")};
         m_host_tab = abseil_fac->produce(4713, abseil_conf);
         break;
       }
       case HostTableType::Phmap: {
-        std::vector<std::string> plugin_names{nve_test::plugin_full_path("phmap")};
-        load_host_table_plugins(plugin_names.begin(), plugin_names.end());
-        nlohmann::json phm_conf = {{"mask_size", 8},
+        nlohmann::json phm_conf = {
                                   {"key_size", sizeof(IndexT)},
                                   {"max_value_size", row_size},
                                   {"value_dtype", to_string(data_type)},
@@ -241,8 +224,7 @@ class HierLayerTest {
                                   {{"overflow_margin", (table_size / row_size)},
                                     {"handler", "evict_lru"},
                                     {"resolution_margin", 0.5}}}};
-        host_table_factory_ptr_t phm_fac{
-            create_host_table_factory(R"({"implementation": "phmap_flat_map"})"_json)};
+        table_factory_ptr_t phm_fac{nve_test::plugin_factory("phmap")};
         m_host_tab = phm_fac->produce(4714, phm_conf);
         break;
       }
@@ -318,10 +300,10 @@ class HierLayerTest {
     NVE_CHECK_(output != 0);
     std::vector<int8_t> ref_output(output_size);
 
-    auto mask_bits_per_elem = sizeof(max_bitmask_repr_t) * 8;
+    auto mask_bits_per_elem = sizeof(bitmask64_t) * 8;
     uint64_t hitmask_size = (static_cast<uint64_t>(num_keys) + mask_bits_per_elem - 1) / mask_bits_per_elem;
-    std::vector<max_bitmask_repr_t> hitmask(hitmask_size);
-    std::vector<max_bitmask_repr_t> ref_hitmask(hitmask_size);
+    std::vector<bitmask64_t> hitmask(hitmask_size);
+    std::vector<bitmask64_t> ref_hitmask(hitmask_size);
 
     std::vector<float> hitrates(3);
 
@@ -333,8 +315,8 @@ class HierLayerTest {
     {
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
           m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
-      auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-          m_ctx, "hit_mask", ref_hitmask.data(), hitmask_size * sizeof(max_bitmask_repr_t));
+      auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+          m_ctx, "hit_mask", ref_hitmask.data(), hitmask_size * sizeof(bitmask64_t));
       auto values_bw = std::make_shared<BufferWrapper<void>>(
           m_ctx, "values", ref_output.data(),
           static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
@@ -587,7 +569,7 @@ class HierLayerTest {
  private:
   const int64_t m_row_size;
   table_ptr_t m_gpu_tab;
-  host_table_ptr_t m_host_tab;
+  table_ptr_t m_host_tab;
   host_table_ptr_t m_remote_tab;
   host_table_ptr_t m_ref_tab;
   std::shared_ptr<layer_type> m_layer{nullptr};
@@ -1040,8 +1022,8 @@ TEST(HierachicalDefaultEmbedding, FillsMissesFromConfig) {
   ctx->wait();
 
   std::vector<uint8_t> output(num_keys * row_size, 0x00);
-  constexpr uint64_t mask_bits = sizeof(max_bitmask_repr_t) * 8;
-  std::vector<max_bitmask_repr_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
+  constexpr uint64_t mask_bits = sizeof(bitmask64_t) * 8;
+  std::vector<bitmask64_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
   layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
                 static_cast<int64_t>(row_size), hitmask.data(),
                 nullptr /*pool_params*/, nullptr /*hitrates*/);
@@ -1089,8 +1071,8 @@ TEST(HierachicalDefaultEmbedding, NoDefaultLeavesMissesUntouched) {
   std::vector<IndexT> keys(num_keys);
   for (uint64_t i = 0; i < num_keys; i++) keys[i] = static_cast<IndexT>(1000 + i);  // none inserted
   std::vector<uint8_t> output(num_keys * row_size, sentinel);
-  constexpr uint64_t mask_bits = sizeof(max_bitmask_repr_t) * 8;
-  std::vector<max_bitmask_repr_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
+  constexpr uint64_t mask_bits = sizeof(bitmask64_t) * 8;
+  std::vector<bitmask64_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
   layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
                 static_cast<int64_t>(row_size), hitmask.data(),
                 nullptr /*pool_params*/, nullptr /*hitrates*/);
@@ -1130,6 +1112,7 @@ TEST(HierachicalLinearHost, LookupReadsHostBuffer) {
   table_cfg.value_dtype = DataType_t::Float32;
   table_cfg.key_size = sizeof(IndexT);
   table_cfg.max_value_size = static_cast<int64_t>(row_size);
+  table_cfg.num_rows = static_cast<int64_t>(num_rows);
   table_cfg.emb_table = h_table;
   auto host_tab = std::make_shared<LinearHostTable<IndexT>>(table_cfg);
 
@@ -1144,8 +1127,8 @@ TEST(HierachicalLinearHost, LookupReadsHostBuffer) {
   for (uint64_t i = 0; i < num_keys; ++i) keys[i] = static_cast<IndexT>(i * 3);
 
   std::vector<DataT> output(num_keys * row_elements, DataT{0});
-  constexpr uint64_t mask_bits = sizeof(max_bitmask_repr_t) * 8;
-  std::vector<max_bitmask_repr_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
+  constexpr uint64_t mask_bits = sizeof(bitmask64_t) * 8;
+  std::vector<bitmask64_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
 
   layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
                 static_cast<int64_t>(row_size), hitmask.data(),
@@ -1183,6 +1166,7 @@ TEST(HierachicalLinearHost, UpdateThenLookup) {
   table_cfg.value_dtype = DataType_t::Float32;
   table_cfg.key_size = sizeof(IndexT);
   table_cfg.max_value_size = static_cast<int64_t>(row_size);
+  table_cfg.num_rows = static_cast<int64_t>(num_rows);
   table_cfg.emb_table = h_table;
   auto host_tab = std::make_shared<LinearHostTable<IndexT>>(table_cfg);
 
@@ -1207,8 +1191,8 @@ TEST(HierachicalLinearHost, UpdateThenLookup) {
   ctx->wait();
 
   std::vector<DataT> output(num_keys * row_elements, DataT{0});
-  constexpr uint64_t mask_bits = sizeof(max_bitmask_repr_t) * 8;
-  std::vector<max_bitmask_repr_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
+  constexpr uint64_t mask_bits = sizeof(bitmask64_t) * 8;
+  std::vector<bitmask64_t> hitmask((num_keys + mask_bits - 1) / mask_bits, 0);
   layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
                 static_cast<int64_t>(row_size), hitmask.data(),
                 nullptr /*pool_params*/, nullptr /*hitrates*/);

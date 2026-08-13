@@ -17,15 +17,18 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 #include <unistd.h>
 
 #include <buffer_wrapper.hpp>
 #include <execution_context.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
 #include "test_utils.hpp"
 
 using namespace nve;
@@ -66,7 +69,8 @@ TEST(general_tests, load_dlls) {
 #ifdef NVE_FEATURE_ROCKSDB_PLUGIN
     plugin_names.push_back(nve_test::plugin_full_path("rocksdb"));
 #endif
-    load_host_table_plugins(plugin_names.begin(), plugin_names.end());
+    std::for_each(plugin_names.begin(), plugin_names.end(),
+                  [](const std::string& name) { Plugin plugin{name}; });
   } catch (const Exception& e) {
     NVE_LOG_CRITICAL_(e);
     FAIL();
@@ -74,13 +78,14 @@ TEST(general_tests, load_dlls) {
 }
 
 TEST(general_tests, shorthand_plugin_names_are_not_supported) {
-  EXPECT_THROW(load_host_table_plugin("abseil"), Exception);
+  EXPECT_THROW(Plugin{"abseil"}, Exception);
 }
 
-void create_and_clear(const nlohmann::json& fac_json) {
+void create_and_clear(const std::string& plugin_path, const nlohmann::json& fac_json) {
   try {
-    host_table_factory_ptr_t fac{create_host_table_factory(fac_json)};
-    host_table_ptr_t tab{fac->produce(4711, R"({})"_json)};
+    Plugin plugin{plugin_path};
+    table_factory_ptr_t fac{plugin.create_table_factory(fac_json)};
+    table_ptr_t tab{fac->produce(4711, R"({})"_json)};
     auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
     tab->clear(ctx);
   } catch (const Exception& e) {
@@ -89,36 +94,33 @@ void create_and_clear(const nlohmann::json& fac_json) {
   }
 }
 
-TEST(create_and_clear, stl_map_table) { create_and_clear(R"({"implementation": "umap"})"_json); }
+TEST(create_and_clear, stl_map_table) {
+  create_and_clear(nve_test::plugin_full_path("stl-map"), nlohmann::json::object());
+}
 
 TEST(create_and_clear, nvhm_table) {
   SKIP_IF_NVHM_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("nvhm"));
-  create_and_clear(R"({"implementation": "nvhm_map"})"_json);
+  create_and_clear(nve_test::plugin_full_path("nvhm"), nlohmann::json::object());
 }
 
 TEST(create_and_clear, abseil_flat_map_table) {
   SKIP_IF_ABSEIL_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("abseil"));
-  create_and_clear(R"({"implementation": "abseil_flat_map"})"_json);
+  create_and_clear(nve_test::plugin_full_path("abseil"), nlohmann::json::object());
 }
 
 TEST(create_and_clear, phmap_flat_map_table) {
   SKIP_IF_PHMAP_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("phmap"));
-  create_and_clear(R"({"implementation": "phmap_flat_map"})"_json);
+  create_and_clear(nve_test::plugin_full_path("phmap"), nlohmann::json::object());
 }
 
 TEST(create_and_clear, rocksdb_table) {
   SKIP_IF_ROCKSDB_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("rocksdb"));
-  create_and_clear(R"({"implementation": "rocksdb"})"_json);
+  create_and_clear(nve_test::plugin_full_path("rocksdb"), nlohmann::json::object());
 }
 
 TEST(host_table_invalid_key, custom_value_round_trips) {
-  host_table_factory_ptr_t fac{create_host_table_factory(R"({"implementation": "umap"})"_json)};
-  host_table_ptr_t tab{
-      fac->produce(4712, R"({"max_value_size": 16, "invalid_key": 999})"_json)};
+  table_factory_ptr_t fac{nve_test::plugin_factory("stl-map")};
+  table_ptr_t tab{fac->produce(4712, R"({"max_value_size": 16, "invalid_key": 999})"_json)};
   EXPECT_EQ(int64_t{999}, tab->get_invalid_key());
 }
 
@@ -129,11 +131,11 @@ TEST(host_table_invalid_key, valid_keys_survive_batch_with_sentinel) {
   constexpr int64_t max_value_size = 16;
   constexpr key_type sentinel = static_cast<key_type>(7777777);
 
-  host_table_factory_ptr_t fac{create_host_table_factory(R"({"implementation": "umap"})"_json)};
+  table_factory_ptr_t fac{nve_test::plugin_factory("stl-map")};
   nlohmann::json table_conf = nlohmann::json::object();
   table_conf["max_value_size"] = max_value_size;
   table_conf["invalid_key"] = static_cast<int64_t>(sentinel);
-  host_table_ptr_t tab{fac->produce(4713, table_conf)};
+  table_ptr_t tab{fac->produce(4713, table_conf)};
   ASSERT_EQ(static_cast<int64_t>(sentinel), tab->get_invalid_key());
 
   auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
@@ -153,15 +155,13 @@ TEST(host_table_invalid_key, valid_keys_survive_batch_with_sentinel) {
     tab->insert(ctx, n, std::move(keys_bw), max_value_size + 1, 0, nullptr);
   }
 
-  std::vector<max_bitmask_repr_t> hit_mask(
-      static_cast<uint64_t>(max_bitmask_t::mask_size(n)), 0);
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), 0);
   tab->reset_lookup_counter(ctx);
   {
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
         ctx, "keys", keys.data(), static_cast<size_t>(n) * sizeof(key_type));
-    auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-        ctx, "hit_mask", hit_mask.data(),
-        static_cast<size_t>(max_bitmask_t::mask_size(n)) * sizeof(max_bitmask_repr_t));
+    auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+        ctx, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(bitmask64_t));
     tab->find(ctx, n, std::move(keys_bw), std::move(hit_mask_bw), max_value_size, nullptr, nullptr);
   }
 
@@ -169,17 +169,15 @@ TEST(host_table_invalid_key, valid_keys_survive_batch_with_sentinel) {
   std::vector<key_type> valid_keys{static_cast<key_type>(1),
                                    static_cast<key_type>(2),
                                    static_cast<key_type>(4)};
-  std::vector<max_bitmask_repr_t> valid_hit_mask(
-      static_cast<uint64_t>(max_bitmask_t::mask_size(static_cast<int64_t>(valid_keys.size()))), 0);
+  const int64_t valid_n{static_cast<int64_t>(valid_keys.size())};
+  std::vector<bitmask64_t> valid_hit_mask(to_uint(ceil_div(valid_n, bitmask64::num_bits)), 0);
   int64_t valid_cnt = 0;
   tab->reset_lookup_counter(ctx);
   {
-    const int64_t valid_n = static_cast<int64_t>(valid_keys.size());
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
         ctx, "keys", valid_keys.data(), valid_keys.size() * sizeof(key_type));
-    auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-        ctx, "hit_mask", valid_hit_mask.data(),
-        static_cast<size_t>(max_bitmask_t::mask_size(valid_n)) * sizeof(max_bitmask_repr_t));
+    auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+        ctx, "hit_mask", valid_hit_mask.data(), valid_hit_mask.size() * sizeof(bitmask64_t));
     tab->find(ctx, valid_n, std::move(keys_bw), std::move(hit_mask_bw),
                  max_value_size, nullptr, nullptr);
   }
@@ -200,8 +198,8 @@ TEST(create_and_clear, arbitrary_so_path) {
   std::filesystem::copy_file(source_path, target_path,
                              std::filesystem::copy_options::overwrite_existing);
   const TempFileCleanup cleanup{target_path};
-  load_host_table_plugin(target_path.string());
+  Plugin plugin{target_path.string()};
 
-  host_table_factory_ptr_t fac{create_host_table_factory(R"({"implementation": "abseil_flat_map"})"_json)};
+  table_factory_ptr_t fac{plugin.create_table_factory(nlohmann::json::object())};
   EXPECT_NE(fac, nullptr);
 }

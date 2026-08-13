@@ -50,6 +50,7 @@ struct GPUTableConfig {
   void* uvm_table{nullptr};                 // Optional pointer to linear table in UVM.
                                             // This pointer will be used to resolve misses (no
                                             // reolution when empty/null) Can be in GPU or host memory.
+  int64_t uvm_num_rows{0};                  // Number of rows in uvm_table. Must be set when uvm_table is used.
   bool count_misses{true};                  // When true, create lookup contexts will collect miss count
                                             // Counter is needed for Insert Heuristics, disable only when not using it.
   int64_t max_modify_size{1 << 20};         // Maximal amount of modify entries allowed in a single op (insert/update/accumulate)
@@ -127,7 +128,7 @@ class GpuTable : public Table {
    * memory).
    * @param value_sizes Must be nullptr (not supported)
    */
-  virtual void find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, buffer_ptr<max_bitmask_repr_t> hit_mask,
+  virtual void find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys, buffer_ptr<bitmask64_t> hit_mask,
                        int64_t value_stride, buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   /**
@@ -161,12 +162,14 @@ class GpuTable : public Table {
    * @param ctx An execution context for this database.
    * @param num_keys The number of given keys.
    * @param keys An array of entry keys. Resides in host memory unless modify_on_gpu was set to true.
+   * Keys outside [0, uvm_num_rows) have undefined results, as they address no UVM row.
    */
   void insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys);
 
   /**
    * Update (overwrite) values for a given set of keys iff they already exist in the database.
    * Values for keys not available in the database will be ignored.
+   * When a UVM table is configured, keys outside [0, uvm_num_rows) are silently ignored.
    *
    * @param ctx An execution context for this database.
    * @param num_keys The number of given keys.
@@ -183,6 +186,7 @@ class GpuTable : public Table {
   /**
    * Update (accumulate) values for a given set of keys iff they already exist in the database.
    * Values for keys not available in the database will be ignored.
+   * When a UVM table is configured, keys outside [0, uvm_num_rows) are silently ignored.
    *
    * @param ctx An execution context for this database.
    * @param num_keys The number of given keys.

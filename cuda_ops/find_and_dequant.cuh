@@ -26,20 +26,25 @@
 namespace nve {
 
 // Gather one embedding row per key and write it out dequantized (no pooling). This is the
-// hotness-1 / no-accumulate sibling of FindAndCombine: every key produces one output row of
-// QuantizationHelper<DTYPE>::ParamType values, reconstructed as float(q) * scale [+ offset].
+// hotness-1 / no-accumulate sibling of find_and_combine: every key produces one output row of
+// OUTPUT_TYPE values, reconstructed as float(q) * scale [+ offset]. OUTPUT_TYPE is independent of
+// DTYPE's dequantized ParamType (e.g. __half storage dequantized to a float output, or vice
+// versa); the final Cast<DequantVecType, OutVecType> converts the dequantized value to OUTPUT_TYPE.
 //
 // A quantized row is laid out as [ q[row_size_in_elements] ][ scale ][ offset? ] where q is
 // DTYPE's storage type and scale/offset are ParamType, matching get_row_size_in_bytes<DTYPE>().
 //
 // Each warp (SUBWARP_WIDTH lanes) resolves SUBWARP_WIDTH row addresses (one per lane), then walks
 // s = 0..SUBWARP_WIDTH-1 broadcasting lane s's address to the whole warp so the warp cooperatively
-// streams that one row out, vectorized over InputVecType/OutputVecType.
+// streams that one row out, vectorized over InputVecType (quantized load) / DequantVecType
+// (dequantized ParamType) / OutVecType (OUTPUT_TYPE store).
 template<DataType_t DTYPE,
+         typename OUTPUT_TYPE,
          typename IndexT,
          typename CacheDataT,
          typename InputVecType,
-         typename OutputVecType,
+         typename DequantVecType,
+         typename OutVecType,
          uint32_t SUBWARP_WIDTH,
          uint32_t BLOCK_Y,
          bool LOAD_INDICES>
@@ -49,7 +54,7 @@ __global__ void find_and_dequant(const IndexT* d_keys, const size_t len,
 {
     using ParamType = typename QuantizationHelper<DTYPE>::ParamType;
     constexpr uint32_t ELEMENT_SIZE = QuantizationHelper<DTYPE>::element_size;
-    constexpr uint32_t VEC_SIZE_IN_ELEMENTS = sizeof(OutputVecType) / sizeof(ParamType);
+    constexpr uint32_t VEC_SIZE_IN_ELEMENTS = sizeof(OutVecType) / sizeof(OUTPUT_TYPE);
     const uint32_t row_size_in_vecs = row_size_in_elements / VEC_SIZE_IN_ELEMENTS;
 
     const uint32_t tid_batch = blockIdx.x * SUBWARP_WIDTH * BLOCK_Y + threadIdx.y * SUBWARP_WIDTH;
@@ -107,8 +112,9 @@ __global__ void find_and_dequant(const IndexT* d_keys, const size_t len,
                     uint32_t offset = base + threadIdx.x + u * SUBWARP_WIDTH;
                     if (offset < row_size_in_vecs)
                     {
-                        OutputVecType out = dequantize<QuantizationHelper<DTYPE>, OutputVecType, InputVecType>(in[u], qscale, qoffset);
-                        *(OutputVecType*)(d_values + out_row * stride + offset * sizeof(OutputVecType)) = out;
+                        DequantVecType deq = dequantize<QuantizationHelper<DTYPE>, DequantVecType, InputVecType>(in[u], qscale, qoffset);
+                        OutVecType out = Cast<DequantVecType, OutVecType>(deq);
+                        *(OutVecType*)(d_values + out_row * stride + offset * sizeof(OutVecType)) = out;
                     }
                 }
             }
@@ -117,7 +123,7 @@ __global__ void find_and_dequant(const IndexT* d_keys, const size_t len,
 }
 
 // Picks the widest vector load whose row layout stays aligned (Vec4 -> Vec2 -> Vec1) and launches.
-template<DataType_t DTYPE, typename IndexT, typename CacheDataT>
+template<DataType_t DTYPE, typename OUTPUT_TYPE, typename IndexT, typename CacheDataT>
 cudaError_t call_find_and_dequant_resolved(const IndexT* d_keys, const size_t len,
     int8_t* d_values, const int8_t* d_table, uint32_t row_size_in_elements,
     CacheDataT data, cudaStream_t stream, size_t stride, bool load_indices, uint32_t curr_table)
@@ -136,56 +142,77 @@ cudaError_t call_find_and_dequant_resolved(const IndexT* d_keys, const size_t le
     using ParamType = typename QuantizationHelper<DTYPE>::ParamType;
     const uint32_t row_size_in_bytes = get_row_size_in_bytes<DTYPE>(row_size_in_elements);
 
-    #define NVE_FAD_DISPATCH(INPUT_VEC_TYPE, OUTPUT_VEC_TYPE) \
+    #define NVE_FAD_DISPATCH(INPUT_VEC_TYPE, DEQUANT_VEC_TYPE, OUT_VEC_TYPE) \
         do { \
             if (load_indices) \
             { \
-                find_and_dequant<DTYPE, IndexT, CacheDataT, INPUT_VEC_TYPE, OUTPUT_VEC_TYPE, blockX, blockY, true> \
+                find_and_dequant<DTYPE, OUTPUT_TYPE, IndexT, CacheDataT, INPUT_VEC_TYPE, DEQUANT_VEC_TYPE, OUT_VEC_TYPE, blockX, blockY, true> \
                     <<<gridDims, blockDims, 0, stream>>>(d_keys, len, d_values, d_table, data, curr_table, stride, row_size_in_elements); \
             } \
             else \
             { \
-                find_and_dequant<DTYPE, IndexT, CacheDataT, INPUT_VEC_TYPE, OUTPUT_VEC_TYPE, blockX, blockY, false> \
+                find_and_dequant<DTYPE, OUTPUT_TYPE, IndexT, CacheDataT, INPUT_VEC_TYPE, DEQUANT_VEC_TYPE, OUT_VEC_TYPE, blockX, blockY, false> \
                     <<<gridDims, blockDims, 0, stream>>>(d_keys, len, d_values, d_table, data, curr_table, stride, row_size_in_elements); \
             } \
         } while (0)
 
     if (row_size_in_bytes % sizeof(typename QuantizationHelper<DTYPE>::Vec4) == 0 && row_size_in_elements % 4 == 0)
     {
-        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec4, typename VecWidthHelper<ParamType>::Vec4);
+        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec4, typename VecWidthHelper<ParamType>::Vec4, typename VecWidthHelper<OUTPUT_TYPE>::Vec4);
     }
     else if (row_size_in_bytes % sizeof(typename QuantizationHelper<DTYPE>::Vec2) == 0 && row_size_in_elements % 2 == 0)
     {
-        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec2, typename VecWidthHelper<ParamType>::Vec2);
+        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec2, typename VecWidthHelper<ParamType>::Vec2, typename VecWidthHelper<OUTPUT_TYPE>::Vec2);
     }
     else
     {
-        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec1, typename VecWidthHelper<ParamType>::Vec1);
+        NVE_FAD_DISPATCH(typename QuantizationHelper<DTYPE>::Vec1, typename VecWidthHelper<ParamType>::Vec1, typename VecWidthHelper<OUTPUT_TYPE>::Vec1);
     }
     #undef NVE_FAD_DISPATCH
     return cudaGetLastError();
 }
 
-template<typename IndexT, typename CacheDataT>
-cudaError_t call_find_and_dequant(const IndexT* d_keys, const size_t len,
+// Resolves the stored data type for a fixed OUTPUT_TYPE. Output precision is independent of the
+// stored type, so each supported output type fans out over every stored dtype here.
+template<typename OUTPUT_TYPE, typename IndexT, typename CacheDataT>
+cudaError_t call_find_and_dequant_output_resolved(const IndexT* d_keys, const size_t len,
     int8_t* d_values, const int8_t* d_table, DataType_t dtype, uint32_t row_size_in_elements,
-    CacheDataT data, cudaStream_t stream, size_t stride, bool load_indices, uint32_t curr_table = 0)
+    CacheDataT data, cudaStream_t stream, size_t stride, bool load_indices, uint32_t curr_table)
 {
     switch (dtype) {
         case DataType_t::Float32:
-            return call_find_and_dequant_resolved<DataType_t::Float32, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::Float32, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         case DataType_t::Float16:
-            return call_find_and_dequant_resolved<DataType_t::Float16, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::Float16, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         case DataType_t::QInt8RowwiseF32:
-            return call_find_and_dequant_resolved<DataType_t::QInt8RowwiseF32, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::QInt8RowwiseF32, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         case DataType_t::QInt8RowwiseF16:
-            return call_find_and_dequant_resolved<DataType_t::QInt8RowwiseF16, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::QInt8RowwiseF16, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         case DataType_t::QUint8RowwiseF32:
-            return call_find_and_dequant_resolved<DataType_t::QUint8RowwiseF32, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::QUint8RowwiseF32, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         case DataType_t::QUint8RowwiseF16:
-            return call_find_and_dequant_resolved<DataType_t::QUint8RowwiseF16, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+            return call_find_and_dequant_resolved<DataType_t::QUint8RowwiseF16, OUTPUT_TYPE, IndexT, CacheDataT>(d_keys, len, d_values, d_table, row_size_in_elements, data, stream, stride, load_indices, curr_table);
         default:
             NVE_THROW_("Unsupported data type for find_and_dequant ", dtype);
+    }
+    return cudaErrorInvalidValue;
+}
+
+// output_dtype selects the type written to d_values (Float32 -> float, Float16 -> __half),
+// independent of the stored dtype; each dequantized value is Cast to it before the store.
+template<typename IndexT, typename CacheDataT>
+cudaError_t call_find_and_dequant(const IndexT* d_keys, const size_t len,
+    int8_t* d_values, const int8_t* d_table, DataType_t dtype, DataType_t output_dtype,
+    uint32_t row_size_in_elements, CacheDataT data, cudaStream_t stream, size_t stride,
+    bool load_indices, uint32_t curr_table = 0)
+{
+    switch (output_dtype) {
+        case DataType_t::Float32:
+            return call_find_and_dequant_output_resolved<float, IndexT, CacheDataT>(d_keys, len, d_values, d_table, dtype, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+        case DataType_t::Float16:
+            return call_find_and_dequant_output_resolved<__half, IndexT, CacheDataT>(d_keys, len, d_values, d_table, dtype, row_size_in_elements, data, stream, stride, load_indices, curr_table);
+        default:
+            NVE_THROW_("Unsupported output type for find_and_dequant ", output_dtype);
     }
     return cudaErrorInvalidValue;
 }

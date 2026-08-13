@@ -43,6 +43,7 @@ int main(int, char*[]) {
   tab_cfg.cache_size = cache_size;
   tab_cfg.row_size_in_bytes = row_size;
   tab_cfg.uvm_table = linear_table;
+  tab_cfg.uvm_num_rows = linear_table_size / row_size;
   auto gpu_tab = std::make_shared<table_type>(tab_cfg); // The table is using int64 indices (template arg)
   
   // Create the linear layer

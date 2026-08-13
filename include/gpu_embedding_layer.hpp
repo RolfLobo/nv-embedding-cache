@@ -29,12 +29,15 @@ namespace nve {
  struct GPUEmbeddingLayerConfig {
   std::string layer_name;
   int device_id{0};                  // Device id of the GPU used
-  void*   embedding_table;           // Pointer to linear table in GPU memory.
-  int64_t num_embeddings;            // Number of rows in the table
+  void* embedding_table;             // Pointer to linear table in GPU memory.
+  int64_t num_embeddings{0};         // Number of rows in the table.
   int64_t embedding_width_in_bytes;  // Stored bytes per row. Rowwise-quantized rows must have an
                                      // even width.
   DataType_t value_dtype{
       DataType_t::Unknown};          // Float16/Float32 or QInt8/QUint8RowwiseF16/F32 storage.
+  int64_t default_row_index{-1};     // Index of a table row holding the default embedding, used by
+                                     // lookups of keys outside [0, num_embeddings).
+                                     // Negative disables the check, user is responsible for all keys being valid.
 };
 
 void from_json(const nlohmann::json& json, GPUEmbeddingLayerConfig& conf);
@@ -53,7 +56,7 @@ class GPUEmbeddingLayer : public EmbeddingLayerBase {
   ~GPUEmbeddingLayer() override;
 
   void lookup(context_ptr_t& ctx, const int64_t num_keys, const void* keys, void* output,
-              const int64_t output_stride, max_bitmask_repr_t* hitmask,
+              const int64_t output_stride, bitmask64_t* hitmask,
               const PoolingParams* pool_params, float* hitrates) override;
   void insert(context_ptr_t& ctx, const int64_t num_keys, const void* keys,
               const int64_t value_stride, const int64_t value_size, const void* values,

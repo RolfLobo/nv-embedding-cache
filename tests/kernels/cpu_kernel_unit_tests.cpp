@@ -16,8 +16,8 @@
  */
 
 #include "gtest/gtest.h"
-#include "cpu_ops/cpu_gather.h"
-#include "cpu_ops/cpu_update.h"
+#include "cpu_ops/cpu_gather.hpp"
+#include "cpu_ops/cpu_update.hpp"
 #include "include/thread_pool.hpp"
 #include "include/nve_types.hpp"
 
@@ -55,13 +55,14 @@ protected:
     
         // Allocate memory for test data
         std::vector<IndexT> keys(n);
-        std::vector<max_bitmask_repr_t> hit_mask(((n + 63) / 64), 0);
+        std::vector<bitmask64_t> hit_mask(((n + 63) / 64), 0);
         std::vector<int8_t> values(n * row_size_in_bytes, 0);
         std::vector<int8_t> uvm_table(n * row_size_in_bytes);
     
         // Initialize test data
         std::mt19937 rng(params.seed);
         std::uniform_int_distribution<int> dist(0, 1);  // For 50/50 probability
+        int64_t expected_resolved_hits = 0;
         for (uint64_t i = 0; i < n; ++i) {
             keys[i] = static_cast<IndexT>(i);  // Use sequential keys
             // Initialize UVM table with test data
@@ -71,13 +72,15 @@ protected:
             // Randomly set hit mask bits with 50% probability
             if (dist(rng)) {
                 hit_mask[i / 64] |= (1ULL << (i % 64));
+            } else {
+                ++expected_resolved_hits;
             }
         }
         // Call the gather function
         // make a copy of the hit mask so we can check the rows that were gathered
-        std::vector<max_bitmask_repr_t> hit_mask_copy(hit_mask);
+        std::vector<bitmask64_t> hit_mask_copy(hit_mask);
 
-        NVE_CHECK_(cpu_kernel_gather<IndexT>(
+        const int64_t resolved_hits = cpu_kernel_gather<IndexT>(
             thread_pool_,
             n,
             keys.data(),
@@ -86,8 +89,10 @@ protected:
             values.data(),
             uvm_table.data(),
             row_size_in_bytes,
+            n,
             params.num_threads
-        ) == 0);
+        );
+        EXPECT_EQ(resolved_hits, expected_resolved_hits);
     
         // check that hit mask is all 1s
         for (uint64_t i = 0; i < (n / 64); ++i) {
@@ -195,6 +200,7 @@ protected:
             values.data(),
             uvm_table.data(),
             row_size_in_bytes,
+            n,
             params.num_threads
         ) == 0);
     
@@ -276,6 +282,7 @@ protected:
             reinterpret_cast<int8_t*>(uvm_table.data()),
             row_size_in_bytes,
             nve::DataType_t::Float32,
+            n,
             params.num_threads
         );
     

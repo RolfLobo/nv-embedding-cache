@@ -17,10 +17,12 @@
 
 #include <linear_embedding_layer.hpp>
 #include <layer_utils.hpp>
+#include <limits>
 #include <default_allocator.hpp>
 #include <gpu_table.hpp>
 #include <insert_heuristic.hpp>
 #include "cuda_ops/cuda_common.h"
+#include "cuda_ops/sanitize_keys.cuh"
 #include <buffer_wrapper.hpp>
 
 namespace nve {
@@ -49,6 +51,12 @@ LinearUVMEmbeddingLayer<KeyType>::LinearUVMEmbeddingLayer(const Config& cfg, gpu
     NVE_CHECK_(allocator_ != nullptr, "Failed to get default allocator");
     NVE_CHECK_(gpu_table_ != nullptr, "Invalid GPU table");
     NVE_CHECK_(gpu_table_->config().uvm_table != nullptr, "GPU Table must be backed by a UVM buffer");
+    NVE_CHECK_(gpu_table_->config().uvm_num_rows > 0, "uvm_num_rows must be >0");
+    NVE_CHECK_(static_cast<uint64_t>(gpu_table_->config().uvm_num_rows) <=
+                   static_cast<uint64_t>(std::numeric_limits<KeyType>::max()),
+               "Number of UVM rows cannot be represented by the layer key type");
+    NVE_CHECK_(config_.default_row_index < gpu_table_->config().uvm_num_rows,
+               "Default row index must be less than uvm_num_rows");
 
     auto heuristic = config_.insert_heuristic;
     if (!heuristic) {
@@ -81,7 +89,7 @@ LinearUVMEmbeddingLayer<KeyType>::~LinearUVMEmbeddingLayer() {
 
 template <typename KeyType>
 void LinearUVMEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_keys, const void* keys, void* output,
-                    const int64_t output_stride, max_bitmask_repr_t* hitmask,
+                    const int64_t output_stride, bitmask64_t* hitmask,
                     const PoolingParams* pool_params, float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(gpu_table_->config().device_id);
@@ -108,6 +116,12 @@ void LinearUVMEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t 
 
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
   auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+
+  // Keys outside the UVM table are replaced with the default row, so both the lookup below and the
+  // auto-insert of these keys stay in bounds (no-op when no default row is configured).
+  keys_bw = sanitize_lookup_keys<KeyType>(ctx, std::move(keys_bw), num_keys,
+                                          gpu_table_->config().uvm_num_rows,
+                                          config_.default_row_index, lookup_stream);
 
   const bool collect_misses = (hitrates || !std::dynamic_pointer_cast<NeverInsertHeuristic>(config_.insert_heuristic));
   if (collect_misses) {

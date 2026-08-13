@@ -17,6 +17,7 @@
 
 #include <common.hpp>
 #include <iostream>
+#include <random>
 
 namespace nve {
 
@@ -64,5 +65,9 @@ Logger* GetGlobalLogger() {
   static Logger global_logger_;
   return &global_logger_;
 }
+
+static thread_local std::random_device rand_dev_;
+
+uint32_t random_seed() { return rand_dev_(); }
 
 }  // namespace nve

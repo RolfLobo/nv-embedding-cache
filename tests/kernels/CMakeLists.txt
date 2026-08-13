@@ -13,8 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The GPU kernel tests are split across one .cu per kernel family (shared fixtures live in
+# kernel_test_common.cuh) so they compile in parallel instead of as one monolithic TU.
 add_executable(kernel_unit_tests
-    gpu_kernel_unit_tests.cu
+    find_and_combine_lookup_tests.cu
+    quant_lookup_tests.cu
+    pooling_backprop_tests.cu
+    find_and_dequant_tests.cu
+    misc_kernel_tests.cu
     cpu_kernel_unit_tests.cpp
     cpu_pooling_unit_tests.cpp
     ../embedding_layer/emb_layer_utils.cpp)

@@ -36,14 +36,17 @@ extern "C" {
  * Status codes
  * ============================================================================ */
 
-typedef enum {
+/* Fixed-width value type: part of the stable plugin/C ABI. The symbolic names
+ * and numeric values match the previous enum exactly. */
+typedef int32_t nve_status_t;
+enum {
   NVE_SUCCESS = 0,
   NVE_ERROR_INVALID_ARGUMENT = 1,
   NVE_ERROR_CUDA = 2,
   NVE_ERROR_RUNTIME = 3,
   NVE_ERROR_NOT_IMPLEMENTED = 4,
   NVE_ERROR_OUT_OF_MEMORY = 5,
-} nve_status_t;
+};
 
 /**
  * Retrieve the error message from the last failed C API call on this thread.
@@ -57,25 +60,28 @@ NVE_C_API nve_status_t nve_get_last_error(const char** message);
  * Enumerations
  * ============================================================================ */
 
-typedef enum {
+/* Fixed-width value type: part of the stable plugin/C ABI. The symbolic names
+ * and numeric values match the previous enum exactly. */
+typedef int32_t nve_data_type_t;
+enum {
   NVE_DTYPE_UNKNOWN = 0,
-  NVE_DTYPE_FLOAT32,
-  NVE_DTYPE_BFLOAT16,
-  NVE_DTYPE_FLOAT16,
-  NVE_DTYPE_E4M3,
-  NVE_DTYPE_E5M2,
-  NVE_DTYPE_FLOAT64,
+  NVE_DTYPE_FLOAT32 = 1,
+  NVE_DTYPE_BFLOAT16 = 2,
+  NVE_DTYPE_FLOAT16 = 3,
+  NVE_DTYPE_E4M3 = 4,
+  NVE_DTYPE_E5M2 = 5,
+  NVE_DTYPE_FLOAT64 = 6,
   /* Per-row symmetric-quantized int8 (int8 values + per-row scale, no offset), dequantized as
    * value*scale. The suffix is the scale precision: F32 = fp32 (4 bytes/row), F16 = fp16 (2
    * bytes/row). */
-  NVE_DTYPE_QINT8_ROWWISE_F32,
-  NVE_DTYPE_QINT8_ROWWISE_F16,
+  NVE_DTYPE_QINT8_ROWWISE_F32 = 7,
+  NVE_DTYPE_QINT8_ROWWISE_F16 = 8,
   /* Per-row affine-quantized uint8 (uint8 values + per-row scale & offset), dequantized as
    * value*scale + offset. The suffix is the scale/offset precision: F32 = fp32 (8 bytes/row),
    * F16 = fp16 (4 bytes/row). */
-  NVE_DTYPE_QUINT8_ROWWISE_F32,
-  NVE_DTYPE_QUINT8_ROWWISE_F16,
-} nve_data_type_t;
+  NVE_DTYPE_QUINT8_ROWWISE_F32 = 9,
+  NVE_DTYPE_QUINT8_ROWWISE_F16 = 10,
+};
 
 typedef enum {
   NVE_SPARSE_FIXED = 0,
@@ -132,7 +138,7 @@ typedef struct nve_layer_s*         nve_layer_t;
 typedef struct nve_thread_pool_s*   nve_thread_pool_t;
 typedef struct nve_allocator_s*     nve_allocator_t;
 typedef struct nve_heuristic_s*     nve_heuristic_t;
-typedef struct nve_host_factory_s*  nve_host_factory_t;
+typedef struct nve_table_factory_s* nve_table_factory_t;
 
 /* ============================================================================
  * Configuration structs
@@ -154,6 +160,7 @@ typedef struct {
   uint64_t kernel_mode_type;
   uint64_t kernel_mode_value;
   int64_t  invalid_key;             /* Sentinel for invalid entries. Default -1; cast to the table's key type. */
+  int64_t  uvm_num_rows;            /* Rows in uvm_table, required when uvm_table is set */
 } nve_gpu_table_config_t;
 
 typedef struct {
@@ -163,6 +170,10 @@ typedef struct {
   int64_t     num_embeddings;
   int64_t     embedding_width_in_bytes; /* Stored bytes per row. Quantized rows must have an even width. */
   nve_data_type_t value_dtype; /* FLOAT16/FLOAT32 or rowwise QINT8/QUINT8 F16/F32 storage. */
+  /* Index of a table row holding the default embedding, returned by lookups of keys outside
+   * [0, num_embeddings). The caller owns the row's content.
+   * Negative (the default) disables the check, user is responsible for all keys being valid. */
+  int64_t     default_row_index;
 } nve_gpu_embedding_layer_config_t;
 
 typedef struct {
@@ -170,6 +181,10 @@ typedef struct {
   nve_heuristic_t insert_heuristic;  /* NULL uses default heuristic; use nve_heuristic_create_never() to disable */
   int64_t         min_insert_freq_gpu;
   int64_t         min_insert_size_gpu;
+  /* Index of a UVM table row holding the default embedding, returned by lookups of keys outside
+   * [0, uvm_num_rows). The caller owns the row's content.
+   * Negative (the default) disables the check, user is responsible for all keys being valid. */
+  int64_t         default_row_index;
 } nve_linear_uvm_layer_config_t;
 
 typedef struct {
@@ -202,7 +217,6 @@ typedef struct {
 } nve_overflow_policy_config_t;
 
 typedef struct {
-  int64_t         mask_size;
   int64_t         key_size;
   int64_t         max_value_size;
   nve_data_type_t value_dtype;
@@ -248,7 +262,7 @@ NVE_C_API nve_host_embedding_layer_config_t  nve_host_embedding_layer_config_def
 
 /**
  * Return an overflow-policy config initialized to library defaults
- * (matches nve::OverflowPolicyConfig{}: EvictRandom, overflow_margin=INT64_MAX
+ * (matches nve::OverflowPolicyConfig{}: EvictRandom, overflow_margin=INT64_MAX-1023
  * which disables overflow checks, resolution_margin=0.8).
  */
 NVE_C_API nve_overflow_policy_config_t       nve_overflow_policy_config_default(void);
@@ -271,18 +285,6 @@ NVE_C_API nve_host_table_config_t            nve_host_table_config_default(void)
  * @param patch Output patch version.
  */
 NVE_C_API nve_status_t nve_version(int32_t* major, int32_t* minor, int32_t* patch);
-
-/* ============================================================================
- * Plugin loading
- * ============================================================================ */
-
-/**
- * Load a host-table plugin shared object.
- *
- * @param plugin_name Shared object name/path, for example
- *        "libnve-plugin-abseil.so" or "/tmp/my_plugin.so".
- */
-NVE_C_API nve_status_t nve_load_host_table_plugin(const char* plugin_name);
 
 /* ============================================================================
  * Thread Pool
@@ -561,67 +563,38 @@ NVE_C_API nve_status_t nve_table_get_lookup_counter(const nve_table_t table, nve
  * ============================================================================ */
 
 /**
- * Create a host-table factory from a JSON description. The JSON must select a
- * registered plugin implementation (load plugins first via
- * nve_load_host_table_plugin) and supply any implementation-specific options.
+ * Create a table factory from a plugin shared object. Loads the plugin
+ * (internal C++ ABI or external pure-C ABI) and creates its table factory.
+ * The factory and every table it produces keep the plugin loaded for their
+ * own lifetimes.
  * @param out Output factory handle.
- * @param json_config JSON string describing the factory configuration.
+ * @param plugin_path Plugin shared object name/path, for example
+ *        "libnve-plugin-abseil.so" or "/tmp/my_plugin.so".
+ * @param json_config JSON string with plugin-specific factory options
+ *        (pass "{}" when the plugin needs none).
  */
-NVE_C_API nve_status_t nve_create_host_table_factory(
-    nve_host_factory_t* out, const char* json_config);
+NVE_C_API nve_status_t nve_create_table_factory(
+    nve_table_factory_t* out, const char* plugin_path, const char* json_config);
 
 /**
- * Destroy a host-table factory handle. Tables produced from the factory are
+ * Destroy a table factory handle. Tables produced from the factory are
  * independent and remain valid.
  * @param factory Factory handle to destroy.
  */
-NVE_C_API nve_status_t nve_host_factory_destroy(nve_host_factory_t factory);
+NVE_C_API nve_status_t nve_table_factory_destroy(nve_table_factory_t factory);
 
 /**
- * Produce a host table from a factory.
- * @param factory Factory handle created by nve_create_host_table_factory.
+ * Produce a table from a factory. The handle's key type is derived from the
+ * produced table's key size (4 -> NVE_KEY_INT32, 8 -> NVE_KEY_INT64); other
+ * key sizes are rejected.
+ * @param factory Factory handle created by nve_create_table_factory.
  * @param table_id Numeric ID for the table.
- * @param json_config JSON string with table configuration (mask_size, key_size, etc.).
+ * @param json_config JSON string with table configuration (key_size, etc.).
  * @param out Output table handle.
  */
-NVE_C_API nve_status_t nve_host_factory_produce(
-    nve_host_factory_t factory, int64_t table_id,
+NVE_C_API nve_status_t nve_table_factory_produce(
+    nve_table_factory_t factory, int64_t table_id,
     const char* json_config, nve_table_t* out);
-
-/**
- * Build a complete host database from JSON configuration.
- * Loads plugins, creates factories, and produces tables as specified. JSON
- * "plugins" entries are shared object names/paths passed directly to dlopen().
- * @param json_config JSON string with host_database configuration.
- * @param out_tables Output array of table handles (caller must free with nve_free_host_database).
- * @param out_ids Output array of table IDs (parallel to out_tables).
- * @param out_count Number of tables created.
- */
-NVE_C_API nve_status_t nve_build_host_database(
-    const char* json_config,
-    nve_table_t** out_tables, int64_t** out_ids, int64_t* out_count);
-
-/**
- * Free the arrays returned by nve_build_host_database. Destroys each table
- * handle in `tables` and frees both arrays.
- * @param tables Table-handle array returned by nve_build_host_database.
- * @param ids Table-id array returned by nve_build_host_database.
- * @param count Number of entries (same value returned in `out_count`).
- */
-NVE_C_API nve_status_t nve_free_host_database(
-    nve_table_t* tables, int64_t* ids, int64_t count);
-
-/**
- * Get the number of entries in a host table.
- * @param table Host table handle.
- * @param ctx Execution context.
- * @param exact Non-zero requests an accurate count; zero permits an
- *        approximate count for backends where the exact size is expensive
- *        to compute.
- * @param out Output entry count.
- */
-NVE_C_API nve_status_t nve_host_table_size(
-    const nve_table_t table, nve_context_t ctx, int exact, int64_t* out);
 
 /* ============================================================================
  * Embedding Layers

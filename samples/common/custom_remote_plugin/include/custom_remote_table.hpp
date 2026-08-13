@@ -42,7 +42,7 @@ class CustomRemoteTable final : public HostTableLike {
   void clear(context_ptr_t& ctx) override;
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
@@ -70,11 +70,11 @@ class CustomRemoteTable final : public HostTableLike {
  * CustomRemoteTableFactory
  * ============================================================================ */
 
-class CustomRemoteTableFactory final : public HostTableLikeFactory {
+class CustomRemoteTableFactory final : public TableFactory {
  public:
   CustomRemoteTableFactory() = default;
 
-  host_table_ptr_t produce(table_id_t id, const nlohmann::json& json) override;
+  table_ptr_t produce(table_id_t id, const nlohmann::json& json) override;
 };
 
 }  // namespace nve

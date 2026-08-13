@@ -85,7 +85,7 @@ class EmbeddingLayerBase {
       const void* keys,                 // input keys
       void* output,                     // embedding vector output buffer per table
       const int64_t output_stride,      // row stride per output buffer
-      max_bitmask_repr_t* hitmask,      // bitmask where the i'th bit is 1 iff it was resolved by the
+      bitmask64_t* hitmask,      // bitmask where the i'th bit is 1 iff it was resolved by the
                                         // lookup. null implies no hitmask result is required
       const PoolingParams* pool_params, // Pooling params, null implies no pooling (i.e. concat)
       float* hitrates                   // array of hitrates achieved for each table [device,host,remote]

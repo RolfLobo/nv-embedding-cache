@@ -42,15 +42,13 @@ void from_json(const nlohmann::json& json, AbseilFlatMapTableConfig& conf);
 
 void to_json(nlohmann::json& json, const AbseilFlatMapTableConfig& conf);
 
-template <typename MaskType, typename KeyType, typename MetaType, typename PartitionerType>
-class AbseilFlatMapTable final : public STLContainerTable<AbseilFlatMapTableConfig, MaskType,
+template <typename KeyType, typename MetaType, typename PartitionerType>
+class AbseilFlatMapTable final : public STLContainerTable<AbseilFlatMapTableConfig,
                                                           KeyType, MetaType, PartitionerType> {
  public:
   using base_type =
-      STLContainerTable<AbseilFlatMapTableConfig, MaskType, KeyType, MetaType, PartitionerType>;
+      STLContainerTable<AbseilFlatMapTableConfig, KeyType, MetaType, PartitionerType>;
   using config_type = typename base_type::config_type;
-  using mask_type = typename base_type::mask_type;
-  using mask_repr_type = typename base_type::mask_repr_type;
   using key_type = typename base_type::key_type;
   using meta_type = typename base_type::meta_type;
 

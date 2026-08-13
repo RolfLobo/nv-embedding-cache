@@ -27,13 +27,6 @@
 #include <allocator.hpp>
 
 namespace nve {
-  /**
- * Round up a value using a given base.
- */
-template<typename T>
-inline T round_up(T val, T base) {
-    return ((val + base - 1) / base) * base;
-}
 
 /**
  * Get largest available huge page bits for a given size. This value is needed when calling mmap()

@@ -57,12 +57,10 @@ void from_json(const nlohmann::json& json, NvhmMapTableConfig& conf);
 
 void to_json(nlohmann::json& json, const NvhmMapTableConfig& conf);
 
-template <typename MaskType, typename MapType, typename PartitionerType>
+template <typename MapType, typename PartitionerType>
 class NvhmMapTable final : public HostTable<NvhmMapTableConfig> {
  public:
   using base_type = HostTable<NvhmMapTableConfig>;
-  using mask_type = MaskType;
-  using mask_repr_type = typename mask_type::repr_type;
   using map_type = MapType;
   using key_type = typename map_type::key_type;
   using meta_type = std::conditional_t<map_type::has_values, typename map_type::value_type, void>;
@@ -89,7 +87,7 @@ class NvhmMapTable final : public HostTable<NvhmMapTableConfig> {
   void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) override;
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t value_stride,
@@ -104,11 +102,11 @@ class NvhmMapTable final : public HostTable<NvhmMapTableConfig> {
 
  private:
   template <size_t KeyFetchQueueLength, bool PrefetchValues>
-  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, mask_repr_type* hit_mask,
+  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
                 int64_t value_stride, char* values, int64_t* value_sizes) const;
 
   template <size_t KeyFetchQueueLength, bool PrefetchValues, bool WithValues, bool WithValueSizes>
-  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, mask_repr_type* hit_mask,
+  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
                 int64_t value_stride, char* values, int64_t* value_sizes) const;
 
  private:

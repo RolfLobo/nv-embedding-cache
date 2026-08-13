@@ -24,6 +24,7 @@
 
 #include "include/buffer_wrapper.hpp"
 #include "include/host_table.hpp"
+#include "include/plugin/plugin_loader.hpp"
 
 namespace nve {
 
@@ -43,26 +44,28 @@ std::string get_file_extension(const std::string& filepath) {
 
 }  // namespace
 
-host_table_ptr_t create_table_from_plugin(const std::string& plugin_name,
-                                          const nlohmann::json& factory_config,
-                                          const nlohmann::json& table_config,
-                                          table_id_t table_id)
+table_ptr_t create_table_from_plugin(const std::string& plugin_name,
+                                     const nlohmann::json& factory_config,
+                                     const nlohmann::json& table_config,
+                                     table_id_t table_id)
 {
     NVE_CHECK_(!plugin_name.empty(),
                "create_table_from_plugin: plugin shared object must not be empty");
-    NVE_CHECK_(factory_config.is_object() && factory_config.contains("implementation"),
-               "create_table_from_plugin: factory_config must be a JSON object containing an 'implementation' key");
+    NVE_CHECK_(factory_config.is_object(),
+               "create_table_from_plugin: factory_config must be a JSON object");
     NVE_CHECK_(table_config.is_object(),
                "create_table_from_plugin: table_config must be a JSON object");
 
-    load_host_table_plugin(plugin_name);
-    auto factory = create_host_table_factory(factory_config);
+    // The stack Plugin may die here: the factory (and every table it
+    // produces) retains the shared-library lease on its own.
+    Plugin plugin(plugin_name);
+    auto factory = plugin.create_table_factory(factory_config);
     NVE_CHECK_(factory != nullptr,
                "create_table_from_plugin: failed to create host-table factory for plugin '" + plugin_name + "'");
-    auto host_tab = factory->produce(table_id, table_config);
-    NVE_CHECK_(host_tab != nullptr,
-               "create_table_from_plugin: failed to produce host table for plugin '" + plugin_name + "'");
-    return host_tab;
+    auto table = factory->produce(table_id, table_config);
+    NVE_CHECK_(table != nullptr,
+               "create_table_from_plugin: failed to produce table for plugin '" + plugin_name + "'");
+    return table;
 }
 
 void insert_keys_from_tensor_file(table_ptr_t table,

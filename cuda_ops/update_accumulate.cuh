@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 #include "kernels_common.cuh"
 #include "cuda_ops/cuda_common.h"
+#include "include/key_utils.hpp"
 
 namespace nve {
 
@@ -31,7 +32,8 @@ __global__ void UpdateTableKernel
     const uint32_t embed_width_in_bytes,
     const uint32_t embed_src_stride_in_bytes,
     const uint32_t embed_dst_stride_in_bytes,
-    const int32_t num_indices)
+    const int32_t num_indices,
+    const uint64_t num_rows)
 {
     const int id = blockIdx.x * blockDim.y + threadIdx.y;
 
@@ -40,6 +42,11 @@ __global__ void UpdateTableKernel
     }
 
     KeyType key = indices[id];
+
+    // Silently ignore keys that fall outside the table
+    if (!key_in_range(key, num_rows)) {
+      return;
+    }
 
     const DataType* embed_src = reinterpret_cast<const DataType*>(src + id * embed_src_stride_in_bytes);
     DataType* embed_dst = reinterpret_cast<DataType*>(embedding_table + key * embed_dst_stride_in_bytes);
@@ -59,7 +66,8 @@ __global__ void UpdateAccumulateTableKernel(
       const uint32_t embed_width,
       const uint32_t embed_src_stride,
       const uint32_t embed_dst_stride,
-      const int32_t num_indices)
+      const int32_t num_indices,
+      const uint64_t num_rows)
 {
     const int id = blockIdx.x * blockDim.y + threadIdx.y;
 
@@ -68,6 +76,11 @@ __global__ void UpdateAccumulateTableKernel(
     }
 
     KeyType key = indices[id];
+
+    // Silently ignore keys that fall outside the table
+    if (!key_in_range(key, num_rows)) {
+      return;
+    }
 
     const DataType* embed_src = src + id * embed_src_stride;
     DataType* embed_dst = embedding_table + key * embed_dst_stride;
@@ -86,13 +99,14 @@ void CallUpdateKernelVecTypeSubwarp(
                               const uint32_t embed_src_stride_in_bytes,
                               const uint32_t embed_dst_stride_in_bytes,
                               const int32_t num_indices,
+                              const uint64_t num_rows,
                               const cudaStream_t stream = 0)
 {
     uint32_t indices_per_warp = 32 / SubwarpWidth;
     dim3 grid_size ((num_indices + indices_per_warp - 1) / indices_per_warp, 1);
     dim3 block_size (SubwarpWidth, indices_per_warp);
     UpdateTableKernel<SubwarpWidth, KeyType, DataType><<<grid_size, block_size, 0, stream>>>(
-        src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices);
+        src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows);
     NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
 }
 
@@ -104,34 +118,37 @@ void CallUpdatKernelVecType(const int8_t* __restrict__ src,
                             const uint32_t embed_src_stride_in_bytes,
                             const uint32_t embed_dst_stride_in_bytes,
                             const int32_t num_indices,
+                            const uint64_t num_rows,
                             const cudaStream_t stream = 0)
 {
     uint32_t subgroupWidth = std::min(nextPow2(embed_width_in_bytes / sizeof(DataType)), 32u);
     switch (subgroupWidth)
     {
     case 32:
-        CallUpdateKernelVecTypeSubwarp<32, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<32, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     case 16:
-        CallUpdateKernelVecTypeSubwarp<16, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<16, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     case 8:
-        CallUpdateKernelVecTypeSubwarp<8, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<8, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     case 4:
-        CallUpdateKernelVecTypeSubwarp<4, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<4, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     case 2:
-        CallUpdateKernelVecTypeSubwarp<2, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<2, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     case 1:
-        CallUpdateKernelVecTypeSubwarp<1, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+        CallUpdateKernelVecTypeSubwarp<1, KeyType, DataType>(src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
         break;
     default:
         NVE_THROW_("Unsupported kernel dimensions ", subgroupWidth);
     }
 }
 
+// Writes src rows into embedding_table[key]. num_rows is the row count of embedding_table:
+// keys outside [0, num_rows) are ignored.
 template<typename KeyType>
 void UpdateTable(const void* src,
                  const KeyType* indices,
@@ -140,24 +157,25 @@ void UpdateTable(const void* src,
                  const uint32_t embed_src_stride_in_bytes,
                  const uint32_t embed_dst_stride_in_bytes,
                  const int32_t num_indices,
+                 const uint64_t num_rows,
                  const cudaStream_t stream)
 {
     if ((embed_width_in_bytes % 16) == 0) {
       using Vec4 = typename VecWidthHelper<float>::Vec4;
       CallUpdatKernelVecType<KeyType, Vec4>(reinterpret_cast<const int8_t*>(src), indices, reinterpret_cast<int8_t*>(embedding_table),
-                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
     } else if ((embed_width_in_bytes % 8) == 0) {
       using Vec2 = typename VecWidthHelper<float>::Vec2;
       CallUpdatKernelVecType<KeyType, Vec2>(reinterpret_cast<const int8_t*>(src), indices, reinterpret_cast<int8_t*>(embedding_table),
-                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
     } else if ((embed_width_in_bytes % 4) == 0) {
       using Vec1 = typename VecWidthHelper<float>::Vec1;
       CallUpdatKernelVecType<KeyType, Vec1>(reinterpret_cast<const int8_t*>(src), indices, reinterpret_cast<int8_t*>(embedding_table),
-                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
     } else if ((embed_width_in_bytes % 2) == 0) {
       using Vec1 = typename VecWidthHelper<__half>::Vec1;
       CallUpdatKernelVecType<KeyType, Vec1>(reinterpret_cast<const int8_t*>(src), indices, reinterpret_cast<int8_t*>(embedding_table),
-                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, stream);
+                                            embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows, stream);
     } 
 }
 
@@ -170,16 +188,19 @@ void CallUpdateAccumulateKernelSubwarp(
                               const uint32_t embed_src_stride,
                               const uint32_t embed_dst_stride,
                               const int32_t num_indices,
+                              const uint64_t num_rows,
                               const cudaStream_t stream = 0)
 {
     uint32_t indices_per_warp = 32 / SubwarpWidth;
     dim3 grid_size ((num_indices + indices_per_warp - 1) / indices_per_warp, 1);
     dim3 block_size (SubwarpWidth, indices_per_warp);
     UpdateAccumulateTableKernel<SubwarpWidth, KeyType, DataType><<<grid_size, block_size, 0, stream>>>(
-        src, indices, embedding_table, embed_width, embed_src_stride, embed_dst_stride, num_indices);
+        src, indices, embedding_table, embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows);
     NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
 }
 
+// Accumulates src rows into embedding_table[key]. num_rows is the row count of embedding_table:
+// keys outside [0, num_rows) are ignored.
 template<typename KeyType, typename DataType>
 void UpdateAccumulateTable(const DataType* src,
                            const KeyType* indices,
@@ -188,6 +209,7 @@ void UpdateAccumulateTable(const DataType* src,
                            const uint32_t embed_src_stride,
                            const uint32_t embed_dst_stride,
                            const int32_t num_indices,
+                           const uint64_t num_rows,
                            const cudaStream_t stream)
 {
     uint32_t subgroupWidth = std::min(nextPow2(embed_width), 32u);
@@ -196,32 +218,32 @@ void UpdateAccumulateTable(const DataType* src,
       case 32:
           CallUpdateAccumulateKernelSubwarp<32, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       case 16:
           CallUpdateAccumulateKernelSubwarp<16, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       case 8:
           CallUpdateAccumulateKernelSubwarp<8, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       case 4:
           CallUpdateAccumulateKernelSubwarp<4, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       case 2:
           CallUpdateAccumulateKernelSubwarp<2, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       case 1:
           CallUpdateAccumulateKernelSubwarp<1, KeyType, DataType>(
               src, indices, embedding_table,
-              embed_width, embed_src_stride, embed_dst_stride, num_indices, stream);
+              embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows, stream);
           break;
       default:
           NVE_THROW_("Unsupported kernel dimensions ", subgroupWidth);

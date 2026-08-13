@@ -17,6 +17,8 @@ After installing NVE, you also need to install the benchmarks' requirements, usi
 ```bash
 pip install -r benchmarks/requirements.txt
 ```
+Finally, you'll need to install torchrec and fbgemm_gpu.
+
 The examples below were measured on GB200 using driver version: 590.48.01
 
 ## Single GPU Benchmark

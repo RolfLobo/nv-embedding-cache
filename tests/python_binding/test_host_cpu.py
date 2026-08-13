@@ -30,7 +30,7 @@ import torch
 
 def _make_layer(num_embeddings, embed_size, weight, *, storage_kind):
     if storage_kind == "memblock":
-        memblock = nve.UserMemBlock(weight.data_ptr())
+        memblock = nve.UserMemBlock(weight.data_ptr(), weight.nbytes)
         layer = nve_layers.NVEmbedding(
             num_embeddings, embed_size, torch.float32,
             layer_type=nve_layers.LayerType.HostLayer,

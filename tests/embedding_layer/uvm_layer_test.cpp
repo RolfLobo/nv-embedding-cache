@@ -24,6 +24,7 @@
 #include <execution_context.hpp>
 #include <gpu_table.hpp>
 #include <host_table.hpp>
+#include <key_utils.hpp>
 #include <memory>
 #include <string>
 #include <thread>
@@ -125,6 +126,7 @@ class UVMLayerTest {
       cfg.max_modify_size = MAX_MODIFY_SIZE;
       cfg.row_size_in_bytes = row_size;
       cfg.uvm_table = m_linear_table;
+      cfg.uvm_num_rows = m_max_rows;
       cfg.count_misses = true;
       cfg.value_dtype = data_type;
       cfg.private_stream = private_stream;
@@ -188,9 +190,9 @@ class UVMLayerTest {
     NVE_CHECK_(output != 0);
     std::vector<int8_t> ref_output(output_size);
 
-    int64_t mask_bits_per_elem = static_cast<int64_t>(sizeof(max_bitmask_repr_t) * 8);
+    int64_t mask_bits_per_elem = static_cast<int64_t>(sizeof(bitmask64_t) * 8);
     auto hitmask_size = static_cast<size_t>((num_keys + mask_bits_per_elem - 1) / mask_bits_per_elem);
-    std::vector<max_bitmask_repr_t> ref_hitmask(hitmask_size);
+    std::vector<bitmask64_t> ref_hitmask(hitmask_size);
 
     std::vector<float> hitrates(3);
 
@@ -202,8 +204,8 @@ class UVMLayerTest {
     {
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
           m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
-      auto hit_mask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
-          m_ctx, "hit_mask", ref_hitmask.data(), hitmask_size * sizeof(max_bitmask_repr_t));
+      auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
+          m_ctx, "hit_mask", ref_hitmask.data(), hitmask_size * sizeof(bitmask64_t));
       auto values_bw = std::make_shared<BufferWrapper<void>>(
           m_ctx, "values", ref_output.data(),
           static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
@@ -809,6 +811,7 @@ static void RunQuantUVMLookup(DataType_t dtype, PoolingType_t pooling, int64_t h
   cfg.row_size_in_bytes = row_bytes;
   cfg.value_dtype = dtype;
   cfg.uvm_table = h_table;
+  cfg.uvm_num_rows = num_rows;
   cfg.count_misses = true;
   auto gpu_tab = std::make_shared<GpuTable<IndexT>>(cfg);
 
@@ -878,6 +881,190 @@ static void RunQuantUVMLookup(DataType_t dtype, PoolingType_t pooling, int64_t h
   ctx->wait();
   ctx.reset();
   NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+// Lookups of keys outside [0, uvm_num_rows) must resolve to the configured default row instead of
+// reading past the UVM table. `guard_rows` extra rows past uvm_num_rows hold values no valid row
+// can produce, so out of range keys aimed at them are visible in the output.
+// With auto-inserts enabled the same batch is looked up twice: the second lookup exercises the keys
+// promoted into the GPU cache by the first, which must not turn an out of range key into a hit on
+// stale data.
+template <typename IndexT>
+static void RunUVMDefaultRowLookup(bool pooled, uint64_t kernel_mode, bool auto_insert) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  constexpr int device_id = 0;
+  ScopedDevice dev(device_id);
+
+  constexpr int64_t num_rows = 4096;
+  constexpr int64_t guard_rows = 8;
+  constexpr int64_t default_row_index = 11;
+  constexpr int64_t hotness = 4;
+  constexpr int64_t value_count = 32;
+  constexpr int64_t row_bytes = value_count * static_cast<int64_t>(sizeof(float));
+
+  float* h_table = nullptr;
+  NVE_CHECK_(cudaMallocHost(&h_table, static_cast<size_t>((num_rows + guard_rows) * row_bytes)));
+  for (int64_t r = 0; r < num_rows + guard_rows; ++r) {
+    for (int64_t e = 0; e < value_count; ++e) {
+      const float value = static_cast<float>(r * 100) + static_cast<float>(e);
+      h_table[r * value_count + e] = (r < num_rows) ? value : -value;
+    }
+  }
+
+  GPUTableConfig cfg;
+  cfg.device_id = device_id;
+  cfg.cache_size = 1l << 20;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = DataType_t::Float32;
+  cfg.uvm_table = h_table;
+  cfg.uvm_num_rows = num_rows;
+  cfg.count_misses = true;
+  cfg.kernel_mode_type = kernel_mode;
+  auto gpu_tab = std::make_shared<GpuTable<IndexT>>(cfg);
+
+  typename LinearUVMEmbeddingLayer<IndexT>::Config lcfg;
+  if (auto_insert) {
+    lcfg.insert_heuristic = std::make_shared<TestInsertHeuristic>();
+    lcfg.min_insert_freq_gpu = 0;
+    lcfg.min_insert_size_gpu = 1;
+  } else {
+    lcfg.insert_heuristic = std::make_shared<NeverInsertHeuristic>();
+  }
+  lcfg.default_row_index = default_row_index;
+  auto layer = std::make_shared<LinearUVMEmbeddingLayer<IndexT>>(lcfg, gpu_tab);
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  // Every 3rd key is out of range: negative, or aimed at a guard row past the end of the table.
+  constexpr int64_t num_keys = 64;
+  std::vector<IndexT> keys(static_cast<size_t>(num_keys));
+  std::vector<IndexT> resolved(static_cast<size_t>(num_keys));  // row each key must read
+  for (int64_t i = 0; i < num_keys; ++i) {
+    const auto idx = static_cast<size_t>(i);
+    if ((i % 3) == 1) {
+      keys[idx] = static_cast<IndexT>(-(i + 1));
+    } else if ((i % 3) == 2) {
+      keys[idx] = static_cast<IndexT>(num_rows + (i % guard_rows));
+    } else {
+      keys[idx] = static_cast<IndexT>(i);
+    }
+    resolved[idx] = key_in_range(keys[idx], num_rows) ? keys[idx]
+                                                      : static_cast<IndexT>(default_row_index);
+  }
+
+  const int64_t output_bags = pooled ? (num_keys / hotness) : num_keys;
+  const size_t output_bytes = static_cast<size_t>(output_bags * row_bytes);
+  float* output = nullptr;
+  NVE_CHECK_(cudaMallocHost(&output, output_bytes));
+
+  EmbeddingLayerBase::PoolingParams pp;
+  pp.pooling_type = PoolingType_t::Sum;
+  pp.sparse_type = SparseType_t::Fixed;
+  pp.fixed_hotness = hotness;
+  pp.output_type = DataType_t::Float32;
+
+  const int num_lookups = auto_insert ? 2 : 1;
+  for (int attempt = 0; attempt < num_lookups; ++attempt) {
+    std::memset(output, 0, output_bytes);
+    std::vector<float> hitrates(3);
+    layer->lookup(ctx, num_keys, keys.data(), output, row_bytes, nullptr /*hitmask*/,
+                  pooled ? &pp : nullptr, hitrates.data());
+    ctx->wait();  // auto-inserts run on the thread pool, wait for the promotion to land
+    NVE_CHECK_(cudaDeviceSynchronize());
+    if (auto_insert && (attempt > 0)) {
+      // The first lookup promotes the keys it resolved, which includes the default row - so the
+      // repeat lookup is fully served by the cache. A miss here means the out of range keys were
+      // promoted as themselves instead of as the default row.
+      EXPECT_FLOAT_EQ(1.0f, hitrates[0]);
+    }
+
+    // Reference: out of range keys contribute the default row, in a bag like anywhere else
+    for (int64_t b = 0; b < output_bags; ++b) {
+      for (int64_t e = 0; e < value_count; ++e) {
+        float expected = 0.0f;
+        if (pooled) {
+          for (int64_t h = 0; h < hotness; ++h) {
+            expected += h_table[resolved[static_cast<size_t>(b * hotness + h)] * value_count + e];
+          }
+        } else {
+          expected = h_table[resolved[static_cast<size_t>(b)] * value_count + e];
+        }
+        ASSERT_FLOAT_EQ(expected, output[b * value_count + e])
+            << "lookup " << attempt << " output row " << b << " element " << e;
+      }
+    }
+  }
+
+  NVE_CHECK_(cudaFreeHost(output));
+  ctx->wait();
+  ctx.reset();
+  NVE_CHECK_(cudaFreeHost(h_table));
+}
+
+TEST(UVMOutOfRangeKeys, LookupReturnsDefaultRow) {
+  RunUVMDefaultRowLookup<int64_t>(false /*pooled*/, 0 /*kernel_mode: default*/, false /*auto_insert*/);
+}
+
+TEST(UVMOutOfRangeKeys, LookupReturnsDefaultRowInt32) {
+  RunUVMDefaultRowLookup<int32_t>(false /*pooled*/, 0 /*kernel_mode: default*/, false /*auto_insert*/);
+}
+
+TEST(UVMOutOfRangeKeys, LookupReturnsDefaultRowSortGather) {
+  RunUVMDefaultRowLookup<int64_t>(false /*pooled*/,
+                                  static_cast<uint64_t>(KernelType::SortGather), false /*auto_insert*/);
+}
+
+TEST(UVMOutOfRangeKeys, PooledLookupPoolsDefaultRow) {
+  RunUVMDefaultRowLookup<int64_t>(true /*pooled*/, 0 /*kernel_mode: default*/, false /*auto_insert*/);
+}
+
+// Auto-inserts promote the looked up keys into the GPU cache, so a repeated lookup must keep
+// returning the default row for out of range keys rather than whatever the promotion cached.
+TEST(UVMOutOfRangeKeys, LookupWithAutoInsertStaysConsistent) {
+  RunUVMDefaultRowLookup<int64_t>(false /*pooled*/, 0 /*kernel_mode: default*/, true /*auto_insert*/);
+}
+
+TEST(UVMOutOfRangeKeys, PooledLookupWithAutoInsertStaysConsistent) {
+  RunUVMDefaultRowLookup<int64_t>(true /*pooled*/, 0 /*kernel_mode: default*/, true /*auto_insert*/);
+}
+
+TEST(UVMValidation, RejectsDefaultRowOutsideTable) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  constexpr int64_t num_rows = 64;
+  constexpr int64_t row_bytes = 32;
+  std::vector<int8_t> table(static_cast<size_t>(num_rows * row_bytes));
+
+  GPUTableConfig cfg;
+  cfg.device_id = 0;
+  cfg.cache_size = 1l << 16;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = DataType_t::Float32;
+  cfg.uvm_table = table.data();
+  cfg.uvm_num_rows = num_rows;
+  auto gpu_tab = std::make_shared<GpuTable<int64_t>>(cfg);
+
+  typename LinearUVMEmbeddingLayer<int64_t>::Config lcfg;
+  lcfg.insert_heuristic = std::make_shared<NeverInsertHeuristic>();
+  lcfg.default_row_index = num_rows;
+  EXPECT_THROW((void)std::make_shared<LinearUVMEmbeddingLayer<int64_t>>(lcfg, gpu_tab), Exception);
+}
+
+TEST(UVMValidation, RejectsNumRowsOutsideKeyType) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  constexpr int64_t row_bytes = 32;
+  std::vector<int8_t> table(static_cast<size_t>(row_bytes));
+
+  GPUTableConfig cfg;
+  cfg.device_id = 0;
+  cfg.cache_size = 1l << 16;
+  cfg.row_size_in_bytes = row_bytes;
+  cfg.value_dtype = DataType_t::Float32;
+  cfg.uvm_table = table.data();
+  cfg.uvm_num_rows = int64_t{1} << 31;
+  auto gpu_tab = std::make_shared<GpuTable<int32_t>>(cfg);
+
+  typename LinearUVMEmbeddingLayer<int32_t>::Config lcfg;
+  lcfg.insert_heuristic = std::make_shared<NeverInsertHeuristic>();
+  EXPECT_THROW((void)std::make_shared<LinearUVMEmbeddingLayer<int32_t>>(lcfg, gpu_tab), Exception);
 }
 
 // Concatenate (no pooling) -> find_and_dequant.

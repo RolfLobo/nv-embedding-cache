@@ -19,6 +19,7 @@
 
 #include <buffer_wrapper.hpp>
 #include <gpu_embedding_layer.hpp>
+#include <key_utils.hpp>
 #include "emb_layer_utils.hpp"
 #include <thread>
 #include <cuda_support.hpp>
@@ -386,6 +387,200 @@ TEST(GPUValidation, RejectsNullEmbeddingTable) {
   EXPECT_THROW((void)std::make_shared<GPUEmbeddingLayer<int64_t>>(config), Exception);
 }
 
+TEST(GPUValidation, RejectsZeroNumEmbeddings) {
+  GPUEmbeddingLayerConfig config;
+  config.embedding_table = &config;  // Only required to be non-null before the row count check.
+  config.num_embeddings = 0;
+  config.embedding_width_in_bytes = sizeof(float);
+  config.value_dtype = DataType_t::Float32;
+
+  EXPECT_THROW((void)std::make_shared<GPUEmbeddingLayer<int64_t>>(config), Exception);
+}
+
+// update/accumulate must ignore keys outside [0, num_embeddings) rather than write past the table.
+// The device buffer holds `guard_rows` extra rows past num_embeddings: out of range keys are aimed
+// at them, so an unchecked write shows up as a modified guard row.
+static void RunGpuLayerOutOfRangeKeysTest(bool accumulate) {
+  using IndexT = int64_t;
+  constexpr int64_t num_rows = 64;
+  constexpr int64_t guard_rows = 8;
+  constexpr int64_t row_size = 128;  // bytes == 32 floats
+  constexpr size_t row_floats = static_cast<size_t>(row_size) / sizeof(float);
+  constexpr size_t total_floats = static_cast<size_t>(num_rows + guard_rows) * row_floats;
+
+  std::vector<float> ref_table(total_floats);
+  for (size_t i = 0; i < total_floats; ++i) {
+    ref_table[i] = static_cast<float>(i);
+  }
+  float* d_table = nullptr;
+  NVE_CHECK_(cudaMalloc(&d_table, total_floats * sizeof(float)));
+  NVE_CHECK_(cudaMemcpy(d_table, ref_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
+
+  GPUEmbeddingLayerConfig cfg;
+  cfg.device_id = 0;
+  cfg.num_embeddings = num_rows;
+  cfg.embedding_width_in_bytes = row_size;
+  cfg.embedding_table = d_table;
+  cfg.value_dtype = DataType_t::Float32;
+  auto layer = std::make_shared<GPUEmbeddingLayer<IndexT>>(cfg);
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  // Every 7th key is out of range: negative, or aimed at a guard row past the end of the table.
+  constexpr int64_t num_keys = num_rows;
+  std::vector<IndexT> keys(static_cast<size_t>(num_keys));
+  for (int64_t i = 0; i < num_keys; ++i) {
+    if ((i % 7) == 1) {
+      keys[static_cast<size_t>(i)] = -(i + 1);
+    } else if ((i % 7) == 3) {
+      keys[static_cast<size_t>(i)] = num_rows + (i % guard_rows);
+    } else {
+      keys[static_cast<size_t>(i)] = i;
+    }
+  }
+
+  std::vector<float> updates(static_cast<size_t>(num_keys) * row_floats);
+  for (int64_t i = 0; i < num_keys; ++i) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      updates[static_cast<size_t>(i) * row_floats + j] = static_cast<float>(1000 + i) + static_cast<float>(j);
+    }
+  }
+
+  // Reference: apply the in-range keys only
+  for (int64_t i = 0; i < num_keys; ++i) {
+    const IndexT key = keys[static_cast<size_t>(i)];
+    if (key < 0 || key >= num_rows) {
+      continue;
+    }
+    for (size_t j = 0; j < row_floats; ++j) {
+      float& dst = ref_table[static_cast<size_t>(key) * row_floats + j];
+      const float src = updates[static_cast<size_t>(i) * row_floats + j];
+      dst = accumulate ? (dst + src) : src;
+    }
+  }
+
+  if (accumulate) {
+    layer->accumulate(ctx, num_keys, keys.data(), row_size, row_size, updates.data(),
+                      DataType_t::Float32, -1 /*table_id*/);
+  } else {
+    layer->update(ctx, num_keys, keys.data(), row_size, row_size, updates.data(), -1 /*table_id*/);
+  }
+  NVE_CHECK_(cudaDeviceSynchronize());
+
+  std::vector<float> result(total_floats);
+  NVE_CHECK_(cudaMemcpy(result.data(), d_table, total_floats * sizeof(float), cudaMemcpyDeviceToHost));
+  for (int64_t r = 0; r < num_rows + guard_rows; ++r) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      const size_t idx = static_cast<size_t>(r) * row_floats + j;
+      ASSERT_FLOAT_EQ(ref_table[idx], result[idx])
+          << (r >= num_rows ? "guard row " : "row ") << r << " float " << j;
+    }
+  }
+
+  NVE_CHECK_(cudaFree(d_table));
+}
+
+// Lookups of keys outside [0, num_embeddings) must resolve to the configured default row instead of
+// reading past the table. The device buffer holds `guard_rows` extra rows past num_embeddings with
+// values no valid row can produce, so out of range keys aimed at them are visible in the output.
+static void RunGpuLayerDefaultRowLookupTest(bool pooled) {
+  using IndexT = int64_t;
+  constexpr int64_t num_rows = 64;
+  constexpr int64_t guard_rows = 8;
+  constexpr int64_t row_size = 128;  // bytes == 32 floats
+  constexpr int64_t default_row_index = 7;
+  constexpr int64_t hotness = 2;
+  constexpr size_t row_floats = static_cast<size_t>(row_size) / sizeof(float);
+  constexpr size_t total_floats = static_cast<size_t>(num_rows + guard_rows) * row_floats;
+
+  std::vector<float> host_table(total_floats);
+  for (int64_t r = 0; r < num_rows + guard_rows; ++r) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      const float value = static_cast<float>(r * 100) + static_cast<float>(j);
+      host_table[static_cast<size_t>(r) * row_floats + j] = (r < num_rows) ? value : -value;
+    }
+  }
+  float* d_table = nullptr;
+  NVE_CHECK_(cudaMalloc(&d_table, total_floats * sizeof(float)));
+  NVE_CHECK_(cudaMemcpy(d_table, host_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
+
+  GPUEmbeddingLayerConfig cfg;
+  cfg.device_id = 0;
+  cfg.num_embeddings = num_rows;
+  cfg.embedding_width_in_bytes = row_size;
+  cfg.embedding_table = d_table;
+  cfg.value_dtype = DataType_t::Float32;
+  cfg.default_row_index = default_row_index;
+  auto layer = std::make_shared<GPUEmbeddingLayer<IndexT>>(cfg);
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  // Every 3rd key is out of range: negative, or aimed at a guard row past the end of the table.
+  constexpr int64_t num_keys = 32;
+  std::vector<IndexT> keys(static_cast<size_t>(num_keys));
+  std::vector<IndexT> resolved(static_cast<size_t>(num_keys));  // row each key must read
+  for (int64_t i = 0; i < num_keys; ++i) {
+    const auto idx = static_cast<size_t>(i);
+    if ((i % 3) == 1) {
+      keys[idx] = -(i + 1);
+    } else if ((i % 3) == 2) {
+      keys[idx] = num_rows + (i % guard_rows);
+    } else {
+      keys[idx] = i;
+    }
+    resolved[idx] = key_in_range(keys[idx], num_rows) ? keys[idx] : default_row_index;
+  }
+
+  const int64_t output_rows = pooled ? (num_keys / hotness) : num_keys;
+  std::vector<float> output(static_cast<size_t>(output_rows) * row_floats, 0.f);
+
+  EmbeddingLayerBase::PoolingParams pp;
+  pp.pooling_type = PoolingType_t::Sum;
+  pp.sparse_type = SparseType_t::Fixed;
+  pp.fixed_hotness = hotness;
+  pp.output_type = DataType_t::Float32;
+  layer->lookup(ctx, num_keys, keys.data(), output.data(), row_size, nullptr /*hitmask*/,
+                pooled ? &pp : nullptr, nullptr /*hitrates*/);
+  ctx->wait();
+
+  // Reference: out of range keys contribute the default row, in a bag like anywhere else
+  for (int64_t out = 0; out < output_rows; ++out) {
+    for (size_t j = 0; j < row_floats; ++j) {
+      float expected = 0.f;
+      if (pooled) {
+        for (int64_t k = 0; k < hotness; ++k) {
+          expected += host_table[static_cast<size_t>(resolved[static_cast<size_t>(out * hotness + k)]) * row_floats + j];
+        }
+      } else {
+        expected = host_table[static_cast<size_t>(resolved[static_cast<size_t>(out)]) * row_floats + j];
+      }
+      ASSERT_FLOAT_EQ(expected, output[static_cast<size_t>(out) * row_floats + j])
+          << "output row " << out << " float " << j;
+    }
+  }
+
+  NVE_CHECK_(cudaFree(d_table));
+}
+
+TEST(GPUValidation, RejectsDefaultRowOutsideTable) {
+  GPUEmbeddingLayerConfig config;
+  config.embedding_table = &config;  // Only required to be non-null before the default row check.
+  config.num_embeddings = 16;
+  config.embedding_width_in_bytes = sizeof(float);
+  config.value_dtype = DataType_t::Float32;
+  config.default_row_index = config.num_embeddings;
+
+  EXPECT_THROW((void)std::make_shared<GPUEmbeddingLayer<int64_t>>(config), Exception);
+}
+
+TEST(GPUValidation, RejectsNumEmbeddingsOutsideKeyType) {
+  GPUEmbeddingLayerConfig config;
+  config.embedding_table = &config;  // Only required to be non-null before the row count check.
+  config.num_embeddings = int64_t{1} << 31;
+  config.embedding_width_in_bytes = sizeof(float);
+  config.value_dtype = DataType_t::Float32;
+
+  EXPECT_THROW((void)std::make_shared<GPUEmbeddingLayer<int32_t>>(config), Exception);
+}
+
 TEST(GPUValidation, RejectsUnsupportedPoolingTypeConversions) {
   int num_devices = 0;
   if (cudaGetDeviceCount(&num_devices) != cudaSuccess || num_devices == 0) {
@@ -412,6 +607,26 @@ bool gpu_test_device_available() {
   return status == cudaSuccess && num_devices > 0;
 }
 
+TEST(GPUOutOfRangeKeys, UpdateIgnoresOutOfRangeKeys) {
+  if (!gpu_test_device_available()) GTEST_SKIP();
+  RunGpuLayerOutOfRangeKeysTest(false /*accumulate*/);
+}
+
+TEST(GPUOutOfRangeKeys, AccumulateIgnoresOutOfRangeKeys) {
+  if (!gpu_test_device_available()) GTEST_SKIP();
+  RunGpuLayerOutOfRangeKeysTest(true /*accumulate*/);
+}
+
+TEST(GPUOutOfRangeKeys, LookupReturnsDefaultRow) {
+  if (!gpu_test_device_available()) GTEST_SKIP();
+  RunGpuLayerDefaultRowLookupTest(false /*pooled*/);
+}
+
+TEST(GPUOutOfRangeKeys, PooledLookupPoolsDefaultRow) {
+  if (!gpu_test_device_available()) GTEST_SKIP();
+  RunGpuLayerDefaultRowLookupTest(true /*pooled*/);
+}
+
 struct CudaFreeDeleter {
   void operator()(void* ptr) const {
     if (ptr) cudaFree(ptr);
@@ -421,7 +636,7 @@ struct CudaFreeDeleter {
 template <typename IndexT>
 class QuantGpuLayerTest {
  public:
-  QuantGpuLayerTest(DataType_t dtype, int64_t value_count = 64)
+  QuantGpuLayerTest(DataType_t dtype, int64_t value_count = 64, int64_t default_row_index = -1)
       : dtype_(dtype), value_count_(value_count),
         row_bytes_(value_count + quant_rowwise_meta_bytes(dtype)),
         output_dtype_(quant_rowwise_output_dtype(dtype)),
@@ -438,6 +653,7 @@ class QuantGpuLayerTest {
     config.num_embeddings = kNumRows;
     config.embedding_width_in_bytes = row_bytes_;
     config.value_dtype = dtype_;
+    config.default_row_index = default_row_index;
     layer_ = std::make_shared<GPUEmbeddingLayer<IndexT>>(config);
     ctx_ = layer_->create_execution_context(0, 0, nullptr, nullptr);
   }
@@ -618,6 +834,45 @@ class QuantGpuLayerTest {
     }
   }
 
+  // Out of range keys must read the default row, both as stored bytes and dequantized: the row's
+  // trailing scale/offset metadata has to come along for the dequantized values to match.
+  void CheckDefaultRowLookup(int64_t default_row_index) {
+    const std::vector<IndexT> lookup_keys{0, -1, kNumRows, kNumRows + 5};
+    const auto num_keys = static_cast<int64_t>(lookup_keys.size());
+    const auto* default_row = host_table_.data() + default_row_index * row_bytes_;
+
+    std::vector<int8_t> raw(static_cast<size_t>(num_keys) * static_cast<size_t>(row_bytes_));
+    layer_->lookup(ctx_, num_keys, lookup_keys.data(), raw.data(), row_bytes_, nullptr, nullptr,
+                   nullptr);
+    ctx_->wait();
+
+    EmbeddingLayerBase::PoolingParams pp;
+    pp.pooling_type = PoolingType_t::Concatenate;
+    pp.output_type = output_dtype_;
+    std::vector<int8_t> dequantized(static_cast<size_t>(num_keys) *
+                                    static_cast<size_t>(output_stride_));
+    layer_->lookup(ctx_, num_keys, lookup_keys.data(), dequantized.data(), output_stride_, nullptr,
+                   &pp, nullptr);
+    ctx_->wait();
+
+    for (int64_t i = 0; i < num_keys; ++i) {
+      const IndexT key = lookup_keys[static_cast<size_t>(i)];
+      const auto* expected_row =
+          key_in_range(key, kNumRows) ? (host_table_.data() + key * row_bytes_) : default_row;
+      EXPECT_EQ(std::memcmp(raw.data() + i * row_bytes_, expected_row,
+                            static_cast<size_t>(row_bytes_)),
+                0)
+          << "raw row mismatch at key index " << i;
+      for (int64_t e = 0; e < value_count_; ++e) {
+        const float expected =
+            load_quant_row_element_as_float(expected_row, e, value_count_, dtype_);
+        ASSERT_NEAR(load_as_float(dequantized.data(), i * value_count_ + e, output_dtype_), expected,
+                    output_dtype_ == DataType_t::Float16 ? 1e-3f : 1e-6f)
+            << "dequantized element " << e << " at key index " << i;
+      }
+    }
+  }
+
   std::shared_ptr<GPUEmbeddingLayer<IndexT>>& layer() { return layer_; }
   context_ptr_t& context() { return ctx_; }
   DataType_t output_dtype() const { return output_dtype_; }
@@ -661,6 +916,13 @@ TEST(GPUQuantRaw, DeviceOutput) {
   QuantGpuLayerTest<int64_t> test(DataType_t::QUint8RowwiseF32);
   test.CheckRawLookup(true);
   test.CheckRawLookup(true, true);
+}
+
+TEST(GPUQuantRaw, OutOfRangeKeysReturnDefaultRow) {
+  if (!gpu_test_device_available()) GTEST_SKIP();
+  constexpr int64_t default_row_index = 5;
+  QuantGpuLayerTest<int64_t> test(DataType_t::QInt8RowwiseF32, 64, default_row_index);
+  test.CheckDefaultRowLookup(default_row_index);
 }
 
 TEST(GPUQuantPool, ConcatF32HostOutput) {

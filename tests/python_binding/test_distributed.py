@@ -26,6 +26,22 @@ from pynve.torch.nve_distributed import TorchDistEnv
 import pytest
 import platform
 
+
+class RetainingTorchDistEnv(TorchDistEnv):
+    """Keep callback buffers alive to verify that their storage is Python-owned."""
+
+    def __init__(self):
+        super().__init__()
+        self.retained_buffers = []
+
+    def broadcast(self, buffer, size, root=0):
+        self.retained_buffers.append(buffer)
+        super().broadcast(buffer, size, root)
+
+    def all_gather(self, send_buffer, recv_buffer, size):
+        self.retained_buffers.extend((send_buffer, recv_buffer))
+        super().all_gather(send_buffer, recv_buffer, size)
+
 def kernel_doesnt_supports_pidfd() -> bool:
     ver = platform.release()
     dot_pos = ver.find('.')
@@ -69,7 +85,7 @@ def main():
         print(args)
 
     dist.init_process_group(backend=args.backend)
-    env = TorchDistEnv()
+    env = RetainingTorchDistEnv()
     match args.data_type:
         case "float32":
             dtype = nve.DataType_t.Float32
@@ -78,6 +94,15 @@ def main():
         case _:
             raise RuntimeError("Invalid data type")
     NVL = nve.DistMemBlock(env, args.embedding_dim, args.num_table_rows, dtype)
+
+    # The trampoline must not expose a borrowed view over its stack/vector
+    # storage. Retained views have a bytearray owner and remain safe to access
+    # after their callback has returned.
+    assert env.retained_buffers
+    for buffer in env.retained_buffers:
+        assert isinstance(buffer.obj, bytearray)
+        if buffer.nbytes:
+            buffer[0] ^= 0xFF
 
     # Must explicitly destroy NVL and env before the dist process group, since dist is needed during their destruction
     NVL = None

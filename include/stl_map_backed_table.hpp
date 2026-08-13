@@ -46,9 +46,14 @@ struct STLContainerTableConfig : public HostTableConfig {
 
   inline int64_t meta_size() const noexcept { return overflow_policy.meta_size(); }
 
-  inline int64_t slot_size() const noexcept { return this->max_value_size + meta_size(); }
+  inline int64_t meta_offset() const noexcept {
+    // To avoid alignment issues with the meta data on some platforms, need to pad the max_value_size.
+    return round_up(this->max_value_size, meta_align(overflow_policy.handler));
+  }
 
-  inline int64_t slot_stride() const noexcept { return next_aligned(slot_size(), value_alignment); }
+  inline int64_t slot_size() const noexcept { return meta_offset() + meta_size(); }
+
+  inline int64_t slot_stride() const noexcept { return round_up(slot_size(), value_alignment); }
 };
 
 void from_json(const nlohmann::json& json, STLContainerTableConfig& conf);
@@ -60,15 +65,12 @@ void to_json(nlohmann::json& json, const STLContainerTableConfig& conf);
  * a last resort, if plugins are not available, and used to sanity check more advanced
  * implementations，
  */
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
-          typename PartitionerType>
+template <typename ConfigType, typename KeyType, typename MetaType, typename PartitionerType>
 class STLContainerTable : public HostTable<ConfigType> {
  public:
   using base_type = HostTable<ConfigType>;
   using config_type = typename base_type::config_type;
   using map_type = typename config_type::template map_type<KeyType>;
-  using mask_type = MaskType;
-  using mask_repr_type = typename mask_type::repr_type;
   using key_type = typename map_type::key_type;
   using meta_type = MetaType;
   template <typename T>
@@ -90,7 +92,7 @@ class STLContainerTable : public HostTable<ConfigType> {
   void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) override;
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t value_stride,
@@ -105,7 +107,7 @@ class STLContainerTable : public HostTable<ConfigType> {
 
  private:
   template <bool PrefetchValues, bool WithValues, bool WithValueSizes>
-  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, mask_repr_type* hit_mask,
+  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
                 int64_t value_stride, char* values, int64_t* value_sizes) const;
 
  protected:
@@ -150,8 +152,8 @@ void from_json(const nlohmann::json& json, STLMapTableConfig& conf);
 
 void to_json(nlohmann::json& json, const STLMapTableConfig& conf);
 
-template <typename MaskType, typename KeyType, typename MetaType, typename PartitionerType>
-using STLMapTable = STLContainerTable<STLMapTableConfig, MaskType, KeyType, MetaType, PartitionerType>;
+template <typename KeyType, typename MetaType, typename PartitionerType>
+using STLMapTable = STLContainerTable<STLMapTableConfig, KeyType, MetaType, PartitionerType>;
 
 struct STLMapTableFactoryConfig : public STLContainerTableFactoryConfig {
   using base_type = STLContainerTableFactoryConfig;

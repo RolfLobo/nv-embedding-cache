@@ -18,6 +18,7 @@
 #include "nve_c_api_internal.hpp"
 #include <buffer_wrapper.hpp>
 #include <json_support.hpp>
+#include <plugin/plugin_loader.hpp>
 
 /* ============================================================================
  * Config conversion helpers
@@ -29,6 +30,7 @@ static nve::GPUTableConfig convert_gpu_table_config(const nve_gpu_table_config_t
   cfg.cache_size = c->cache_size;
   cfg.row_size_in_bytes = c->row_size_in_bytes;
   cfg.uvm_table = c->uvm_table;
+  cfg.uvm_num_rows = c->uvm_num_rows;
   cfg.count_misses = c->count_misses != 0;
   cfg.max_modify_size = c->max_modify_size;
   cfg.value_dtype = convert_dtype(c->value_dtype);
@@ -95,9 +97,9 @@ nve_status_t nve_table_find(
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();
     const auto keys_buffer_size = static_cast<size_t>(n * key_size);
-    constexpr auto hitmask_elem_bits = sizeof(nve::max_bitmask_repr_t) * 8;
+    constexpr auto hitmask_elem_bits = sizeof(nve::bitmask64_t) * 8;
     const auto hitmask_elements = (static_cast<size_t>(n) + hitmask_elem_bits - 1) / hitmask_elem_bits;
-    const auto hitmask_buffer_size = static_cast<size_t>(hitmask_elements * sizeof(nve::max_bitmask_repr_t));
+    const auto hitmask_buffer_size = static_cast<size_t>(hitmask_elements * sizeof(nve::bitmask64_t));
     const auto values_buffer_size = static_cast<size_t>(n * value_stride);
     const auto value_sizes_buffer_size = static_cast<size_t>(n) * sizeof(int64_t);
 
@@ -105,7 +107,7 @@ nve_status_t nve_table_find(
       ? std::make_shared<nve::BufferWrapper<const void>>(ctx->ptr, "keys", keys, keys_buffer_size)
       : nullptr;
     auto hit_mask_bw = hit_mask
-      ? std::make_shared<nve::BufferWrapper<nve::max_bitmask_repr_t>>(ctx->ptr, "hit_mask", hit_mask, hitmask_buffer_size)
+      ? std::make_shared<nve::BufferWrapper<nve::bitmask64_t>>(ctx->ptr, "hit_mask", hit_mask, hitmask_buffer_size)
       : nullptr;
     auto values_bw = values
       ? std::make_shared<nve::BufferWrapper<void>>(ctx->ptr, "values", values, values_buffer_size)
@@ -288,23 +290,35 @@ nve_status_t nve_table_get_lookup_counter(const nve_table_t table, nve_context_t
 }
 
 /* ============================================================================
- * Host Tables (via plugins / JSON config)
+ * Tables (via plugins / JSON config)
  * ============================================================================ */
 
-nve_status_t nve_create_host_table_factory(
-    nve_host_factory_t* out, const char* json_config) {
-  if (!out || !json_config) {
-    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "out and json_config must not be NULL");
+nve_status_t nve_create_table_factory(
+    nve_table_factory_t* out, const char* plugin_path, const char* json_config) {
+  if (out) {
+    *out = NULL;  // never expose a partial handle, whatever fails below
+  }
+  if (!out || !plugin_path || !json_config) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT,
+                         "out, plugin_path, and json_config must not be NULL");
+  }
+  if (plugin_path[0] == '\0') {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "plugin_path must not be empty");
   }
   NVE_C_TRY
     auto json = nlohmann::json::parse(json_config);
-    auto factory = nve::create_host_table_factory(json);
-    *out = new nve_host_factory_s{std::move(factory)};
+    if (!json.is_object()) {
+      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "json_config must be a JSON object");
+    }
+    // The local Plugin may die here: the factory retains the library lease.
+    nve::Plugin plugin{std::filesystem::path{plugin_path}};
+    auto factory = plugin.create_table_factory(json);
+    *out = new nve_table_factory_s{std::move(factory)};
     return NVE_SUCCESS;
   NVE_C_CATCH
 }
 
-nve_status_t nve_host_factory_destroy(nve_host_factory_t factory) {
+nve_status_t nve_table_factory_destroy(nve_table_factory_t factory) {
   if (!factory) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "factory must not be NULL");
   }
@@ -312,93 +326,37 @@ nve_status_t nve_host_factory_destroy(nve_host_factory_t factory) {
   return NVE_SUCCESS;
 }
 
-nve_status_t nve_host_factory_produce(
-    nve_host_factory_t factory, int64_t table_id,
+nve_status_t nve_table_factory_produce(
+    nve_table_factory_t factory, int64_t table_id,
     const char* json_config, nve_table_t* out) {
+  if (out) {
+    *out = NULL;  // never expose a partial handle, whatever fails below
+  }
   if (!factory || !factory->ptr || !json_config || !out) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "factory, json_config, and out must not be NULL");
   }
   NVE_C_TRY
     auto json = nlohmann::json::parse(json_config);
-    auto key_size_it = json.find("key_size");
-    if (key_size_it == json.end()) {
-      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "json_config must contain key_size");
+    if (!json.is_object()) {
+      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "json_config must be a JSON object");
     }
-    int64_t key_size = key_size_it->get<int64_t>();
+    auto table = factory->ptr->produce(table_id, json);
+    if (!table) {
+      return nve_set_error(NVE_ERROR_RUNTIME, "factory produced a null table");
+    }
+    // The produced table's validated key size is authoritative for the C
+    // handle's key type; a classification failure destroys the table normally.
+    const int64_t key_size = table->get_key_size();
     nve_key_type_t key_type;
     if (key_size == 8) {
       key_type = NVE_KEY_INT64;
     } else if (key_size == 4) {
       key_type = NVE_KEY_INT32;
     } else {
-      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "key_size must be 4 or 8");
+      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT,
+                           "produced table reports unsupported key size (must be 4 or 8)");
     }
-    auto table = factory->ptr->produce(table_id, json);
     *out = new nve_table_s{std::move(table), key_type};
-    return NVE_SUCCESS;
-  NVE_C_CATCH
-}
-
-nve_status_t nve_build_host_database(
-    const char* json_config,
-    nve_table_t** out_tables, int64_t** out_ids, int64_t* out_count) {
-  if (!json_config || !out_tables || !out_ids || !out_count) {
-    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "All output pointers must not be NULL");
-  }
-  NVE_C_TRY
-    auto json = nlohmann::json::parse(json_config);
-    auto db = nve::build_host_database(json);
-
-    const size_t count = db.size();
-    auto* tables = new nve_table_t[count]();
-    auto* ids = new int64_t[count]();
-
-    int64_t i = 0;
-    try {
-      for (auto& [id, table_ptr] : db) {
-        ids[i] = id;
-        tables[i] = new nve_table_s{std::move(table_ptr), NVE_KEY_INT64};
-        ++i;
-      }
-    } catch (...) {
-      for (int64_t j = 0; j < i; ++j) {
-        delete tables[j];
-      }
-      delete[] tables;
-      delete[] ids;
-      throw;
-    }
-
-    *out_tables = tables;
-    *out_ids = ids;
-    *out_count = static_cast<int64_t>(count);
-    return NVE_SUCCESS;
-  NVE_C_CATCH
-}
-
-nve_status_t nve_free_host_database(
-    nve_table_t* tables, int64_t* ids, int64_t count) {
-  if (tables) {
-    for (int64_t i = 0; i < count; ++i) {
-      delete tables[i];
-    }
-    delete[] tables;
-  }
-  delete[] ids;
-  return NVE_SUCCESS;
-}
-
-nve_status_t nve_host_table_size(
-    const nve_table_t table, nve_context_t ctx, int exact, int64_t* out) {
-  if (!table || !table->ptr || !ctx || !ctx->ptr || !out) {
-    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "Invalid arguments");
-  }
-  NVE_C_TRY
-    const auto* host_table = dynamic_cast<const nve::HostTableLike*>(table->ptr.get());
-    if (!host_table) {
-      return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "Table is not a host table");
-    }
-    *out = host_table->size(ctx->ptr, exact != 0);
     return NVE_SUCCESS;
   NVE_C_CATCH
 }

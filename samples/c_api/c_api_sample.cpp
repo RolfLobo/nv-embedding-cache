@@ -83,13 +83,10 @@ int main() {
   // ── Step 2: Create NVHM host table ────────────────────────────────────
   printf("\n[2] Creating NVHM host table...\n");
 
-  CHECK_NVE(nve_load_host_table_plugin("libnve-plugin-nvhm.so"));
-
-  nve_host_factory_t factory = nullptr;
-  CHECK_NVE(nve_create_host_table_factory(&factory, R"({"implementation": "nvhm_map"})"));
+  nve_table_factory_t factory = nullptr;
+  CHECK_NVE(nve_create_table_factory(&factory, "libnve-plugin-nvhm.so", "{}"));
 
   const char* host_table_config = R"({
-    "mask_size": 8,
     "key_size": 8,
     "max_value_size": 128,
     "value_dtype": "float32",
@@ -99,7 +96,7 @@ int main() {
   })";
 
   nve_table_t host_table = nullptr;
-  CHECK_NVE(nve_host_factory_produce(factory, 0, host_table_config, &host_table));
+  CHECK_NVE(nve_table_factory_produce(factory, 0, host_table_config, &host_table));
   printf("  NVHM host table created\n");
 
   // ── Step 3: Create hierarchical layer (GPU cache → host table) ────────
@@ -202,7 +199,7 @@ int main() {
   nve_layer_destroy(layer);
   nve_table_destroy(gpu_table);
   nve_table_destroy(host_table);
-  nve_host_factory_destroy(factory);
+  nve_table_factory_destroy(factory);
   printf("  Done.\n");
 
   return 0;

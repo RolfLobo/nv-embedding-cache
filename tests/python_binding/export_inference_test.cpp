@@ -1,0 +1,135 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <gtest/gtest.h>
+
+#include <array>
+#include <string>
+#include <vector>
+
+#include "tests/inference_test_utils.hpp"
+
+namespace {
+
+constexpr char kExportScript[] = R"PY(
+import os
+import sys
+
+import numpy as np
+import torch
+
+import pynve.torch.nve_layers as nve_layers
+import pynve.torch.nve_ps as nve_ps
+from pynve.torch.nve_export import export_aot
+
+save_dir, layer_kind, custom_remote_plugin = sys.argv[1:4]
+num_embeddings = 1024
+embedding_size = 8
+gpu_cache_size = 4 * 1024 * 1024
+device = torch.device("cuda")
+keys = torch.tensor([0, 1, 5, 10], dtype=torch.int64, device=device)
+
+
+class Model(torch.nn.Module):
+    def __init__(self, layer_type, storage=None):
+        super().__init__()
+        kwargs = {
+            "num_embeddings": num_embeddings,
+            "embedding_size": embedding_size,
+            "data_type": torch.float32,
+            "layer_type": layer_type,
+            "optimize_for_training": False,
+            "device": device,
+        }
+        if layer_type != nve_layers.LayerType.GPULayer:
+            kwargs["gpu_cache_size"] = gpu_cache_size
+        if storage is not None:
+            kwargs["storage"] = storage
+        self.emb = nve_layers.NVEmbedding(**kwargs)
+
+    def forward(self, input_keys):
+        return self.emb(input_keys)
+
+
+export_options = {}
+if layer_kind == "linear_uvm":
+    model = Model(nve_layers.LayerType.LinearUVM)
+elif layer_kind == "gpu":
+    model = Model(nve_layers.LayerType.GPULayer)
+elif layer_kind == "custom_remote":
+    parameter_server = nve_ps.NVEParameterServer(
+        num_embeddings=num_embeddings,
+        embedding_size=embedding_size,
+        data_type=torch.float32,
+        plugin_name=custom_remote_plugin,
+        factory_config={"implementation": "custom_remote"},
+        table_config={"key_size": 8, "max_value_size": embedding_size * 4},
+    )
+    all_keys = torch.arange(num_embeddings, dtype=torch.int64)
+    all_values = torch.arange(num_embeddings, dtype=torch.float32) \
+        .unsqueeze(1).expand(num_embeddings, embedding_size).contiguous()
+    parameter_server.insert(all_keys, all_values)
+    model = Model(nve_layers.LayerType.Hierarchical, parameter_server)
+    keys_path = os.path.join(save_dir, "keys.npy")
+    values_path = os.path.join(save_dir, "values.npy")
+    np.save(keys_path, all_keys.numpy())
+    np.save(values_path, all_values.numpy())
+    export_options["ps_data_paths"] = {"emb": (keys_path, values_path)}
+else:
+    raise ValueError(f"Unknown layer kind: {layer_kind}")
+
+if layer_kind != "custom_remote":
+    weights = torch.arange(num_embeddings, dtype=torch.float32, device=device) \
+        .unsqueeze(1).expand(num_embeddings, embedding_size)
+    model.emb.weight.data.copy_(weights)
+
+export_aot(model, (keys,), save_dir, **export_options)
+)PY";
+
+void expect_known_inference_output(const std::string& output) {
+  constexpr std::array<const char*, 5> kExpectedOutput{
+      "Output shape: [4, 8]", "key=0 -> [0, 0, 0, 0", "key=1 -> [1, 1, 1, 1",
+      "key=5 -> [5, 5, 5, 5", "key=10 -> [10, 10, 10, 10"};
+  for (const char* expected : kExpectedOutput) {
+    EXPECT_NE(output.find(expected), std::string::npos)
+        << "Missing output: " << expected << "\nProcess output:\n" << output;
+  }
+}
+
+class NVEExportInferenceTest : public ::testing::TestWithParam<const char*> {};
+
+TEST_P(NVEExportInferenceTest, ExportAndRunCppInference) {
+  const nve_test::TemporaryDirectory export_directory("nve-export-inference-test");
+  const std::string save_dir = export_directory.path().string();
+
+  const nve_test::ProcessResult export_result = nve_test::run_process(
+      {NVE_TEST_PYTHON_EXECUTABLE, "-c", kExportScript, save_dir, GetParam(),
+       NVE_TEST_CUSTOM_REMOTE_PLUGIN});
+  ASSERT_EQ(export_result.exit_code, 0)
+      << "Python export failed:\n" << export_result.output;
+
+  const nve_test::ProcessResult inference_result =
+      nve_test::run_process({NVE_TEST_INFERENCE_EXECUTABLE, save_dir});
+  ASSERT_EQ(inference_result.exit_code, 0)
+      << "C++ inference failed:\n" << inference_result.output;
+  expect_known_inference_output(inference_result.output);
+}
+
+INSTANTIATE_TEST_SUITE_P(LayerTypes, NVEExportInferenceTest,
+                         ::testing::Values("linear_uvm", "gpu", "custom_remote"));
+
+}  // namespace

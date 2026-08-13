@@ -379,10 +379,9 @@ def main():
             keys = torch.arange(start_key, end_key, device="cuda")
             if perm != None:
                 keys = perm[keys]
-            model.insert(keys, values, 0)
-            if model.layer_type == nve_layers.LayerType.Hierarchical:
-                model.insert(keys, values, 1)
-                model.insert(keys, values, 2) # Calling insert on a nonexistent table is safe, will only yield a warning.
+            # Prefill every table the layer has
+            for table_id in model.table_ids:
+                model.insert(keys, values, table_id)
             start_key += batch_size
 
     # move if needed

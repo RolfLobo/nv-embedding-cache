@@ -41,6 +41,7 @@ nve_status_t nve_gpu_embedding_layer_create(
     cfg.num_embeddings = config->num_embeddings;
     cfg.embedding_width_in_bytes = config->embedding_width_in_bytes;
     cfg.value_dtype = convert_dtype(config->value_dtype);
+    cfg.default_row_index = config->default_row_index;
 
     auto alloc = unwrap_allocator(allocator);
     std::shared_ptr<nve::EmbeddingLayerBase> layer;
@@ -84,6 +85,7 @@ nve_status_t nve_linear_uvm_layer_create(
         cfg.insert_heuristic = unwrap_heuristic(config->insert_heuristic);
         cfg.min_insert_freq_gpu = config->min_insert_freq_gpu;
         cfg.min_insert_size_gpu = config->min_insert_size_gpu;
+        cfg.default_row_index = config->default_row_index;
         auto gpu_tbl = std::static_pointer_cast<nve::GpuTable<int32_t>>(gpu_table->ptr);
         layer = std::make_shared<nve::LinearUVMEmbeddingLayer<int32_t>>(cfg, gpu_tbl, alloc);
         break;
@@ -94,6 +96,7 @@ nve_status_t nve_linear_uvm_layer_create(
         cfg.insert_heuristic = unwrap_heuristic(config->insert_heuristic);
         cfg.min_insert_freq_gpu = config->min_insert_freq_gpu;
         cfg.min_insert_size_gpu = config->min_insert_size_gpu;
+        cfg.default_row_index = config->default_row_index;
         auto gpu_tbl = std::static_pointer_cast<nve::GpuTable<int64_t>>(gpu_table->ptr);
         layer = std::make_shared<nve::LinearUVMEmbeddingLayer<int64_t>>(cfg, gpu_tbl, alloc);
         break;

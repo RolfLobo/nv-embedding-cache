@@ -48,16 +48,8 @@ class RuntimeError<ECError> : public Exception {
   RuntimeError() = delete;
 
   inline RuntimeError(const char file[], const int line, const char expr[],
-                      const ECError& error, const std::string& hint) noexcept
+                      const ECError& error, const std::string& hint)
       : base_type(file, line, expr, hint), error_{error} {}
-
-  inline RuntimeError(const RuntimeError& that) noexcept : base_type(that), error_{that.error_} {}
-
-  inline RuntimeError& operator=(const RuntimeError& that) noexcept {
-    base_type::operator=(that);
-    error_ = that.error_;
-    return *this;
-  }
 
   inline ECError error() const noexcept { return error_; }
 
@@ -249,7 +241,7 @@ public:
     const float hitrate,
     const int64_t num_keys,
     const int64_t output_stride,
-    std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw = nullptr,
+    std::shared_ptr<BufferWrapper<bitmask64_t>> hitmask_bw = nullptr,
     const bool insert_from_uvm = false);
   void lock_modify();
   void unlock_modify();
@@ -279,7 +271,7 @@ private:
   void collect_keys_and_data(
     std::shared_ptr<BufferWrapper<const void>>& keys_bw,
     std::shared_ptr<BufferWrapper<void>>& output_bw,
-    std::shared_ptr<BufferWrapper<max_bitmask_repr_t>>& hitmask_bw,
+    std::shared_ptr<BufferWrapper<bitmask64_t>>& hitmask_bw,
     cudaStream_t lookup_stream,
     const int64_t num_keys);
   void launch_insert(
@@ -301,7 +293,7 @@ int64_t get_lookup_output_rows(
 
 /**
  * Pool/dequantize a host-resident gather buffer into a host-resident output buffer using the
- * CPU pooling kernels (cpu_ops/cpu_pooling.h). Shared by the host layer and by the hierarchical
+ * CPU pooling kernels (cpu_ops/cpu_pooling.hpp). Shared by the host layer and by the hierarchical
  * layer's no-GPU-tier pooling path.
  *
  * `gather_host` holds `num_keys` raw stored rows at `gather_stride` (each `row_size` bytes,

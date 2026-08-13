@@ -19,21 +19,23 @@
 #include "third_party/pybind11/include/pybind11/functional.h"
 #include "third_party/dlpack/include/dlpack/dlpack.h"
 #include "binding_layers.hpp"
+#include "binding_util.hpp"
 #include "binding_tables.hpp"
 #include "binding_serialization.hpp"
 #include "include/memblock.hpp"
+#include "cuda_ops/cuda_common.h"
 #ifdef NVE_WITH_TORCH_BINDINGS
 #include "python/pynve/torch_bindings/nve_registry.hpp"
 #endif
 #include "third_party/pybind11/include/pybind11/stl.h"
 #include "include/distributed.hpp"
+#include <cstring>
 
 namespace py = pybind11;
 using IndexT = int64_t;
 
 namespace nve {
 
-   
     void insert_keys_from_numpy_file(std::shared_ptr<ParameterServerTable> table,
                                      py::object keys_stream,
                                      py::object values_stream,
@@ -126,11 +128,21 @@ namespace nve {
         int local_device() const override { PYBIND11_OVERRIDE_PURE(int, DistributedEnv, local_device); }
         bool single_host() const override { PYBIND11_OVERRIDE_PURE(bool, DistributedEnv, single_host); }
         void barrier() override { PYBIND11_OVERRIDE_PURE(void, DistributedEnv, barrier); }
+        // The Python overrides receive bounded writable memoryviews backed by
+        // Python-owned staging buffers. Retaining a view after the callback is
+        // therefore safe; changes are copied back before the C++ buffer expires.
         void broadcast(uintptr_t buffer, size_t size, int root) override {
-            PYBIND11_OVERRIDE_PURE(void, DistributedEnv, broadcast, buffer, size, root);
+            py::gil_scoped_acquire gil;
+            StagedWritableMemoryView staged(reinterpret_cast<void*>(buffer), size);
+            PYBIND11_OVERRIDE_PURE(void, DistributedEnv, broadcast, staged.view(), size, root);
         }
         void all_gather(uintptr_t send_buffer, uintptr_t recv_buffer, size_t size) override {
-            PYBIND11_OVERRIDE_PURE(void, DistributedEnv, all_gather, send_buffer, recv_buffer, size);
+            py::gil_scoped_acquire gil;
+            StagedWritableMemoryView send(reinterpret_cast<void*>(send_buffer), size);
+            StagedWritableMemoryView recv(
+                reinterpret_cast<void*>(recv_buffer), size * world_size());
+            PYBIND11_OVERRIDE_PURE(
+                void, DistributedEnv, all_gather, send.view(), recv.view(), size);
         }
     };
 
@@ -173,6 +185,7 @@ PYBIND11_MODULE(nve, m) {
         .def_readwrite("kernel_mode_value_1", &EmbedLayerConfig::kernel_mode_value_1)
         .def_readwrite("kernel_mode_value_2", &EmbedLayerConfig::kernel_mode_value_2)
         .def_readwrite("max_modify_size", &EmbedLayerConfig::max_modify_size)
+        .def_readwrite("default_row_index", &EmbedLayerConfig::default_row_index)
         .def("to_json", [](const EmbedLayerConfig& c) {
             return nlohmann::json(c).dump();
         }, "Serialize the config to a JSON string.");
@@ -216,7 +229,35 @@ PYBIND11_MODULE(nve, m) {
 
     py::class_<MemBlock, std::shared_ptr<MemBlock>>(m, "MemBlock")
         .def("get_handle", &MemBlock::get_handle)
-        .def("get_type", &MemBlock::get_type);
+        .def("get_type", &MemBlock::get_type)
+        .def("get_size_in_bytes", &MemBlock::get_size_in_bytes)
+        .def("copy_from", [](MemBlock& self, py::buffer src) {
+            py::buffer_info info = src.request();
+            py::ssize_t expected_stride = info.itemsize;
+            for (py::ssize_t i = info.ndim - 1; i >= 0; --i) {
+                if (info.shape[i] > 1 && info.strides[i] != expected_stride) {
+                    NVE_THROW_ARG_("copy_from: source buffer must be C-contiguous");
+                }
+                expected_stride *= info.shape[i];
+            }
+            size_t nbytes = static_cast<size_t>(info.size) * static_cast<size_t>(info.itemsize);
+            size_t capacity = self.get_size_in_bytes();
+            if (nbytes > capacity)
+                throw std::out_of_range(
+                    "copy_from: source is " + std::to_string(nbytes) +
+                    " bytes but memblock holds " + std::to_string(capacity) + " bytes");
+            if (driver_available()) {
+                // Under UVA, cudaMemcpyDefault handles host, managed and
+                // device-resident memblocks alike.
+                NVE_CHECK_(cudaMemcpy(self.get_ptr(), info.ptr, nbytes, cudaMemcpyDefault));
+            } else if (nbytes != 0) {
+                // HostMemBlock and host UserMemBlock remain usable on systems
+                // without a CUDA driver, where even host-to-host cudaMemcpy
+                // fails before performing the copy.
+                std::memcpy(self.get_ptr(), info.ptr, nbytes);
+            }
+        }, py::arg("src"),
+        "Copy a buffer-protocol object (numpy array, bytes, ...) into the memblock, bounds-checked.");
 
     py::class_<LinearMemBlock, MemBlock, std::shared_ptr<LinearMemBlock>>(m, "LinearMemBlock")
         .def(py::init<size_t, size_t, nve::DataType_t, int>(),
@@ -242,7 +283,7 @@ PYBIND11_MODULE(nve, m) {
         .def(py::init<std::shared_ptr<DistributedEnv>, size_t, size_t, nve::DataType_t>());
 
     py::class_<UserMemBlock, MemBlock, std::shared_ptr<UserMemBlock>>(m, "UserMemBlock")
-        .def(py::init<uint64_t>());
+        .def(py::init<uint64_t, size_t>(), py::arg("ptr"), py::arg("size"));
 
     py::class_<ManagedMemBlock, MemBlock, std::shared_ptr<ManagedMemBlock>>(m, "ManagedMemBlock")
         .def(py::init<size_t, size_t, nve::DataType_t, std::vector<int>>());
@@ -319,11 +360,6 @@ PYBIND11_MODULE(nve, m) {
         .def("barrier", &DistributedEnv::barrier)
         .def("broadcast", &DistributedEnv::broadcast)
         .def("all_gather", &DistributedEnv::all_gather);
-
-    m.def("raw_copy",
-        [](uintptr_t dst, uintptr_t src, uint64_t size) {
-            std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size);
-        }, "An auxiliary function to copy from raw pointers");
 
     m.def("get_dl_tensor", &get_dl_tensor);
     m.def("write_tensor_to_stream",

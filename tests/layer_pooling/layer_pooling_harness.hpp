@@ -66,6 +66,9 @@
 #include <hierarchical_embedding_layer.hpp>
 #include <host_embedding_layer.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
+
+#include "test_utils.hpp"
 #include <linear_embedding_layer.hpp>
 #include <linear_host_table.hpp>
 #include <nve_types.hpp>
@@ -75,14 +78,6 @@
 
 namespace nve {
 namespace layer_pooling {
-
-inline void LoadPhmapPlugin() {
-  static const bool loaded = [] {
-    load_host_table_plugin("libnve-plugin-phmap.so");
-    return true;
-  }();
-  (void)loaded;
-}
 
 // ---------------------------------------------------------------------------
 // Test matrix
@@ -733,6 +728,7 @@ class PoolingHarness {
     hcfg.value_dtype    = c_.in_dtype;
     hcfg.max_threads    = 64;
     hcfg.max_value_size = in_row_bytes_;
+    hcfg.num_rows       = c_.num_rows;
     hcfg.emb_table      = h_table_;       // full backing table, shared with the reference
     host_tab_ = std::make_shared<LinearHostTable<IndexT>>(hcfg);
 
@@ -747,6 +743,7 @@ class PoolingHarness {
     cfg.value_dtype    = c_.in_dtype;
     cfg.max_threads    = 64;
     cfg.max_value_size = in_row_bytes_;
+    cfg.num_rows       = c_.num_rows;
     cfg.emb_table      = h_table_;
     host_tab_ = std::make_shared<LinearHostTable<IndexT>>(cfg);
 
@@ -759,9 +756,7 @@ class PoolingHarness {
     // A two-tier host hierarchy: a bounded parallel hash map acts as a small cache in front of a
     // LinearHostTable containing every row. gpu_device_ stays -1, so the layer takes its CPU
     // pool/dequant path (pool_gathered_host), the same kernels the Host layer uses.
-    LoadPhmapPlugin();
     const nlohmann::json phmap_cfg = {
-        {"mask_size", sizeof(max_bitmask_repr_t)},
         {"key_size", sizeof(IndexT)},
         {"max_value_size", in_row_bytes_},
         {"value_dtype", to_string(c_.in_dtype)},
@@ -773,14 +768,14 @@ class PoolingHarness {
          {{"overflow_margin", kHostCacheRows / kHostCachePartitions},
           {"handler", "evict_lru"},
           {"resolution_margin", 0.5}}}};
-    host_table_factory_ptr_t phmap_factory{
-        create_host_table_factory(nlohmann::json{{"implementation", "phmap_flat_map"}})};
-    host_cache_tab_ = phmap_factory->produce(4714, phmap_cfg);
+    table_factory_ptr_t phmap_factory{nve_test::plugin_factory("phmap")};
+    host_cache_tab_ = std::dynamic_pointer_cast<HostTableLike>(phmap_factory->produce(4714, phmap_cfg));
 
     LinearHostTableConfig hcfg;
     hcfg.value_dtype    = c_.in_dtype;
     hcfg.max_threads    = 64;
     hcfg.max_value_size = in_row_bytes_;
+    hcfg.num_rows       = c_.num_rows;
     hcfg.emb_table      = h_table_;
     host_tab_ = std::make_shared<LinearHostTable<IndexT>>(hcfg);
 
@@ -797,6 +792,7 @@ class PoolingHarness {
     cfg.cache_size       = int64_t(1) << 20;
     cfg.row_size_in_bytes = in_row_bytes_;
     cfg.uvm_table        = h_table_;     // every key resolves via the UVM fallback
+    cfg.uvm_num_rows     = c_.num_rows;
     cfg.count_misses     = true;         // required to report hitrates
     cfg.value_dtype      = c_.in_dtype;
     return std::make_shared<GpuTable<IndexT>>(cfg);

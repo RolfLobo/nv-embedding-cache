@@ -7,9 +7,10 @@ The header is [`include/nve_c_api.h`](../include/nve_c_api.h).
 ## Compilation
 
 Link with `libnve-common.so` and `libcudart.so`, the same as for the C++ API.
-Pass host table plugins to `nve_load_host_table_plugin()` as shared object
+Pass table plugins to `nve_create_table_factory()` as shared object
 names that the dynamic linker can resolve (e.g. `libnve-plugin-nvhm.so`) or as
-explicit paths (e.g. `/tmp/my_plugin.so`).
+explicit paths (e.g. `/tmp/my_plugin.so`). See [plugins.md](plugins.md) for the
+full plugin system documentation.
 
 ```c
 #include <nve_c_api.h>
@@ -49,7 +50,7 @@ All objects are represented as opaque handles:
 | `nve_layer_t` | Embedding layer |
 | `nve_context_t` | Execution context |
 | `nve_heuristic_t` | Insert heuristic |
-| `nve_host_factory_t` | Host table factory |
+| `nve_table_factory_t` | Table factory (plugin) |
 | `nve_thread_pool_t` | Thread pool |
 | `nve_allocator_t` | Memory allocator |
 
@@ -112,21 +113,25 @@ nve_gpu_table_create(&gpu_table, NVE_KEY_INT64, &cfg, NULL);
 
 ### Host Tables (via plugins)
 
-Host tables are created through a two-step factory pattern:
+Host tables are created through a factory pattern:
 
-1. Load a plugin and create a factory with an implementation-specific JSON config
+1. Create a factory from a plugin shared object with a plugin-specific JSON config
 2. Produce tables from the factory with a table-specific JSON config
 
+`nve_create_table_factory()` loads the plugin and creates its table factory in
+one call. The factory and every table it produces keep the plugin loaded for
+their own lifetimes. The JSON config contains only plugin-specific options —
+pass `"{}"` when the plugin needs none. See [plugins.md](plugins.md) for the
+full plugin documentation, including how to write your own plugin.
+
 ```c
-// Load plugin and create factory
-nve_load_host_table_plugin("libnve-plugin-nvhm.so");
-nve_host_factory_t factory = NULL;
-nve_create_host_table_factory(&factory, "{\"implementation\": \"nvhm_map\"}");
+// Create factory from a plugin shared object
+nve_table_factory_t factory = NULL;
+nve_create_table_factory(&factory, "libnve-plugin-nvhm.so", "{}");
 
 // Produce a table
 nve_table_t host_table = NULL;
-nve_host_factory_produce(factory, 0, "{"
-    "\"mask_size\": 8,"
+nve_table_factory_produce(factory, 0, "{"
     "\"key_size\": 8,"
     "\"max_value_size\": 128,"
     "\"value_dtype\": \"float32\","
@@ -136,14 +141,20 @@ nve_host_factory_produce(factory, 0, "{"
 "}", &host_table);
 ```
 
-Available plugin implementations:
-- `nvhm_map` — NVIDIA nvHashMap
-- `abseil_flat_map` — Google Abseil
-- `phmap_flat_map` — Parallel Hashmap
-- `redis_cluster` — Redis backend (requires `"address"` in factory config). Connects to a Redis
-  **Cluster** by default, or to a **standalone single-node** server when `"single_node": true` — see
-  [Redis backend configuration](#redis-backend-configuration) below.
-- `rocksdb` — RocksDB
+`nve_table_factory_produce()` derives the handle's key type from the produced
+table's key size (4 → `NVE_KEY_INT32`, 8 → `NVE_KEY_INT64`); other key sizes
+are rejected. Table configs still carry `key_size` where the table needs it
+for its own configuration.
+
+Available in-tree plugins:
+- `libnve-plugin-nvhm.so` — NVIDIA nvHashMap
+- `libnve-plugin-abseil.so` — Google Abseil
+- `libnve-plugin-phmap.so` — Parallel Hashmap
+- `libnve-plugin-stl-map.so` — STL `std::unordered_map` (reference plugin)
+- `libnve-plugin-redis.so` — Redis backend (requires `"address"` in factory config). Connects to a
+  Redis **Cluster** by default, or to a **standalone single-node** server when
+  `"single_node": true` — see [Redis backend configuration](#redis-backend-configuration) below.
+- `libnve-plugin-rocksdb.so` — RocksDB
 
 #### Redis backend configuration
 
@@ -162,15 +173,12 @@ option and the table's `num_partitions`:
 
 ```c
 // Cluster mode: shard across Redis hashes.
-nve_load_host_table_plugin("libnve-plugin-redis.so");
-nve_host_factory_t cluster_factory = NULL;
-nve_create_host_table_factory(&cluster_factory, "{"
-    "\"implementation\": \"redis_cluster\","
+nve_table_factory_t cluster_factory = NULL;
+nve_create_table_factory(&cluster_factory, "libnve-plugin-redis.so", "{"
     "\"address\": \"localhost:7000\""
 "}");
 nve_table_t cluster_table = NULL;
-nve_host_factory_produce(cluster_factory, 0, "{"
-    "\"mask_size\": 8,"
+nve_table_factory_produce(cluster_factory, 0, "{"
     "\"key_size\": 8,"
     "\"max_value_size\": 128,"
     "\"value_dtype\": \"float32\","
@@ -178,15 +186,13 @@ nve_host_factory_produce(cluster_factory, 0, "{"
 "}", &cluster_table);
 
 // Standalone string mode: single-node Redis with MSET/MGET.
-nve_host_factory_t standalone_factory = NULL;
-nve_create_host_table_factory(&standalone_factory, "{"
-    "\"implementation\": \"redis_cluster\","
+nve_table_factory_t standalone_factory = NULL;
+nve_create_table_factory(&standalone_factory, "libnve-plugin-redis.so", "{"
     "\"address\": \"localhost:6379\","
     "\"single_node\": true"
 "}");
 nve_table_t standalone_table = NULL;
-nve_host_factory_produce(standalone_factory, 0, "{"
-    "\"mask_size\": 8,"
+nve_table_factory_produce(standalone_factory, 0, "{"
     "\"key_size\": 8,"
     "\"max_value_size\": 128,"
     "\"value_dtype\": \"float32\","
@@ -195,7 +201,7 @@ nve_host_factory_produce(standalone_factory, 0, "{"
 "}", &standalone_table);
 ```
 
-Factory config options (`nve_create_host_table_factory`):
+Factory config options (`nve_create_table_factory`):
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -207,7 +213,7 @@ Factory config options (`nve_create_host_table_factory`):
 | `connections_per_node` | `5` | Max parallel connections per Redis node. In standalone string mode set this `≥ num_partitions` so the parallel work isn't bottlenecked on the pool. |
 | `use_tls` | `false` | Encrypt connections with TLS (with `ca_certificate`, `client_certificate`, `client_key`, `server_name_identification`). |
 
-Table config options (`nve_host_factory_produce`), in addition to the common fields above:
+Table config options (`nve_table_factory_produce`), in addition to the common fields above:
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -252,6 +258,7 @@ cfg.embedding_table = d_table_ptr;  // GPU memory pointer
 cfg.num_embeddings = 1024;
 cfg.embedding_width_in_bytes = 128;
 cfg.value_dtype = NVE_DTYPE_FLOAT32;
+cfg.default_row_index = 0;  // optional: row returned for keys outside [0, num_embeddings)
 
 nve_layer_t layer = NULL;
 nve_gpu_embedding_layer_create(&layer, NVE_KEY_INT64, &cfg, NULL);
@@ -272,10 +279,13 @@ nve_gpu_table_create(&gpu_table, NVE_KEY_INT64, &gpu_cfg, NULL);
 
 nve_linear_uvm_layer_config_t cfg = nve_linear_uvm_layer_config_default();
 cfg.layer_name = "my_uvm_layer";
+cfg.default_row_index = 0;  // optional: row returned for keys outside [0, uvm_num_rows)
 
 nve_layer_t layer = NULL;
 nve_linear_uvm_layer_create(&layer, NVE_KEY_INT64, &cfg, gpu_table, NULL);
 ```
+
+Both layers fill the caller-owned row named by `default_row_index` into the output of any key outside the table, and update/accumulate ignore such keys. Leaving `default_row_index` negative (the default) skips the range check, and looking up an out of range key is then undefined.
 
 ### Hierarchical Embedding Layer
 
@@ -298,13 +308,11 @@ CPU-only layer wrapping one host table. The table must use the same key type as 
 
 ```c
 // Create any host table first, for example through a plugin factory.
-nve_load_host_table_plugin("libnve-plugin-nvhm.so");
-nve_host_factory_t factory = NULL;
-nve_create_host_table_factory(&factory, "{\"implementation\": \"nvhm_map\"}");
+nve_table_factory_t factory = NULL;
+nve_create_table_factory(&factory, "libnve-plugin-nvhm.so", "{}");
 
 nve_table_t host_table = NULL;
-nve_host_factory_produce(factory, 0, "{"
-    "\"mask_size\": 8,"
+nve_table_factory_produce(factory, 0, "{"
     "\"key_size\": 8,"
     "\"max_value_size\": 128,"
     "\"value_dtype\": \"float32\","

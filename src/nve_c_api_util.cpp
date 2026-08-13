@@ -16,8 +16,6 @@
  */
 
 #include "nve_c_api_internal.hpp"
-#include <host_table.hpp>
-#include <climits>
 
 extern "C" {
 
@@ -36,20 +34,6 @@ nve_status_t nve_version(int32_t* major, int32_t* minor, int32_t* patch) {
 }
 
 /* ============================================================================
- * Plugin loading
- * ============================================================================ */
-
-nve_status_t nve_load_host_table_plugin(const char* plugin_name) {
-  if (!plugin_name) {
-    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "plugin_name must not be NULL");
-  }
-  NVE_C_TRY
-    nve::load_host_table_plugin(plugin_name);
-    return NVE_SUCCESS;
-  NVE_C_CATCH
-}
-
-/* ============================================================================
  * Config defaults
  * ============================================================================ */
 
@@ -59,6 +43,7 @@ nve_gpu_table_config_t nve_gpu_table_config_default(void) {
   c.cache_size = 0;
   c.row_size_in_bytes = 0;
   c.uvm_table = NULL;
+  c.uvm_num_rows = 0;
   c.count_misses = 1;
   c.max_modify_size = 1 << 20;
   c.value_dtype = NVE_DTYPE_UNKNOWN;
@@ -81,6 +66,7 @@ nve_gpu_embedding_layer_config_t nve_gpu_embedding_layer_config_default(void) {
   c.num_embeddings = 0;
   c.embedding_width_in_bytes = 0;
   c.value_dtype = NVE_DTYPE_UNKNOWN;
+  c.default_row_index = -1;
   return c;
 }
 
@@ -90,6 +76,7 @@ nve_linear_uvm_layer_config_t nve_linear_uvm_layer_config_default(void) {
   c.insert_heuristic = NULL;
   c.min_insert_freq_gpu = 0;
   c.min_insert_size_gpu = 1 << 16;
+  c.default_row_index = -1;
   return c;
 }
 
@@ -115,8 +102,9 @@ nve_host_embedding_layer_config_t nve_host_embedding_layer_config_default(void) 
 }
 
 nve_overflow_policy_config_t nve_overflow_policy_config_default(void) {
+  const nve::OverflowPolicyConfig defaults;
   nve_overflow_policy_config_t c;
-  c.overflow_margin = INT64_MAX;
+  c.overflow_margin = defaults.overflow_margin;
   c.handler = NVE_OVERFLOW_EVICT_RANDOM;
   c.resolution_margin = 0.8;
   return c;
@@ -124,7 +112,6 @@ nve_overflow_policy_config_t nve_overflow_policy_config_default(void) {
 
 nve_host_table_config_t nve_host_table_config_default(void) {
   nve_host_table_config_t c;
-  c.mask_size = 64;
   c.key_size = 8;
   c.max_value_size = 8;
   c.value_dtype = NVE_DTYPE_UNKNOWN;
@@ -138,22 +125,45 @@ nve_host_table_config_t nve_host_table_config_default(void) {
  * Enum conversion implementations
  * ============================================================================ */
 
-nve::DataType_t convert_dtype(nve_data_type_t dt) {
+namespace nve {
+
+DataType_t convert_external_dtype(nve_data_type_t dt) noexcept {
   switch (dt) {
-    case NVE_DTYPE_UNKNOWN:  return nve::DataType_t::Unknown;
-    case NVE_DTYPE_FLOAT32:  return nve::DataType_t::Float32;
-    case NVE_DTYPE_BFLOAT16: return nve::DataType_t::BFloat;
-    case NVE_DTYPE_FLOAT16:  return nve::DataType_t::Float16;
-    case NVE_DTYPE_E4M3:     return nve::DataType_t::E4M3;
-    case NVE_DTYPE_E5M2:     return nve::DataType_t::E5M2;
-    case NVE_DTYPE_FLOAT64:  return nve::DataType_t::Float64;
-    case NVE_DTYPE_QINT8_ROWWISE_F32: return nve::DataType_t::QInt8RowwiseF32;
-    case NVE_DTYPE_QINT8_ROWWISE_F16: return nve::DataType_t::QInt8RowwiseF16;
-    case NVE_DTYPE_QUINT8_ROWWISE_F32: return nve::DataType_t::QUint8RowwiseF32;
-    case NVE_DTYPE_QUINT8_ROWWISE_F16: return nve::DataType_t::QUint8RowwiseF16;
+    case NVE_DTYPE_UNKNOWN:  return DataType_t::Unknown;
+    case NVE_DTYPE_FLOAT32:  return DataType_t::Float32;
+    case NVE_DTYPE_BFLOAT16: return DataType_t::BFloat;
+    case NVE_DTYPE_FLOAT16:  return DataType_t::Float16;
+    case NVE_DTYPE_E4M3:     return DataType_t::E4M3;
+    case NVE_DTYPE_E5M2:     return DataType_t::E5M2;
+    case NVE_DTYPE_FLOAT64:  return DataType_t::Float64;
+    case NVE_DTYPE_QINT8_ROWWISE_F32: return DataType_t::QInt8RowwiseF32;
+    case NVE_DTYPE_QINT8_ROWWISE_F16: return DataType_t::QInt8RowwiseF16;
+    case NVE_DTYPE_QUINT8_ROWWISE_F32: return DataType_t::QUint8RowwiseF32;
+    case NVE_DTYPE_QUINT8_ROWWISE_F16: return DataType_t::QUint8RowwiseF16;
   }
-  return nve::DataType_t::Unknown;
+  return DataType_t::Unknown;
 }
+
+nve_data_type_t convert_external_dtype(DataType_t dt) noexcept {
+  switch (dt) {
+    case DataType_t::Unknown:  return NVE_DTYPE_UNKNOWN;
+    case DataType_t::Float32:  return NVE_DTYPE_FLOAT32;
+    case DataType_t::BFloat:   return NVE_DTYPE_BFLOAT16;
+    case DataType_t::Float16:  return NVE_DTYPE_FLOAT16;
+    case DataType_t::E4M3:     return NVE_DTYPE_E4M3;
+    case DataType_t::E5M2:     return NVE_DTYPE_E5M2;
+    case DataType_t::Float64:  return NVE_DTYPE_FLOAT64;
+    case DataType_t::QInt8RowwiseF32:  return NVE_DTYPE_QINT8_ROWWISE_F32;
+    case DataType_t::QInt8RowwiseF16:  return NVE_DTYPE_QINT8_ROWWISE_F16;
+    case DataType_t::QUint8RowwiseF32: return NVE_DTYPE_QUINT8_ROWWISE_F32;
+    case DataType_t::QUint8RowwiseF16: return NVE_DTYPE_QUINT8_ROWWISE_F16;
+  }
+  return NVE_DTYPE_UNKNOWN;
+}
+
+}  // namespace nve
+
+nve::DataType_t convert_dtype(nve_data_type_t dt) { return nve::convert_external_dtype(dt); }
 
 // The pooling/sparse converters throw on out-of-range values so the C entry points' NVE_C_CATCH
 // reports an error instead of silently running a valid operation the caller never requested.

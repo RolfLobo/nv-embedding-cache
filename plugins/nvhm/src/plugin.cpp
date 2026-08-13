@@ -16,26 +16,8 @@
  */
 
 #include <nvhm_map_table.hpp>
-#include <plugin.hpp>
+#include <plugin/nve_internal_plugin.hpp>
 
-extern "C" const char* plugin_ident() noexcept { return "nvHashMap plugin"; }
-
-extern "C" const char* plugin_developer() noexcept { return "NVIDIA Corporation"; }
-
-extern "C" void enum_host_table_implementations(void* dll,
-                                                void (*callback)(void*, const char*)) noexcept {
-  callback(dll, "nvhm_map");
-}
-
-using namespace nve;
-using namespace nve::plugin;
-
-#pragma GCC diagnostic push
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-extern "C" host_table_factory_ptr_t create_nvhm_map_table_factory(const nlohmann::json& json) {
-#pragma GCC diagnostic pop
-  return {new NvhmMapTableFactory(static_cast<NvhmMapTableFactoryConfig>(json)),
-          [](NvhmMapTableFactory* const p) { delete p; }};
-}
+NVE_DEFINE_INTERNAL_PLUGIN("nvHashMap plugin", "NVIDIA Corporation",
+                           nve::plugin::NvhmMapTableFactory,
+                           nve::plugin::NvhmMapTableFactoryConfig)

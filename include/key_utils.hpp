@@ -17,15 +17,30 @@
 
 #pragma once
 
-#include <host_table.hpp>
-#include <vector>
+#include <stdint.h>
+#include <type_traits>
+
+#ifdef __CUDACC__
+#define NVE_KEY_UTILS_CUDA_CALLABLE __host__ __device__
+#else
+#define NVE_KEY_UTILS_CUDA_CALLABLE
+#endif
 
 namespace nve {
 
-using plugin_info_t = const char* (*)();
-
-using enum_implementations_t = void (*)(void*, void (*)(void*, const char*));
-
-using create_host_table_factory_t = host_table_factory_ptr_t (*)(const nlohmann::json& json);
+// A linear (dense) table is indexed directly by key, so only keys in [0, num_rows) address a real
+// row. Ops on such tables use this to drop out of range keys instead of touching foreign memory.
+template <typename KeyT>
+NVE_KEY_UTILS_CUDA_CALLABLE inline bool key_in_range(const KeyT key, const uint64_t num_rows) {
+  static_assert(std::is_integral_v<KeyT>);
+  if constexpr (std::is_signed_v<KeyT>) {
+    if (key < 0) {
+      return false;
+    }
+  }
+  return static_cast<uint64_t>(key) < num_rows;
+}
 
 }  // namespace nve
+
+#undef NVE_KEY_UTILS_CUDA_CALLABLE

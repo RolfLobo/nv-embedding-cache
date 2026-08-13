@@ -26,13 +26,11 @@ using namespace nve::plugin;
 using namespace nlohmann::literals;
 
 TEST(rocksdb_plugin, parse_table_conf) {
-  const RocksDBTableConfig conf{
-      {4, sizeof(int32_t), 16, DataType_t::BFloat}, 1024, "some_column_name", false};
+  const RocksDBTableConfig conf{{sizeof(int32_t), 16, DataType_t::BFloat}, 1024, "some_column_name", false};
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"(
     {
-      "mask_size": 4,
       "key_size": 4,
       "max_value_size": 16,
       "value_dtype": "bfloat",

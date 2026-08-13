@@ -25,7 +25,7 @@ using namespace nve;
 using namespace nlohmann::literals;
 
 TEST(stl_map_backed_table, parse_table_conf) {
-  const STLMapTableConfig conf{{{4, sizeof(int32_t), 16, DataType_t::BFloat},
+  const STLMapTableConfig conf{{{sizeof(int32_t), 16, DataType_t::BFloat},
                                 2, Partitioner_t::AlwaysZero, {1}, 128,
                                 32, 4096,
                                 false,
@@ -33,7 +33,6 @@ TEST(stl_map_backed_table, parse_table_conf) {
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"({
-    "mask_size": 4,
     "key_size": 4,
     "max_value_size": 16,
     "value_dtype": "bfloat",

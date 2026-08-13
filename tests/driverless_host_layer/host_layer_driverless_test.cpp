@@ -30,6 +30,7 @@
 #include "include/linear_host_table.hpp"
 #include "include/nve_types.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -57,6 +58,7 @@ struct HostLayerFixture {
     cfg.value_dtype = DataType_t::Float32;
     cfg.max_threads = 8;
     cfg.max_value_size = kRowBytes;
+    cfg.num_rows = kNumRows;
     cfg.emb_table = backing.data();
 
     table = std::make_shared<LinearHostTable<KeyType>>(cfg);
@@ -103,6 +105,45 @@ TEST(DriverlessHostLayer, UpdateThenLookup) {
   for (size_t e = 0; e < kElems; ++e) {
     EXPECT_FLOAT_EQ(out[e], row[e]) << "elem=" << e;
   }
+}
+
+TEST(DriverlessHostLayer, OutOfRangeKeysMissAndMutationsAreIgnored) {
+  HostLayerFixture f;
+  const std::vector<KeyType> keys{-1, kNumRows, 5};
+  constexpr float untouched = -99.0f;
+  std::vector<float> out(keys.size() * kElems, untouched);
+  bitmask64_t hitmask = 0;
+
+  f.layer->lookup(f.ctx, static_cast<int64_t>(keys.size()), keys.data(), out.data(),
+                  kRowBytes, &hitmask, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
+
+  EXPECT_EQ(hitmask, bitmask64::single(2));
+  for (size_t e = 0; e < kElems; ++e) {
+    EXPECT_FLOAT_EQ(out[e], untouched);
+    EXPECT_FLOAT_EQ(out[kElems + e], untouched);
+    EXPECT_FLOAT_EQ(out[2 * kElems + e], f.backing[5 * kElems + e]);
+  }
+
+  std::fill(out.begin(), out.end(), untouched);
+  float hitrates[1] = {-1.0f};
+  f.layer->lookup(f.ctx, static_cast<int64_t>(keys.size()), keys.data(), out.data(),
+                  kRowBytes, /*hitmask=*/nullptr, /*pool_params=*/nullptr, hitrates);
+  EXPECT_FLOAT_EQ(hitrates[0], 1.0f / 3.0f);
+  for (size_t e = 0; e < kElems; ++e) {
+    EXPECT_FLOAT_EQ(out[e], untouched);
+    EXPECT_FLOAT_EQ(out[kElems + e], untouched);
+    EXPECT_FLOAT_EQ(out[2 * kElems + e], f.backing[5 * kElems + e]);
+  }
+
+  const std::vector<float> original = f.backing;
+  const std::vector<KeyType> invalid_keys{-1, kNumRows};
+  std::vector<float> values(invalid_keys.size() * kElems, 7.0f);
+  f.layer->update(f.ctx, static_cast<int64_t>(invalid_keys.size()), invalid_keys.data(),
+                  kRowBytes, kRowBytes, values.data(), /*table_id=*/0);
+  f.layer->accumulate(f.ctx, static_cast<int64_t>(invalid_keys.size()), invalid_keys.data(),
+                      kRowBytes, kRowBytes, values.data(), DataType_t::Float32,
+                      /*table_id=*/0);
+  EXPECT_EQ(f.backing, original);
 }
 
 }  // namespace

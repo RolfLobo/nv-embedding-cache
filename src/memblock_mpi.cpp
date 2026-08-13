@@ -38,6 +38,10 @@ void* MPIMemBlock::get_ptr() const {
     return mpi_buffer_->ptr();
 }
 
+size_t MPIMemBlock::get_size_in_bytes() const {
+    return mpi_buffer_->total_size();
+}
+
 } // namespace nve
 
 #else  // NVE_DISABLE_MPI
@@ -63,6 +67,10 @@ MPIMemBlock::MPIMemBlock(size_t, const std::vector<size_t>, const std::vector<in
 
 void* MPIMemBlock::get_ptr() const {
     return nullptr;
+}
+
+size_t MPIMemBlock::get_size_in_bytes() const {
+    return 0;
 }
 
 } // namespace nve

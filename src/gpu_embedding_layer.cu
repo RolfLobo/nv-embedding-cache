@@ -17,6 +17,7 @@
 
 #include <gpu_embedding_layer.hpp>
 #include <layer_utils.hpp>
+#include <limits>
 
 // Disable warnings for cuEmbed
 #pragma GCC diagnostic push
@@ -30,6 +31,7 @@
 #include <default_allocator.hpp>
 #include "cuda_ops/find_and_dequant.cuh"
 #include "cuda_ops/pool_gathered.cuh"
+#include "cuda_ops/sanitize_keys.cuh"
 #include "cuda_ops/update_accumulate.cuh"
 #include <ecache/ec_no_cache.cuh>
 #include <ecache/embed_cache.h> // DefaultECEvent
@@ -132,6 +134,7 @@ void from_json(const nlohmann::json& json, GPUEmbeddingLayerConfig& conf) {
   NVE_READ_JSON_FIELD_(num_embeddings);
   NVE_READ_JSON_FIELD_(embedding_width_in_bytes);
   NVE_READ_JSON_FIELD_(value_dtype);
+  NVE_READ_JSON_FIELD_(default_row_index);
 }
 
 void to_json(nlohmann::json& json, const GPUEmbeddingLayerConfig& conf) {
@@ -140,6 +143,7 @@ void to_json(nlohmann::json& json, const GPUEmbeddingLayerConfig& conf) {
   NVE_WRITE_JSON_FIELD_(num_embeddings);
   NVE_WRITE_JSON_FIELD_(embedding_width_in_bytes);
   NVE_WRITE_JSON_FIELD_(value_dtype);
+  NVE_WRITE_JSON_FIELD_(default_row_index);
 }
 
 // cuEmbed's index and CSR-offset types follow the layer's KeyType. Quantized pooling bypasses this
@@ -202,7 +206,7 @@ int64_t gpu_find_raw(context_ptr_t& ctx, const GPUEmbeddingLayerConfig& config,
     const cudaError_t status = call_find_and_dequant<KeyType, typename ECNoCache<KeyType>::CacheData>(
         static_cast<const KeyType*>(keys), static_cast<size_t>(num_keys),
         static_cast<int8_t*>(values), static_cast<const int8_t*>(config.embedding_table),
-        DataType_t::Float16,
+        DataType_t::Float16, DataType_t::Float16,
         static_cast<uint32_t>(config.embedding_width_in_bytes / sizeof(__half)), cache,
         lookup_stream, static_cast<size_t>(config.embedding_width_in_bytes), true /*load_indices*/);
     NVE_CHECK_(status, "Raw quantized GPU lookup failed");
@@ -300,6 +304,7 @@ GPUEmbeddingLayer<KeyType>::GPUEmbeddingLayer(const GPUEmbeddingLayerConfig& con
                                               allocator_ptr_t allocator)
   : config_(config) {
     NVE_CHECK_(static_cast<bool>(config_.embedding_table), "Invalid embedding table");
+    NVE_CHECK_(config_.num_embeddings > 0, "Invalid number of embeddings");
     NVE_CHECK_(config_.value_dtype == DataType_t::Float32 ||
                    config_.value_dtype == DataType_t::Float16 ||
                    is_quant_rowwise(config_.value_dtype),
@@ -309,6 +314,11 @@ GPUEmbeddingLayer<KeyType>::GPUEmbeddingLayer(const GPUEmbeddingLayerConfig& con
                  "Quantized GPU embedding row width must be even");
       (void)gpu_quant_value_count(config_);
     }
+    NVE_CHECK_(static_cast<uint64_t>(config_.num_embeddings) <=
+                   static_cast<uint64_t>(std::numeric_limits<KeyType>::max()),
+               "Number of embeddings cannot be represented by the layer key type");
+    NVE_CHECK_(config_.default_row_index < config_.num_embeddings,
+               "Default row index must be less than num_embeddings");
 
     allocator_ = allocator ? allocator : GetDefaultAllocator();
     NVE_CHECK_(allocator_ != nullptr, "Failed to get default allocator");
@@ -333,7 +343,7 @@ GPUEmbeddingLayer<KeyType>::~GPUEmbeddingLayer() {
 
 template <typename KeyType>
 void GPUEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_keys, const void* keys, void* output,
-                    const int64_t output_stride, max_bitmask_repr_t* hitmask,
+                    const int64_t output_stride, bitmask64_t* hitmask,
                     const PoolingParams* pool_params, float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(config_.device_id);
@@ -378,6 +388,11 @@ void GPUEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_ke
   const auto keys_buffer_size = static_cast<size_t>(sizeof(KeyType)) * num_keys;
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
   const void* d_keys = keys_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
+
+  // Keys outside the table are replaced with the default row, so the gather below stays in bounds
+  // (no-op when no default row is configured).
+  d_keys = sanitize_lookup_keys<KeyType>(ctx, d_keys, num_keys, config_.num_embeddings,
+                                         config_.default_row_index, lookup_stream);
 
   if (quantized) {
     if (pool_params && !raw_concatenate) {
@@ -531,7 +546,9 @@ void GPUEmbeddingLayer<KeyType>::update(context_ptr_t& ctx, const int64_t num_ke
                        static_cast<uint32_t>(config_.embedding_width_in_bytes),
                        static_cast<uint32_t>(value_stride),
                        static_cast<uint32_t>(config_.embedding_width_in_bytes),
-                       static_cast<int32_t>(num_keys), private_modify_stream_);
+                       static_cast<int32_t>(num_keys),
+                       static_cast<uint64_t>(config_.num_embeddings),
+                       private_modify_stream_);
 
   NVE_CHECK_(cudaEventRecord(modify_in_progress_, private_modify_stream_));
   NVE_CHECK_(cudaStreamWaitEvent(modify_stream, modify_in_progress_));
@@ -584,7 +601,8 @@ void GPUEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const int64_t nu
               reinterpret_cast<const float*>(d_values), reinterpret_cast<const KeyType*>(d_keys),
               reinterpret_cast<float*>(config_.embedding_table),
               embedding_width, value_stride_elements, embedding_width,
-              static_cast<int32_t>(num_keys), private_modify_stream_);
+              static_cast<int32_t>(num_keys),
+              static_cast<uint64_t>(config_.num_embeddings), private_modify_stream_);
         }
         break;
       case DataType_t::Float16:
@@ -595,7 +613,8 @@ void GPUEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const int64_t nu
               reinterpret_cast<const __half*>(d_values), reinterpret_cast<const KeyType*>(d_keys),
               reinterpret_cast<__half*>(config_.embedding_table),
               embedding_width, value_stride_elements, embedding_width,
-              static_cast<int32_t>(num_keys), private_modify_stream_);
+              static_cast<int32_t>(num_keys),
+              static_cast<uint64_t>(config_.num_embeddings), private_modify_stream_);
         }
         break;
     default:

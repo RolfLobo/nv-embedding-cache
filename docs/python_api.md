@@ -84,6 +84,19 @@ Once a python binding to an implementation of nve::Table is available, creating 
                                         layer_type=nve_layers.LayerType.Hierarchical, gpu_cache_size=1024*1024,
                                         storage=binding_to_remote_ps)
 ```
+
+Alternatively, `NVEParameterServer` (in [nve_ps.py](../python/pynve/torch/nve_ps.py)) can construct the parameter server from any table plugin shared object. The plugin is selected by `plugin_name` (the `.so` name or path), `factory_config` contains **plugin-specific factory options only**, and `table_config` configures the produced table. See [plugins.md](plugins.md) for the plugin system documentation.
+
+```python
+    from pynve.torch.nve_ps import NVEParameterServer
+
+    ps = NVEParameterServer(num_embeddings=10*1024*1024,
+                            embedding_size=128,
+                            data_type=torch.float32,
+                            plugin_name="libnve-plugin-redis.so",
+                            factory_config={"address": "localhost:7000"},
+                            table_config={"num_partitions": 16})
+```
 ## Host Layer (CPU Inference)
 
 `LayerType.HostLayer` stores all embedding vectors in CPU host memory with no GPU cache. It is

@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:26.01-py3
+FROM nvcr.io/nvidia/pytorch:26.03-py3
 RUN apt-get update
 RUN apt-get -y install sudo redis
 

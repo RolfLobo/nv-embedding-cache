@@ -18,16 +18,19 @@ cmake_minimum_required(VERSION 3.18)
 # Generate the split FindAndCombine kernel instantiations. FAC_GEN_DIR is set in the top-level
 # CMakeLists.txt (and added to the global include path there).
 set(FAC_GEN_SCRIPT ${PROJECT_SOURCE_DIR}/cmake/gen_find_and_combine_instantiations.py)
-# Per-file instantiation count defaults to the constant at the head of the generator script;
-# override here only if needed.
-set(FAC_PER_FILE "" CACHE STRING "Override FindAndCombine instantiations per generated .cu (blank = script default)")
-if(FAC_PER_FILE)
-  set(_fac_per_file_arg --per-file ${FAC_PER_FILE})
+# Number of generated .cu translation units the instantiation matrix is split across. This governs
+# compile parallelism (roughly ceil(FAC_NUM_TUS / build cores) waves); each TU also carries a large
+# fixed cost, so the fast regime is a few large TUs (~1-2 waves of the core count), not many small
+# ones. Defaults to the constant at the head of the generator script; override here to retune for a
+# very different core count.
+set(FAC_NUM_TUS "" CACHE STRING "Override number of FindAndCombine generated .cu files (blank = script default)")
+if(FAC_NUM_TUS)
+  set(_fac_num_tus_arg --num-tus ${FAC_NUM_TUS})
 endif()
 
 # Configure-time generation so the generated source list exists for this configure run.
 execute_process(
-  COMMAND ${Python3_EXECUTABLE} ${FAC_GEN_SCRIPT} --out-dir ${FAC_GEN_DIR} ${_fac_per_file_arg}
+  COMMAND ${Python3_EXECUTABLE} ${FAC_GEN_SCRIPT} --out-dir ${FAC_GEN_DIR} ${_fac_num_tus_arg}
   RESULT_VARIABLE _fac_rc)
 if(NOT _fac_rc EQUAL 0)
   message(FATAL_ERROR "FindAndCombine instantiation generation failed (${_fac_rc})")
@@ -45,9 +48,9 @@ include(${FAC_GEN_DIR}/find_and_combine_generated.cmake)  # -> FAC_GENERATED_SOU
 set_property(DIRECTORY ${CMAKE_SOURCE_DIR} APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${FAC_GEN_SCRIPT} ${PROJECT_SOURCE_DIR}/cuda_ops/find_and_combine_kernel.cuh)
 
-# The generated sources already exist on disk (written by execute_process above); mark them GENERATED
-# so CMake never looks for a build rule that produces them.
-set_source_files_properties(${FAC_GENERATED_SOURCES} PROPERTIES GENERATED TRUE)
+# The generated sources already exist on disk (written by execute_process above), so they are
+# deliberately NOT marked GENERATED: that property makes the Ninja generator emit a no-op build
+# edge per file, which `ninja -t clean` would delete without being able to regenerate.
 
 file(GLOB common_src RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.cpp *.cu)
 add_library(nve-common SHARED ${common_src} ${FAC_GENERATED_SOURCES})
@@ -60,9 +63,9 @@ if(NVE_DRIVERLESS_BUILD)
 endif()
 
 target_compile_definitions(nve-common PRIVATE
-  NVE_VERSION_MAJOR=${CMAKE_PROJECT_VERSION_MAJOR}
-  NVE_VERSION_MINOR=${CMAKE_PROJECT_VERSION_MINOR}
-  NVE_VERSION_PATCH=${CMAKE_PROJECT_VERSION_PATCH}
+  NVE_VERSION_MAJOR=${NVE_VERSION_MAJOR}
+  NVE_VERSION_MINOR=${NVE_VERSION_MINOR}
+  NVE_VERSION_PATCH=${NVE_VERSION_PATCH}
 )
 
 target_include_directories(nve-common PRIVATE

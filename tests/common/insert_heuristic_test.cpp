@@ -27,7 +27,6 @@ static constexpr uint32_t NUM_EXAMPLES = 10;
 // and last steady_state_samples are with maximal_hit_rate + normal noise
 std::vector<float> generate_random_hitrate(uint32_t num_warmup_samples, float maximal_hit_rate, uint32_t steady_state_samples, float std_dev, uint32_t seed) {
     std::vector<float> hitrates;
-    std::random_device rd;
     std::mt19937 gen(seed);
     float mean = 0.0f;
     std::normal_distribution<float> dis(mean, std_dev);

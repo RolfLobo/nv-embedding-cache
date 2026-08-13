@@ -127,7 +127,7 @@ class Table {
    * @param value_sizes Optional wrapped output array of `n` int64_t entries that
    * receives the bytes written per key. May be `nullptr`.
    */
-  virtual void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, buffer_ptr<max_bitmask_repr_t> hit_mask,
+  virtual void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, buffer_ptr<bitmask64_t> hit_mask,
                        int64_t value_stride, buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const = 0;
 
   /**
@@ -170,7 +170,7 @@ class Table {
    * @param n Number of keys in `keys`.
    * @param keys Wrapped pointer to an array of `n` keys.
    * @param update_stride Spacing / raster between two updates in `updates`.
-   * @param update_size Size of each update in bytes (must be a multiple of `dtype_size(update_dtype)`).
+   * @param update_size Size of each update in bytes (must be >= 0 and a multiple of `dtype_size(update_dtype)`).
    * @param updates Wrapped pointer to an array containing at least `n * update_stride` bytes.
    * @param update_dtype Data type of the supplied updates. May differ from the
    * table's storage dtype, subject to per-backend support.

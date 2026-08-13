@@ -279,7 +279,7 @@ def test_pytorch_init_host():
     embed_size = 4
     # Host-resident buffer that the LinearHostTable will gather from.
     host_weight = torch.zeros(num_embeddings, embed_size, dtype=torch.float32).contiguous().pin_memory()
-    memblock = nve.UserMemBlock(host_weight.data_ptr())
+    memblock = nve.UserMemBlock(host_weight.data_ptr(), host_weight.nbytes)
     layer = nve_layers.NVEmbedding(num_embeddings, embed_size, torch.float32,
                                    layer_type=nve_layers.LayerType.HostLayer,
                                    storage=memblock,
@@ -294,7 +294,7 @@ def test_pytorch_host_gather():
     host_weight = (torch.arange(num_embeddings, dtype=torch.float32)
                    .unsqueeze(1).expand(num_embeddings, embed_size)
                    .contiguous().pin_memory())
-    memblock = nve.UserMemBlock(host_weight.data_ptr())
+    memblock = nve.UserMemBlock(host_weight.data_ptr(), host_weight.nbytes)
     layer = nve_layers.NVEmbedding(num_embeddings, embed_size, torch.float32,
                                    layer_type=nve_layers.LayerType.HostLayer,
                                    storage=memblock,
@@ -309,7 +309,7 @@ def test_pytorch_host_update():
     num_embeddings = 256
     embed_size = 4
     host_weight = torch.zeros(num_embeddings, embed_size, dtype=torch.float32).contiguous().pin_memory()
-    memblock = nve.UserMemBlock(host_weight.data_ptr())
+    memblock = nve.UserMemBlock(host_weight.data_ptr(), host_weight.nbytes)
     layer = nve_layers.NVEmbedding(num_embeddings, embed_size, torch.float32,
                                    layer_type=nve_layers.LayerType.HostLayer,
                                    storage=memblock,
@@ -329,7 +329,7 @@ def test_pytorch_host_weight_init():
                    .unsqueeze(1).expand(num_embeddings, embed_size).contiguous())
     # Buffer starts zeroed; NVEmbedding should copy weight_init into it.
     host_weight = torch.zeros(num_embeddings, embed_size, dtype=torch.float32).contiguous().pin_memory()
-    memblock = nve.UserMemBlock(host_weight.data_ptr())
+    memblock = nve.UserMemBlock(host_weight.data_ptr(), host_weight.nbytes)
     layer = nve_layers.NVEmbedding(num_embeddings, embed_size, torch.float32,
                                    layer_type=nve_layers.LayerType.HostLayer,
                                    storage=memblock,
@@ -819,7 +819,7 @@ def test_pytorch_user_memblock():
     embed_size = 2
     cache_size = 2**20
     linear_memblock = nve.LinearMemBlock(embed_size, num_embeddings, nve.DataType_t.Float32)
-    user_memblock = nve.UserMemBlock(linear_memblock.get_handle())
+    user_memblock = nve.UserMemBlock(linear_memblock.get_handle(), linear_memblock.get_size_in_bytes())
     emb_layer = nve_layers.NVEmbedding(num_embeddings, embed_size, torch.float32, layer_type=nve_layers.LayerType.LinearUVM, storage=user_memblock, gpu_cache_size=cache_size, weight_init=torch.ones(num_embeddings, embed_size, dtype=torch.float32), optimize_for_training=False)
     num_keys = 100
     keys = torch.randint(1, num_embeddings, (num_keys,), device="cuda", dtype=torch.int64)

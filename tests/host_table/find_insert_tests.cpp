@@ -21,6 +21,7 @@
 #include <buffer_wrapper.hpp>
 #include <execution_context.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
 #include <random>
 #include "test_utils.hpp"
 
@@ -30,7 +31,7 @@ using namespace nlohmann::literals;
 std::vector<int64_t> make_uniform_keys(int64_t n) {
   std::vector<int64_t> keys(static_cast<size_t>(n));
 
-  std::default_random_engine rng(random_device());
+  std::default_random_engine rng(random_seed());
   std::uniform_int_distribution dist(0, 1'000'000);
   std::generate(keys.begin(), keys.end(), [&dist, &rng]() { return dist(rng); });
 
@@ -41,18 +42,19 @@ void replace(std::string& x, const std::string_view& a, const std::string_view& 
   x.replace(x.find(a), a.size(), b);
 }
 
-void find_insert_find(const nlohmann::json& fac_json) {
+void find_insert_find(const std::string& plugin_path, const nlohmann::json& fac_json) {
   try {
     using key_type = int64_t;
 
-    host_table_factory_ptr_t fac{create_host_table_factory(fac_json)};
+    Plugin plugin{plugin_path};
+    table_factory_ptr_t fac{plugin.create_table_factory(fac_json)};
     std::string table_conf{R"({
       "max_value_size": %max_value_size
     })"};
     const int64_t max_value_size{20};
 
     replace(table_conf, "%max_value_size", std::to_string(max_value_size));
-    host_table_ptr_t tab{fac->produce(4711, nlohmann::json::parse(table_conf))};
+    table_ptr_t tab{fac->produce(4711, nlohmann::json::parse(table_conf))};
 
     auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
     tab->clear(ctx);
@@ -60,20 +62,19 @@ void find_insert_find(const nlohmann::json& fac_json) {
     // Find -> nothing -> insert -> find.
     int64_t n{63999};
     std::vector<key_type> keys{make_uniform_keys(n)};
-    std::vector<max_bitmask_repr_t> hit_mask(static_cast<uint64_t>(max_bitmask_t::mask_size(n)));
+    std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)));
     const int64_t value_stride{max_value_size + 1};
 
     int64_t cnt;
 
     const size_t keys_bytes = static_cast<size_t>(n) * sizeof(key_type);
-    const size_t hit_mask_bytes =
-        static_cast<size_t>(max_bitmask_t::mask_size(n)) * sizeof(max_bitmask_repr_t);
+    const size_t hit_mask_bytes = hit_mask.size() * sizeof(bitmask64_t);
 
     auto make_keys_bw = [&](const key_type* p) {
       return std::make_shared<BufferWrapper<const void>>(ctx, "keys", p, keys_bytes);
     };
     auto make_hit_mask_bw = [&]() {
-      return std::make_shared<BufferWrapper<max_bitmask_repr_t>>(
+      return std::make_shared<BufferWrapper<bitmask64_t>>(
           ctx, "hit_mask", hit_mask.data(), hit_mask_bytes);
     };
 
@@ -88,7 +89,7 @@ void find_insert_find(const nlohmann::json& fac_json) {
     tab->get_lookup_counter(ctx, &cnt);
     ASSERT_EQ(cnt, n);
 
-    std::fill(hit_mask.begin(), hit_mask.end(), max_bitmask_t::full());
+    std::fill(hit_mask.begin(), hit_mask.end(), bitmask64::full);
     tab->reset_lookup_counter(ctx);
     tab->find(ctx, n, make_keys_bw(keys.data()), make_hit_mask_bw(), max_value_size, nullptr, nullptr);
     tab->get_lookup_counter(ctx, &cnt);
@@ -114,28 +115,26 @@ void find_insert_find(const nlohmann::json& fac_json) {
   }
 }
 
-TEST(find_insert_find, stl_map_table) { find_insert_find(R"({"implementation": "umap"})"_json); }
+TEST(find_insert_find, stl_map_table) {
+  find_insert_find(nve_test::plugin_full_path("stl-map"), nlohmann::json::object());
+}
 
 TEST(find_insert_find, nvhm_table) {
   SKIP_IF_NVHM_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("nvhm"));
-  find_insert_find(R"({"implementation": "nvhm_map"})"_json);
+  find_insert_find(nve_test::plugin_full_path("nvhm"), nlohmann::json::object());
 }
 
 TEST(find_insert_find, abseil_flat_map_table) {
   SKIP_IF_ABSEIL_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("abseil"));
-  find_insert_find(R"({"implementation": "abseil_flat_map"})"_json);
+  find_insert_find(nve_test::plugin_full_path("abseil"), nlohmann::json::object());
 }
 
 TEST(find_insert_find, phmap_flat_map_table) {
   SKIP_IF_PHMAP_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("phmap"));
-  find_insert_find(R"({"implementation": "phmap_flat_map"})"_json);
+  find_insert_find(nve_test::plugin_full_path("phmap"), nlohmann::json::object());
 }
 
 TEST(find_insert_find, rocksdb_table) {
   SKIP_IF_ROCKSDB_UNAVAILABLE();
-  load_host_table_plugin(nve_test::plugin_full_path("rocksdb"));
-  find_insert_find(R"({"implementation": "rocksdb"})"_json);
+  find_insert_find(nve_test::plugin_full_path("rocksdb"), nlohmann::json::object());
 }

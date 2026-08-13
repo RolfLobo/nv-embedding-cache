@@ -20,8 +20,7 @@ add_executable(nve_driverless_test host_layer_driverless_test.cpp)
 target_link_libraries(nve_driverless_test PUBLIC gtest_main nve-common)
 
 # End-to-end driverless C++ inference: loads a Python-exported AOTInductor
-# NVEmbedding(HostLayer) package and runs it entirely at device_index=-1. Driven
-# by test_driverless_inference.py, which exports the model and checks the output.
+# NVEmbedding(HostLayer) package and runs it entirely at device_index=-1.
 # Needs the torch custom-op bindings (nve-torch-ops), so it is only built when
 # they are enabled. The `torch` umbrella target forces libtorch_cuda.so NEEDED via
 # -Wl,--no-as-needed even when unused (see python/pynve/torch_bindings/CMakeLists.txt),
@@ -42,4 +41,12 @@ if(NOT NVE_DISABLE_TORCH_BINDINGS AND TORCH_FOUND)
         nve-torch-ops
         nve-common
     )
+
+    add_executable(driverless_inference_test driverless_inference_test.cpp)
+    target_link_libraries(driverless_inference_test PRIVATE gtest_main)
+    target_compile_definitions(driverless_inference_test PRIVATE
+        NVE_TEST_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        NVE_TEST_INFERENCE_EXECUTABLE="$<TARGET_FILE:nve_inference_driverless>"
+    )
+    add_dependencies(driverless_inference_test nve_inference_driverless)
 endif()

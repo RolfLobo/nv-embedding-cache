@@ -19,6 +19,7 @@
 #include <json_support.hpp>
 #include <ecache/embedding_cache_combined.cuh>
 #include <execution_context.hpp>
+#include <key_utils.hpp>
 #include <layer_utils.hpp>
 #include "cuda_ops/update_accumulate.cuh"
 #include "cuda_ops/find_and_combine_kernel.cuh"
@@ -49,6 +50,7 @@ void from_json(const nlohmann::json& json, GPUTableConfig& conf) {
   NVE_READ_JSON_FIELD_(device_id);
   NVE_READ_JSON_FIELD_(cache_size);
   NVE_READ_JSON_FIELD_(row_size_in_bytes);
+  NVE_READ_JSON_FIELD_(uvm_num_rows);
   NVE_READ_JSON_FIELD_(max_modify_size);
   NVE_READ_JSON_FIELD_(value_dtype);
   NVE_READ_JSON_FIELD_(count_misses);
@@ -64,6 +66,7 @@ void to_json(nlohmann::json& json, const GPUTableConfig& conf) {
   NVE_WRITE_JSON_FIELD_(device_id);
   NVE_WRITE_JSON_FIELD_(cache_size);
   NVE_WRITE_JSON_FIELD_(row_size_in_bytes);
+  NVE_WRITE_JSON_FIELD_(uvm_num_rows);
   NVE_WRITE_JSON_FIELD_(max_modify_size);
   NVE_WRITE_JSON_FIELD_(value_dtype);
   NVE_WRITE_JSON_FIELD_(count_misses);
@@ -171,6 +174,8 @@ GpuTable<KeyType>::GpuTable(const GPUTableConfig& config, allocator_ptr_t alloca
   using CacheTypeHost = nve::CacheSAHostModify<KeyType, KeyType>;
 
   NVE_CHECK_((config.row_size_in_bytes % 2) == 0, "Invalid cache row size (must divide by 2)");
+  NVE_CHECK_(config.uvm_table == nullptr || config.uvm_num_rows > 0,
+             "uvm_num_rows must be set to the number of rows in uvm_table");
   allocator_ = allocator ? allocator : GetDefaultAllocator();
   NVE_CHECK_(allocator_ != nullptr, "Failed to get default allocator");
 
@@ -339,14 +344,14 @@ static void run_find_uvm(const GPUTableConfig& config, std::shared_ptr<CacheType
 
 template <typename KeyType>
 void GpuTable<KeyType>::find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
-                             buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+                             buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
                              buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   ScopedDevice scope_device(config_.device_id);
   NVE_CHECK_(value_sizes == nullptr, "value_sizes must be nullptr for GPU table");
   auto lookup_stream = ctx->get_lookup_stream();
   const void* keys_buf = keys->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
-  max_bitmask_repr_t* hit_mask_buf =
+  bitmask64_t* hit_mask_buf =
       hit_mask ? hit_mask->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;
   void* values_buf = values ? values->access_buffer(cudaMemoryTypeDevice, false /*copy_content*/, lookup_stream) : nullptr;
 
@@ -606,6 +611,7 @@ void GpuTable<KeyType>::update(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
                         static_cast<uint32_t>(update_stride),
                         static_cast<uint32_t>(config_.row_size_in_bytes),
                         static_cast<int32_t>(num_keys),
+                        static_cast<uint64_t>(config_.uvm_num_rows),
                         update_stream);
 
     cudaEvent_t uvm_update_event;
@@ -762,6 +768,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
         const int8_t* i8_h_updates = reinterpret_cast<const int8_t*>(h_updates);
         const KeyType* typed_keys = reinterpret_cast<const KeyType*>(h_keys);
         const auto row_size = config_.row_size_in_bytes;
+        const auto num_rows = static_cast<uint64_t>(config_.uvm_num_rows);
         NVE_CHECK_(update_size % dtype_size(update_dtype) == 0);
         const auto elements_per_row = update_size / dtype_size(update_dtype);
 
@@ -780,10 +787,15 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
               std::vector<half*> dst(keys_per_task);
               std::vector<const half*> src(keys_per_task);
               for (int64_t i=0 ; i<local_updates ; i++) {
-                dst[i] = reinterpret_cast<half*>(i8_table + (typed_keys[i+start_key] * row_size));
+                const KeyType key = typed_keys[i+start_key];
+                // Keys outside the table are ignored (null dst)
+                dst[i] = key_in_range(key, num_rows) ? reinterpret_cast<half*>(i8_table + (key * row_size)) : nullptr;
                 src[i] = reinterpret_cast<const half*>(i8_h_updates + ((i+start_key) * update_stride));
               }
               for (int64_t i=0 ; i<local_updates ; i++) {
+                if (dst[i] == nullptr) {
+                  continue;
+                }
                 for (int64_t j=0 ; j<elements_per_row ; j++) {
                   dst[i][j] += src[i][j];
                 }
@@ -801,10 +813,15 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
               std::vector<float*> dst(keys_per_task);
               std::vector<const float*> src(keys_per_task);
               for (int64_t i=0 ; i<local_updates ; i++) {
-                dst[i] = reinterpret_cast<float*>(i8_table + (typed_keys[i+start_key] * row_size));
+                const KeyType key = typed_keys[i+start_key];
+                // Keys outside the table are ignored (null dst)
+                dst[i] = key_in_range(key, num_rows) ? reinterpret_cast<float*>(i8_table + (key * row_size)) : nullptr;
                 src[i] = reinterpret_cast<const float*>(i8_h_updates + ((i+start_key) * update_stride));
               }
               for (int64_t i=0 ; i<local_updates ; i++) {
+                if (dst[i] == nullptr) {
+                  continue;
+                }
                 for (int64_t j=0 ; j<elements_per_row ; j++) {
                   dst[i][j] += src[i][j];
                 }
@@ -849,6 +866,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
 
         const auto num_tasks = (num_keys + updates_per_task - 1) / updates_per_task;
         const auto row_size = config_.row_size_in_bytes;
+        const auto num_rows = static_cast<uint64_t>(config_.uvm_num_rows);
         
         const auto update_task_fp16{[&](const size_t idx) {
           const int64_t start_key = idx * updates_per_task;
@@ -860,11 +878,16 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
           std::vector<half*> dst(updates_per_task);
           std::vector<const half*> src(updates_per_task);
           for (int64_t i=0 ; i<local_updates ; i++) {
-            dst[i] = reinterpret_cast<half*>(i8_table + (typed_keys[i+start_key] * row_size));
+            const KeyType key = typed_keys[i+start_key];
+            // Keys outside the table are ignored (null dst)
+            dst[i] = key_in_range(key, num_rows) ? reinterpret_cast<half*>(i8_table + (key * row_size)) : nullptr;
             src[i] = reinterpret_cast<const half*>(i8_updates + ((i+start_key) * update_stride));
           }
 
           for (int64_t i=0 ; i<local_updates ; i++) {
+            if (dst[i] == nullptr) {
+              continue;
+            }
             for (size_t j=0 ; j<elements_per_row ; j++) {
               dst[i][j] += src[i][j];
             }
@@ -881,10 +904,15 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
           std::vector<float*> dst(updates_per_task);
           std::vector<const float*> src(updates_per_task);
           for (int64_t i=0 ; i<local_updates ; i++) {
-            dst[i] = reinterpret_cast<float*>(i8_table + (typed_keys[i+start_key] * row_size));
+            const KeyType key = typed_keys[i+start_key];
+            // Keys outside the table are ignored (null dst)
+            dst[i] = key_in_range(key, num_rows) ? reinterpret_cast<float*>(i8_table + (key * row_size)) : nullptr;
             src[i] = reinterpret_cast<const float*>(i8_updates + ((i+start_key) * update_stride));
           }
           for (int64_t i=0 ; i<local_updates ; i++) {
+            if (dst[i] == nullptr) {
+              continue;
+            }
             for (size_t j=0 ; j<elements_per_row ; j++) {
               dst[i][j] += src[i][j];
             }
@@ -923,6 +951,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
                   value_stride_elements,
                   embedding_width,
                   static_cast<int32_t>(num_keys),
+                  static_cast<uint64_t>(config_.uvm_num_rows),
                   update_stream);
             }
             break;
@@ -939,6 +968,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
                   value_stride_elements,
                   embedding_width,
                   static_cast<int32_t>(num_keys),
+                  static_cast<uint64_t>(config_.uvm_num_rows),
                   update_stream);
             }
             break;

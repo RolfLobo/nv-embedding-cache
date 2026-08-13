@@ -147,7 +147,7 @@ public:
     }
 
     // Apply remap and look up a PS table. Returns nullptr on miss.
-    host_table_ptr_t find_ps(const std::string& key) const {
+    table_ptr_t find_ps(const std::string& key) const {
         auto it = ps_tables_.find(remap(key));
         return it != ps_tables_.end() ? it->second : nullptr;
     }
@@ -156,7 +156,7 @@ public:
         memblocks_[remap(key)] = std::move(mb);
     }
 
-    void insert_ps(const std::string& key, host_table_ptr_t ps) {
+    void insert_ps(const std::string& key, table_ptr_t ps) {
         ps_tables_[remap(key)] = std::move(ps);
     }
 
@@ -171,7 +171,7 @@ public:
 
 private:
     std::unordered_map<std::string, std::shared_ptr<MemBlock>> memblocks_;
-    std::unordered_map<std::string, host_table_ptr_t>          ps_tables_;
+    std::unordered_map<std::string, table_ptr_t>              ps_tables_;
     std::unordered_map<std::string, std::string>               remap_;
 };
 
@@ -297,7 +297,7 @@ private:
     }
 
     // Build a PS from the resources section, consulting/updating resource_dir_.
-    host_table_ptr_t get_or_build_ps(
+    table_ptr_t get_or_build_ps(
             const std::string& key,
             const nlohmann::json& ps_resources,
             const std::string& layer_name,
@@ -315,12 +315,12 @@ private:
         NVE_CHECK_(ps_cfg.value("remote_ps_type", "") == "plugin",
                    "nve_loader: only remote_ps_type=='plugin' is supported");
 
-        host_table_ptr_t host_remote = create_table_from_plugin(
+        table_ptr_t remote = create_table_from_plugin(
             ps_cfg.at("plugin_name").get<std::string>(),
             ps_cfg.value("factory_config", nlohmann::json::object()),
             ps_cfg.value("table_config",   nlohmann::json::object()));
 
-        const DataType_t ps_dtype = host_remote->config().value_dtype;
+        const DataType_t ps_dtype = remote->get_value_type();
         NVE_CHECK_(ps_dtype == nve_dtype,
                    "nve_loader: layer '" + layer_name +
                    "' has data_type=" + dtype_str +
@@ -332,17 +332,17 @@ private:
             const uint64_t row_bytes =
                 ps_cfg.at("row_elements").get<uint64_t>() *
                 static_cast<uint64_t>(dtype_size(ps_dtype));
-            auto ctx = host_remote->create_execution_context(0, 0, nullptr, nullptr);
+            auto ctx = remote->create_execution_context(0, 0, nullptr, nullptr);
             insert_keys_from_filepath(
-                host_remote, ctx,
+                remote, ctx,
                 data_it->at("keys").get<std::string>(),
                 data_it->at("values").get<std::string>(),
                 row_bytes, /*batch_size=*/1ull << 20);
             ctx->wait();
         }
 
-        resource_dir_->insert_ps(eff, host_remote);
-        return host_remote;
+        resource_dir_->insert_ps(eff, remote);
+        return remote;
     }
 
     // Build a memblock from the resources section, consulting/updating resource_dir_.
@@ -453,12 +453,12 @@ private:
                 NVE_CHECK_(ps_cfg.value("remote_ps_type", "") == "plugin",
                            "nve_loader: only remote_ps_type=='plugin' is supported");
 
-                host_table_ptr_t host_remote = create_table_from_plugin(
+                table_ptr_t remote = create_table_from_plugin(
                     ps_cfg.at("plugin_name").get<std::string>(),
                     ps_cfg.value("factory_config", nlohmann::json::object()),
                     ps_cfg.value("table_config",   nlohmann::json::object()));
 
-                const DataType_t ps_dtype = host_remote->config().value_dtype;
+                const DataType_t ps_dtype = remote->get_value_type();
                 NVE_CHECK_(ps_dtype == nve_dtype,
                            "nve_loader: layer '" + module_path +
                            "' has data_type=" + dtype_str +
@@ -470,9 +470,9 @@ private:
                     const uint64_t row_bytes =
                         ps_cfg.at("row_elements").get<uint64_t>() *
                         static_cast<uint64_t>(dtype_size(ps_dtype));
-                    auto ctx = host_remote->create_execution_context(0, 0, nullptr, nullptr);
+                    auto ctx = remote->create_execution_context(0, 0, nullptr, nullptr);
                     insert_keys_from_filepath(
-                        host_remote, ctx,
+                        remote, ctx,
                         data_it->at("keys").get<std::string>(),
                         data_it->at("values").get<std::string>(),
                         row_bytes, /*batch_size=*/1ull << 20);
@@ -483,7 +483,7 @@ private:
                 uint64_t ps_num_rows  = ps_cfg.value("num_rows", uint64_t{0});
                 layer = std::make_shared<HierarchicalEmbedding<int64_t>>(
                     emb_size, nve_dtype, gpu_cache, host_cache,
-                    host_remote, ps_num_rows,
+                    remote, ps_num_rows,
                     /*use_private_stream=*/training, device_index, cfg);
             } else {
                 NVE_CHECK_(false, "nve_loader: unsupported layer_type: " + layer_type);
@@ -583,7 +583,7 @@ private:
                 NVE_CHECK_(!storage_ref.empty(),
                            "nve_loader: Hierarchical layer '" + module_path +
                            "' is missing storage_ref");
-                host_table_ptr_t host_remote = get_or_build_ps(
+                table_ptr_t remote = get_or_build_ps(
                     storage_ref, ps_resources, module_path, nve_dtype, dtype_str);
                 uint64_t ps_num_rows = 0;
                 {
@@ -594,7 +594,7 @@ private:
                 }
                 layer = std::make_shared<HierarchicalEmbedding<int64_t>>(
                     emb_size, nve_dtype, gpu_cache, host_cache,
-                    host_remote, ps_num_rows,
+                    remote, ps_num_rows,
                     /*use_private_stream=*/training, device_index, cfg);
             } else {
                 NVE_CHECK_(false, "nve_loader: unsupported layer_type: " + layer_type);

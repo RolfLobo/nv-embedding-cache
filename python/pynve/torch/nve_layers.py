@@ -64,6 +64,8 @@ def config_to_nve_config(config: dict):
         embed_config.kernel_mode_value_2 = config["kernel_mode_value_2"]
     if "max_modify_size" in config:
         embed_config.max_modify_size = config["max_modify_size"]
+    if "default_row_index" in config:
+        embed_config.default_row_index = config["default_row_index"]
     return embed_config
 
 class LayerType(Enum):
@@ -157,7 +159,7 @@ class NVEmbeddingBase(torch.nn.Module):
                 tensor_storage = weight_init.detach().clone().to(self.device)
             else:
                 tensor_storage = torch.empty(num_embeddings, embedding_size, dtype=data_type, device=self.device)
-            memblock = storage if storage is not None else nve.UserMemBlock(tensor_storage.data_ptr())
+            memblock = storage if storage is not None else nve.UserMemBlock(tensor_storage.data_ptr(), tensor_storage.nbytes)
             self.memblock_type = memblock.get_type()
             self.storage = memblock
             self.emb_layer = nve.GPUEmbedding(embedding_size, num_embeddings, self.layer_data_type, memblock, self.device_index, self.config)
@@ -226,14 +228,14 @@ class NVEmbeddingBase(torch.nn.Module):
                     tensor_storage = torch.empty(num_embeddings, embedding_size, dtype=data_type)
                     if pin:
                         tensor_storage = tensor_storage.pin_memory()
-                memblock = nve.UserMemBlock(tensor_storage.data_ptr())
+                memblock = nve.UserMemBlock(tensor_storage.data_ptr(), tensor_storage.nbytes)
             else:
                 #user gave both weight_init and memblock (we should consider removing this path)
                 memblock = storage
                 if weight_init is not None:
                     src = weight_init.detach().to(device="cpu", dtype=data_type).contiguous()
-                    size_bytes = num_embeddings * embedding_size * src.element_size()
-                    nve.raw_copy(memblock.get_handle(), src.data_ptr(), size_bytes)
+                    # view as uint8: numpy has no bfloat16, and copy_from is a byte copy
+                    memblock.copy_from(src.view(torch.uint8).numpy())
                 tensor_storage = torch.sparse_coo_tensor(size=(num_embeddings, embedding_size), dtype=data_type, device=self.device)
             self.memblock_type = memblock.get_type()
             self.storage = memblock

@@ -25,23 +25,35 @@
 #include <buffer_wrapper.hpp>
 #include <execution_context.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
+
+#include "test_utils.hpp"
 
 using namespace nve;
 using namespace nlohmann::literals;
 
 namespace {
 
-// A minimal fixture that owns an always-available umap host table just to source an ExecutionContext
-// for BufferWrapper construction. BufferWrapper's behavior is independent of the table type.
+// Own the CUDA allocations so a failing ASSERT (which returns from the test
+// body) cannot leak them. Tests that assert on the free status call the CUDA
+// API directly on .release() instead.
+template <typename T>
+using DevicePtr = std::unique_ptr<T, decltype(&cudaFree)>;
+template <typename T>
+using PinnedPtr = std::unique_ptr<T, decltype(&cudaFreeHost)>;
+
+// A minimal fixture that owns an always-available stl-map host table just to source an
+// ExecutionContext for BufferWrapper construction. BufferWrapper's behavior is independent
+// of the table type.
 class BufferWrapperTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    host_table_factory_ptr_t fac{create_host_table_factory(R"({"implementation": "umap"})"_json)};
+    table_factory_ptr_t fac{nve_test::plugin_factory("stl-map")};
     table_ = fac->produce(1, R"({})"_json);
     ctx_ = table_->create_execution_context(0, 0, nullptr, nullptr);
   }
 
-  host_table_ptr_t table_;
+  table_ptr_t table_;
   context_ptr_t ctx_;
 };
 
@@ -116,6 +128,7 @@ TEST_F(BufferWrapperTest, ConstructFromPinnedHostBuffer) {
   constexpr size_t n = 8;
   constexpr size_t bytes = n * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMallocHost(&pinned, bytes));
+  PinnedPtr<void> pinned_owner(pinned, cudaFreeHost);
   auto* p = static_cast<int32_t*>(pinned);
   std::fill(p, p + n, 5);
   {
@@ -125,13 +138,14 @@ TEST_F(BufferWrapperTest, ConstructFromPinnedHostBuffer) {
     EXPECT_EQ(wrap.get_buffer(cudaMemoryTypeUnregistered), nullptr);
     EXPECT_EQ(wrap.get_buffer(cudaMemoryTypeDevice), nullptr);
   }
-  cudaFreeHost(pinned);
+  EXPECT_EQ(cudaSuccess, cudaFreeHost(pinned_owner.release()));
 }
 
 TEST_F(BufferWrapperTest, ConstructFromDeviceBuffer) {
   void* dev = nullptr;
   constexpr size_t bytes = 8 * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMalloc(&dev, bytes));
+  DevicePtr<void> dev_owner(dev, cudaFree);
   {
     BufferWrapper<int32_t> wrap(ctx_, "buf", static_cast<int32_t*>(dev), bytes);
     EXPECT_EQ(wrap.get_last_access(), cudaMemoryTypeDevice);
@@ -139,7 +153,7 @@ TEST_F(BufferWrapperTest, ConstructFromDeviceBuffer) {
     EXPECT_EQ(wrap.get_buffer(cudaMemoryTypeHost), nullptr);
     EXPECT_EQ(wrap.get_buffer(cudaMemoryTypeUnregistered), nullptr);
   }
-  cudaFree(dev);
+  EXPECT_EQ(cudaSuccess, cudaFree(dev_owner.release()));
 }
 
 TEST_F(BufferWrapperTest, ConstructFromManagedBuffer) {
@@ -147,6 +161,7 @@ TEST_F(BufferWrapperTest, ConstructFromManagedBuffer) {
   constexpr size_t n = 8;
   constexpr size_t bytes = n * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMallocManaged(&managed, bytes));
+  DevicePtr<void> managed_owner(managed, cudaFree);
   auto* p = static_cast<int32_t*>(managed);
   std::fill(p, p + n, 13);
   {
@@ -157,7 +172,7 @@ TEST_F(BufferWrapperTest, ConstructFromManagedBuffer) {
     auto* same = wrap.access_buffer(cudaMemoryTypeManaged, false, ctx_->get_lookup_stream());
     EXPECT_EQ(same, p);
   }
-  cudaFree(managed);
+  EXPECT_EQ(cudaSuccess, cudaFree(managed_owner.release()));
 }
 
 // Unregistered access first allocates a pinned host buffer and aliases it under the unregistered key.
@@ -167,6 +182,7 @@ TEST_F(BufferWrapperTest, UnregisteredAccessAliasesHostAllocation) {
   // Start from a device buffer so unregistered is a *new* type that needs allocation.
   void* dev = nullptr;
   ASSERT_EQ(cudaSuccess, cudaMalloc(&dev, bytes));
+  DevicePtr<void> dev_owner(dev, cudaFree);
   ASSERT_EQ(cudaSuccess, cudaMemcpy(dev, data.data(), bytes, cudaMemcpyHostToDevice));
   {
     BufferWrapper<int32_t> wrap(ctx_, "buf", static_cast<int32_t*>(dev), bytes);
@@ -180,7 +196,7 @@ TEST_F(BufferWrapperTest, UnregisteredAccessAliasesHostAllocation) {
       EXPECT_EQ(unreg_ptr[i], data[i]);
     }
   }
-  cudaFree(dev);
+  EXPECT_EQ(cudaSuccess, cudaFree(dev_owner.release()));
 }
 
 // Round-trip: host → device → host preserves content. Verifies the device-side allocation

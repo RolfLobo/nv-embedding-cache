@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate explicit-instantiation sources for the FindAndCombine kernel.
+"""Generate explicit-instantiation sources for the find_and_combine kernel.
 
-The FindAndCombine kernel (cuda_ops/find_and_combine_kernel.cuh) is instantiated across a large
+The find_and_combine kernel (cuda_ops/find_and_combine_kernel.cuh) is instantiated across a large
 combination space. Compiling the whole matrix in the single translation unit that uses it
 (src/gpu_table.cu) dominates the build time of nve-common.
 
@@ -29,7 +29,7 @@ This script enumerates every combination the dispatch logic can launch and emits
                                           parallel instead of one.
   * find_and_combine_generated.cmake    - sets FAC_GENERATED_SOURCES to the list of .cu files.
 
-The enumeration mirrors callFindAndCombineKernelTypesResolved / NVE_FAC_DISPATCH /
+The enumeration mirrors call_find_and_combine_kernel_types_resolved / NVE_FAC_DISPATCH /
 NVE_FAC_LAUNCH_MASK; keep it in sync if those change.
 """
 
@@ -37,8 +37,9 @@ import argparse
 import os
 
 # --- tunables -----------------------------------------------------------------------------------
-# Explicit instantiations emitted per generated .cu file. Override with --per-file if needed.
-INSTANTIATIONS_PER_FILE = 100
+# Number of generated .cu translation units the instantiation matrix is split across. Override with
+# --num-tus (or -DFAC_NUM_TUS) if needed.
+NUM_TUS = 32
 
 # --- combination space (mirrors the dispatch logic) ---------------------------------------------
 ELEMENT_TYPES = [
@@ -47,8 +48,11 @@ ELEMENT_TYPES = [
     "QUint8RowwiseF16", "QInt8RowwiseF16",
 ]
 
-# (ACC_TYPE, WEIGHT_TYPE) dispatched in callFindAndCombineKernel.
-ACC_WEIGHT = [("float", "float"), ("float", "__half"), ("__half", "__half")]
+# (ACC_TYPE, WEIGHT_TYPE) dispatched in call_find_and_combine_kernel. Only Float32 accumulation is
+# supported; the accumulator pairs with either a float or a __half weight.
+ACC_WEIGHT = [("float", "float"), ("float", "__half")]
+
+OUTPUT_TYPES = ["float", "__half"]
 
 # (INDEX_TYPE, CacheDataT) combinations instantiated in src/gpu_table.cu.
 IDX_CACHE = [
@@ -58,11 +62,19 @@ IDX_CACHE = [
     ("int64_t", "typename nve::ECNoCache<int64_t>::CacheData"),
 ]
 
-# Vector widths selected by rowSizeInElements % 4 (Vec1 / Vec2 / Vec4).
-VEC_WIDTHS = [1, 2, 4]
-
-# SZ_ACCUM values dispatched by NVE_FAC_DISPATCH.
-SZ_ACCUM = range(1, 5)  # 1..4
+# SZ_ACCUM values instantiated per vector width (Vec1 / Vec2 / Vec4, selected by rowSizeInElements
+# alignment), dispatched by call_find_and_combine_kernel_types_resolved.
+#
+# The kernel loops over the row in chunks of SUBWARP_WIDTH * SZ_ACCUM vectors, so any row length is
+# handled regardless of SZ_ACCUM: SZ_ACCUM only trades register pressure against the number of
+# passes. The dispatch picks the smallest SZ_ACCUM that covers the row in a single pass, clamped per
+# width to min(4, 8 // width) so that vec_width * SZ_ACCUM <= 8 (bounded register pressure) and
+# SZ_ACCUM <= 4. We instantiate exactly that clamped range per width; keep this in sync with the
+# per-width clamp in the kernel header (call_find_and_combine_kernel_types_resolved).
+MAX_SZ_ACCUM = 4
+WIDTH_ACCUM = [(width, sz)
+               for width in (4, 2, 1)
+               for sz in range(1, min(MAX_SZ_ACCUM, 8 // width) + 1)]
 
 # All 16 packed MASK values. The kernel unpacks the bits as:
 #   bit0 = FIXED_HOTNESS, bit1 = SUM_POOLING, bit2 = IS_WEIGHTED, bit3 = LOAD_INDICES
@@ -93,24 +105,25 @@ LICENSE_HEADER = """\
 
 
 def combinations():
-    """Yield (element, idx, acc, wgt, cache, width, sz, mask) for every dispatched kernel."""
+    """Yield (element, idx, acc, wgt, out, cache, width, sz, mask) for every dispatched kernel."""
     for element in ELEMENT_TYPES:
         for acc, wgt in ACC_WEIGHT:
-            for idx, cache in IDX_CACHE:
-                for width in VEC_WIDTHS:
-                    for sz in SZ_ACCUM:
+            for out in OUTPUT_TYPES:
+                for idx, cache in IDX_CACHE:
+                    for width, sz in WIDTH_ACCUM:
                         for mask in MASKS:
-                            yield (element, idx, acc, wgt, cache, width, sz, mask)
+                            yield (element, idx, acc, wgt, out, cache, width, sz, mask)
 
 
 def template_args(combo):
-    """Return the angle-bracket template argument list for FindAndCombine<...>."""
-    element, idx, acc, wgt, cache, width, sz, mask = combo
+    """Return the angle-bracket template argument list for nve_fac_launch<...>."""
+    element, idx, acc, wgt, out, cache, width, sz, mask = combo
     elem_id = f"DataType_t::{element}"
     input_vec = f"typename QuantizationHelper<{elem_id}>::Vec{width}"
+    out_vec = f"typename VecWidthHelper<{out}>::Vec{width}"
     elem_vec = f"typename VecWidthHelper<typename QuantizationHelper<{elem_id}>::ParamType>::Vec{width}"
     acc_vec = f"typename VecWidthHelper<{acc}>::Vec{width}"
-    return (f"{elem_id}, {idx}, {acc}, {wgt}, {input_vec}, {elem_vec}, {acc_vec}, "
+    return (f"{elem_id}, {idx}, {acc}, {wgt}, {out}, {input_vec}, {out_vec}, {elem_vec}, {acc_vec}, "
             f"{cache}, {sz}u, {mask}u")
 
 
@@ -121,7 +134,7 @@ def instantiation(combo, extern):
     function links across TUs without relocatable device code, and instantiating it co-locates the
     kernel launch / device-code instantiation in the same TU.
     """
-    _element, idx, _acc, wgt, cache, _width, _sz, _mask = combo
+    _element, idx, _acc, wgt, _out, cache, _width, _sz, _mask = combo
     prefix = "extern template" if extern else "template"
     return (
         f"{prefix} void nve_fac_launch<{template_args(combo)}>(\n"
@@ -143,31 +156,36 @@ def write_if_different(path, content):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True, help="Directory for generated files.")
-    parser.add_argument("--per-file", type=int, default=INSTANTIATIONS_PER_FILE,
-                        help=f"Explicit instantiations per .cu file (default {INSTANTIATIONS_PER_FILE}).")
+    parser.add_argument("--num-tus", type=int, default=NUM_TUS,
+                        help=f"Number of generated .cu files to split the matrix across (default {NUM_TUS}).")
     args = parser.parse_args()
 
-    per_file = args.per_file
-    if per_file < 1:
-        parser.error("--per-file must be >= 1")
+    if args.num_tus < 1:
+        parser.error("--num-tus must be >= 1")
 
     os.makedirs(args.out_dir, exist_ok=True)
     combos = list(combinations())
+
+    # Split the matrix across (at most) num_tus files as evenly as possible. per_file is the ceiling
+    # so no file exceeds it; num_files is then recomputed from per_file so we never emit empty
+    # trailing TUs (e.g. when num_tus exceeds the combination count).
+    num_files = min(args.num_tus, len(combos))
+    per_file = (len(combos) + num_files - 1) // num_files
+    num_files = (len(combos) + per_file - 1) // per_file
 
     # extern template declaration header.
     extern_lines = [LICENSE_HEADER,
                     "#pragma once",
                     "",
                     "// extern template declarations of the nve_fac_launch host wrapper for every",
-                    "// dispatched FindAndCombine combination.",
+                    "// dispatched find_and_combine combination.",
                     ""]
     extern_lines += [instantiation(c, extern=True) for c in combos]
     extern_lines.append("")
     write_if_different(os.path.join(args.out_dir, "find_and_combine_kernel_extern.inc"),
                        "\n".join(extern_lines))
 
-    # Explicit instantiation .cu files, per_file instantiations each.
-    num_files = (len(combos) + per_file - 1) // per_file
+    # Explicit instantiation .cu files, up to per_file instantiations each.
     width = max(3, len(str(num_files - 1)))
     sources = []
     for fidx in range(num_files):
@@ -201,8 +219,8 @@ def main():
     write_if_different(os.path.join(args.out_dir, "find_and_combine_generated.cmake"),
                        "\n".join(cmake_lines))
 
-    print(f"Generated {len(combos)} FindAndCombine instantiations across {num_files} files "
-          f"({per_file}/file) in {args.out_dir}")
+    print(f"Generated {len(combos)} find_and_combine instantiations across {num_files} TUs "
+          f"(<= {per_file}/file) in {args.out_dir}")
 
 
 if __name__ == "__main__":

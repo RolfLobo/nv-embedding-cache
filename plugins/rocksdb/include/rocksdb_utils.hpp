@@ -40,15 +40,8 @@ class RuntimeError<rocksdb::Status> : public Exception {
   RuntimeError() = delete;
 
   inline RuntimeError(const char file[], const int line, const char expr[],
-                      const rocksdb::Status& status, const std::string& hint) noexcept
+                      const rocksdb::Status& status, const std::string& hint)
       : base_type(file, line, expr, hint), status_{status} {}
-
-  inline RuntimeError(const RuntimeError& that) noexcept : base_type(that) {}
-
-  inline RuntimeError& operator=(const RuntimeError& that) noexcept {
-    base_type::operator=(that);
-    return *this;
-  }
 
   inline rocksdb::Status status() const noexcept { return status_; }
 

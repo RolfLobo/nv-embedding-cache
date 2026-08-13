@@ -38,6 +38,15 @@
 
 namespace nve {
 
+// Own the CUDA resources below so a failing ASSERT (which returns from the
+// enclosing test body) cannot leak them. Tests that assert on the release
+// status call the CUDA API directly on .release() instead.
+template <typename T>
+using DevicePtr = std::unique_ptr<T, decltype(&cudaFree)>;
+template <typename T>
+using PinnedPtr = std::unique_ptr<T, decltype(&cudaFreeHost)>;
+using StreamPtr = std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)>;
+
 struct HostLayerTestParams {
   int64_t row_size_bytes;
   int64_t num_rows;
@@ -69,7 +78,7 @@ public:
   }
 
   std::vector<DataType> lookup(const std::vector<KeyType>& keys,
-                               max_bitmask_repr_t* hitmask = nullptr,
+                               bitmask64_t* hitmask = nullptr,
                                float* hitrates = nullptr) {
     const auto& params = GetParam();
     std::vector<DataType> out(keys.size() * data_elements(), DataType{0});
@@ -114,6 +123,7 @@ private:
     cfg.value_dtype = params.value_dtype;
     cfg.max_threads = 64;
     cfg.max_value_size = params.row_size_bytes;
+    cfg.num_rows = params.num_rows;
 
     const size_t table_size = static_cast<size_t>(params.row_size_bytes * params.num_rows);
     NVE_CHECK_(cudaMallocHost(&h_table_, table_size));
@@ -153,14 +163,14 @@ void test_lookup_with_hitmask(HostLayerTest<KeyType>* t) {
   const std::vector<KeyType> keys{static_cast<KeyType>(0), static_cast<KeyType>(5),
                                   static_cast<KeyType>(42), static_cast<KeyType>(1337)};
   const size_t mask_words = (keys.size() + 63) / 64;
-  std::vector<max_bitmask_repr_t> hitmask(mask_words, 0xdeadbeefdeadbeefULL);  // garbage on entry
+  std::vector<bitmask64_t> hitmask(mask_words, 0xdeadbeefdeadbeefULL);  // garbage on entry
   float hitrates[1] = {-1.0f};
   const auto out = t->lookup(keys, hitmask.data(), hitrates);
 
-  // Every key in a LinearHostTable resolves — the kernel sets all-ones.
+  // Every requested key is in range, so the kernel sets all requested bits.
   for (size_t i = 0; i < keys.size(); i++) {
-    const auto bit = (hitmask[i / 64] >> (i % 64)) & max_bitmask_repr_t{1};
-    EXPECT_EQ(bit, max_bitmask_repr_t{1}) << "key index " << i << " missing in hitmask";
+    const auto bit = (hitmask[i / 64] >> (i % 64)) & bitmask64_t{1};
+    EXPECT_EQ(bit, bitmask64_t{1}) << "key index " << i << " missing in hitmask";
   }
   EXPECT_FLOAT_EQ(hitrates[0], 1.0f);
 
@@ -184,12 +194,12 @@ void test_lookup_hitmask_multiple_of_64(HostLayerTest<KeyType>* t) {
     keys[static_cast<size_t>(i)] = static_cast<KeyType>(i);
   }
   const size_t mask_words = (keys.size() + 63) / 64;  // == kNumKeys/64, no extra word
-  std::vector<max_bitmask_repr_t> hitmask(mask_words, 0);
+  std::vector<bitmask64_t> hitmask(mask_words, 0);
   const auto out = t->lookup(keys, hitmask.data(), /*hitrates=*/nullptr);
 
-  // Every key resolves -> all bits in every word set.
+  // Every requested key is in range, so all bits in every word are set.
   for (size_t w = 0; w < mask_words; w++) {
-    EXPECT_EQ(hitmask[w], ~max_bitmask_repr_t{0}) << "word " << w << " not all-ones";
+    EXPECT_EQ(hitmask[w], ~bitmask64_t{0}) << "word " << w << " not all-ones";
   }
   for (size_t k = 0; k < keys.size(); k++) {
     const auto expected = t->read_backing_row(keys[k]);
@@ -243,24 +253,28 @@ void test_lookup_gpu_input(HostLayerTest<KeyType>* t) {
   const size_t key_bytes = h_keys.size() * sizeof(KeyType);
   const size_t output_bytes = h_keys.size() * static_cast<size_t>(params.row_size_bytes);
 
-  KeyType* d_keys = nullptr;
-  void* d_output = nullptr;
-  ASSERT_EQ(cudaMalloc(&d_keys, key_bytes), cudaSuccess);
-  ASSERT_EQ(cudaMalloc(&d_output, output_bytes), cudaSuccess);
-  ASSERT_EQ(cudaMemcpy(d_keys, h_keys.data(), key_bytes, cudaMemcpyHostToDevice), cudaSuccess);
+  KeyType* raw_keys = nullptr;
+  void* raw_output = nullptr;
+  ASSERT_EQ(cudaMalloc(&raw_keys, key_bytes), cudaSuccess);
+  DevicePtr<KeyType> d_keys(raw_keys, cudaFree);
+  ASSERT_EQ(cudaMalloc(&raw_output, output_bytes), cudaSuccess);
+  DevicePtr<void> d_output(raw_output, cudaFree);
+  ASSERT_EQ(cudaMemcpy(d_keys.get(), h_keys.data(), key_bytes, cudaMemcpyHostToDevice),
+            cudaSuccess);
 
-  cudaStream_t stream = nullptr;
-  ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-  auto ctx = t->layer_->create_execution_context(stream, stream, nullptr, nullptr);
+  cudaStream_t raw_stream = nullptr;
+  ASSERT_EQ(cudaStreamCreate(&raw_stream), cudaSuccess);
+  StreamPtr stream(raw_stream, cudaStreamDestroy);
+  auto ctx = t->layer_->create_execution_context(stream.get(), stream.get(), nullptr, nullptr);
 
-  t->layer_->lookup(ctx, static_cast<int64_t>(h_keys.size()), d_keys, d_output,
+  t->layer_->lookup(ctx, static_cast<int64_t>(h_keys.size()), d_keys.get(), d_output.get(),
                     params.row_size_bytes, /*hitmask=*/nullptr, /*pool_params=*/nullptr,
                     /*hitrates=*/nullptr);
 
   std::vector<float> h_output(h_keys.size() * t->data_elements(), 0.0f);
-  ASSERT_EQ(cudaMemcpyAsync(h_output.data(), d_output, output_bytes,
-                            cudaMemcpyDeviceToHost, stream), cudaSuccess);
-  ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  ASSERT_EQ(cudaMemcpyAsync(h_output.data(), d_output.get(), output_bytes,
+                            cudaMemcpyDeviceToHost, stream.get()), cudaSuccess);
+  ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
   for (size_t k = 0; k < h_keys.size(); k++) {
     const auto expected = t->read_backing_row(h_keys[k]);
@@ -271,15 +285,13 @@ void test_lookup_gpu_input(HostLayerTest<KeyType>* t) {
   }
 
   ctx.reset();
-  cudaStreamDestroy(stream);
-  cudaFree(d_keys);
-  cudaFree(d_output);
+  EXPECT_EQ(cudaStreamDestroy(stream.release()), cudaSuccess);
 }
 
 // A layer configured with a default_embedding but called without a caller-
-// supplied hitmask must allocate one internally rather than failing. (With a
-// LinearHostTable every key resolves, so the default fill itself is a no-op,
-// but the internal-hitmask allocation path still runs and must be safe.)
+// supplied hitmask must allocate one internally rather than failing. (Every
+// requested key is in range, so the default fill itself is a no-op, but the
+// internal-hitmask allocation path still runs and must be safe.)
 template <typename KeyType>
 void test_default_embedding_no_hitmask(HostLayerTest<KeyType>* t) {
   const auto& params = t->GetParam();
@@ -521,14 +533,15 @@ void test_quant_pooling(DataType_t qtype) {
   const bool scale_f16 =
       (qtype == DataType_t::QInt8RowwiseF16 || qtype == DataType_t::QUint8RowwiseF16);
 
-  int8_t* buf = nullptr;
-  ASSERT_EQ(cudaMallocHost(&buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  int8_t* raw_buf = nullptr;
+  ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
 
   // deq[r][e] is the dequantized value the layer should produce for that element.
   std::vector<std::vector<float>> deq(static_cast<size_t>(num_rows),
                                       std::vector<float>(static_cast<size_t>(num_values)));
   for (int64_t r = 0; r < num_rows; r++) {
-    int8_t* row = buf + r * row_stride;
+    int8_t* row = buf.get() + r * row_stride;
     for (int64_t e = 0; e < num_values; e++) {
       if (uint_quant) {
         reinterpret_cast<uint8_t*>(row)[e] = static_cast<uint8_t>((r * 7 + e * 3) % 251);  // [0,250]
@@ -566,7 +579,8 @@ void test_quant_pooling(DataType_t qtype) {
   cfg.value_dtype = qtype;
   cfg.max_threads = 16;
   cfg.max_value_size = row_stride;
-  cfg.emb_table = buf;
+  cfg.num_rows = num_rows;
+  cfg.emb_table = buf.get();
   auto table = std::make_shared<LinearHostTable<KeyType>>(cfg);
   typename HostEmbeddingLayer<KeyType>::Config lcfg;
   lcfg.layer_name = "host_layer_quant";
@@ -635,7 +649,7 @@ void test_quant_pooling(DataType_t qtype) {
   ctx.reset();
   layer.reset();
   table.reset();
-  cudaFreeHost(buf);
+  EXPECT_EQ(cudaFreeHost(buf.release()), cudaSuccess);
 }
 
 TEST(HostLayerQuantInt32, pooling_qint8_f32) {
@@ -761,18 +775,20 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
   const int64_t num_rows = 32;
   const int64_t row_stride = pooling_row_stride(in_dtype, num_values);
 
-  int8_t* buf = nullptr;
-  ASSERT_EQ(cudaMallocHost(&buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  int8_t* raw_buf = nullptr;
+  ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
 
   // val[r][e] is the effective (dequantized / stored) value the layer should see.
   std::vector<std::vector<float>> val;
-  fill_value_table(in_dtype, num_values, num_rows, buf, row_stride, val);
+  fill_value_table(in_dtype, num_values, num_rows, buf.get(), row_stride, val);
 
   LinearHostTableConfig cfg;
   cfg.value_dtype = in_dtype;
   cfg.max_threads = 16;
   cfg.max_value_size = row_stride;
-  cfg.emb_table = buf;
+  cfg.num_rows = num_rows;
+  cfg.emb_table = buf.get();
   auto table = std::make_shared<LinearHostTable<KeyType>>(cfg);
   typename HostEmbeddingLayer<KeyType>::Config lcfg;
   lcfg.layer_name = "host_layer_combo";
@@ -881,7 +897,7 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
   ctx.reset();
   layer.reset();
   table.reset();
-  cudaFreeHost(buf);
+  EXPECT_EQ(cudaFreeHost(buf.release()), cudaSuccess);
 }
 
 #define COMBO_TEST(name, in_dt, out_dt, w_dt, sparse)                        \
@@ -935,16 +951,18 @@ void test_pooling_concat_convert(DataType_t in_dtype, DataType_t out_dtype) {
   const int64_t num_rows = 32;
   const int64_t row_stride = pooling_row_stride(in_dtype, num_values);
 
-  int8_t* buf = nullptr;
-  ASSERT_EQ(cudaMallocHost(&buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  int8_t* raw_buf = nullptr;
+  ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
   std::vector<std::vector<float>> val;
-  fill_value_table(in_dtype, num_values, num_rows, buf, row_stride, val);
+  fill_value_table(in_dtype, num_values, num_rows, buf.get(), row_stride, val);
 
   LinearHostTableConfig cfg;
   cfg.value_dtype = in_dtype;
   cfg.max_threads = 16;
   cfg.max_value_size = row_stride;
-  cfg.emb_table = buf;
+  cfg.num_rows = num_rows;
+  cfg.emb_table = buf.get();
   auto table = std::make_shared<LinearHostTable<KeyType>>(cfg);
   typename HostEmbeddingLayer<KeyType>::Config lcfg;
   lcfg.layer_name = "host_layer_concat";
@@ -990,7 +1008,7 @@ void test_pooling_concat_convert(DataType_t in_dtype, DataType_t out_dtype) {
   ctx.reset();
   layer.reset();
   table.reset();
-  cudaFreeHost(buf);
+  EXPECT_EQ(cudaFreeHost(buf.release()), cudaSuccess);
 }
 
 #define CONCAT_TEST(name, in_dt, out_dt)                              \
@@ -1026,16 +1044,18 @@ void test_weighted_mean_zero_weight_sum(DataType_t in_dtype) {
   const int64_t num_rows = 16;
   const int64_t row_stride = pooling_row_stride(in_dtype, num_values);
 
-  int8_t* buf = nullptr;
-  ASSERT_EQ(cudaMallocHost(&buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  int8_t* raw_buf = nullptr;
+  ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
+  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
   std::vector<std::vector<float>> val;
-  fill_value_table(in_dtype, num_values, num_rows, buf, row_stride, val);
+  fill_value_table(in_dtype, num_values, num_rows, buf.get(), row_stride, val);
 
   LinearHostTableConfig cfg;
   cfg.value_dtype = in_dtype;
   cfg.max_threads = 8;
   cfg.max_value_size = row_stride;
-  cfg.emb_table = buf;
+  cfg.num_rows = num_rows;
+  cfg.emb_table = buf.get();
   auto table = std::make_shared<LinearHostTable<KeyType>>(cfg);
   typename HostEmbeddingLayer<KeyType>::Config lcfg;
   lcfg.layer_name = "host_layer_zero_w";
@@ -1069,7 +1089,7 @@ void test_weighted_mean_zero_weight_sum(DataType_t in_dtype) {
   ctx.reset();
   layer.reset();
   table.reset();
-  cudaFreeHost(buf);
+  EXPECT_EQ(cudaFreeHost(buf.release()), cudaSuccess);
 }
 
 TEST(HostLayerWeightedMeanInt32, zero_weight_sum_fp32) {

@@ -34,6 +34,15 @@ string(STRIP "${NVE_VERSION}" NVE_VERSION)
 
 project(NV_Embedding_Cache LANGUAGES C CXX CUDA VERSION ${NVE_VERSION}) # Version format: Year.Month.Patch
 
+# Keep the displayed version zero-padded while emitting valid decimal integer literals.
+foreach(NVE_VERSION_COMPONENT MAJOR MINOR PATCH)
+  string(REGEX REPLACE "^0+([0-9])" "\\1"
+    NVE_VERSION_${NVE_VERSION_COMPONENT}
+    "${CMAKE_PROJECT_VERSION_${NVE_VERSION_COMPONENT}}"
+  )
+endforeach()
+unset(NVE_VERSION_COMPONENT)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -46,14 +55,13 @@ list(APPEND NVE_AVAILABLE_FEATURES
   "phmap_plugin"
   "redis_plugin"
   "rocksdb_plugin"
+  "internal_plugin"
 )
-list(APPEND NVE_AVAILABLE_FEATURES "ht_mask_8" "ht_mask_16" "ht_mask_32" "ht_mask_64")
 list(APPEND NVE_AVAILABLE_FEATURES "ht_key_8" "ht_key_16" "ht_key_32" "ht_key_64")
 list(APPEND NVE_AVAILABLE_FEATURES "ht_kernel_8" "ht_kernel_16" "ht_kernel_32" "ht_kernel_64" "ht_kernel_128" "ht_kernel_256" "ht_kernel_512" "ht_kernel_1024")
 list(APPEND NVE_AVAILABLE_FEATURES "ht_part_fnv1a" "ht_part_murmur3" "ht_part_rrxmrrxmsx0" "ht_part_std_hash")
 
 set(NVE_MINIMAL_FEATURES "")
-list(APPEND NVE_MINIMAL_FEATURES "ht_mask_64")
 list(APPEND NVE_MINIMAL_FEATURES "ht_key_64")
 list(APPEND NVE_MINIMAL_FEATURES "ht_part_fnv1a")
 list(APPEND NVE_MINIMAL_FEATURES "ht_kernel_64")
@@ -210,13 +218,15 @@ if(NOT DEFINED NVE_SM_VERSION)
         RESULT_VARIABLE SMI_FOUND
         OUTPUT_QUIET
     )
+    # Default compute caps for CI
+    set(DEFAULT_CMAKE_SM_VERSIONS 89 90 100 120)
     if(SMI_FOUND EQUAL "0")
         execute_process (
             COMMAND bash -c "nvidia-smi --query-gpu=compute_cap --id=0 --format=csv"
             OUTPUT_VARIABLE SMI_COMPUTE
         )
         if(SMI_COMPUTE MATCHES "^No devices were found.*")
-          set(NVE_SM_VERSION "80;86;89;90;100")
+          set(NVE_SM_VERSION ${DEFAULT_CMAKE_SM_VERSIONS})
         else()
           string(REPLACE "compute_cap" "" SMI_COMPUTE ${SMI_COMPUTE})
           string(REPLACE "\n" "" SMI_COMPUTE ${SMI_COMPUTE})
@@ -224,7 +234,7 @@ if(NOT DEFINED NVE_SM_VERSION)
           message(STATUS "Using NVE_SM_VERSION=" ${NVE_SM_VERSION} " from nvidia-smi")
         endif()
     else()
-        set(NVE_SM_VERSION 80 86 90 100)
+        set(NVE_SM_VERSION ${DEFAULT_CMAKE_SM_VERSIONS})
         message(STATUS "Could not find nvidia-smi! Using default SM versions: " ${NVE_SM_VERSION})
     endif()
 endif()

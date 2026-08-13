@@ -73,16 +73,8 @@ class RuntimeError<cudaError_t> : public Exception {
   RuntimeError() = delete;
 
   inline RuntimeError(const char file[], const int line, const char expr[],
-                      const cudaError_t& error, const std::string& hint) noexcept
+                      const cudaError_t& error, const std::string& hint)
       : base_type(file, line, expr, hint), error_{error} {}
-
-  inline RuntimeError(const RuntimeError& that) noexcept : base_type(that), error_{that.error_} {}
-
-  inline RuntimeError& operator=(const RuntimeError& that) noexcept {
-    base_type::operator=(that);
-    error_ = that.error_;
-    return *this;
-  }
 
   inline cudaError_t error() const noexcept { return error_; }
 

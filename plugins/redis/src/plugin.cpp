@@ -15,27 +15,9 @@
  * limitations under the License.
  */
 
-#include <plugin.hpp>
+#include <plugin/nve_internal_plugin.hpp>
 #include <redis_cluster_table.hpp>
 
-extern "C" const char* plugin_ident() noexcept { return "NVIDIA plugin for Redis"; }
-
-extern "C" const char* plugin_developer() noexcept { return "NVIDIA Corporation"; }
-
-extern "C" void enum_host_table_implementations(void* dll,
-                                                void (*callback)(void*, const char*)) noexcept {
-  callback(dll, "redis_cluster");
-}
-
-using namespace nve;
-using namespace nve::plugin;
-
-#pragma GCC diagnostic push
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-extern "C" host_table_factory_ptr_t create_redis_cluster_table_factory(const nlohmann::json& json) {
-#pragma GCC diagnostic pop
-  return {new RedisClusterTableFactory(static_cast<RedisClusterTableFactoryConfig>(json)),
-          [](RedisClusterTableFactory* const p) { delete p; }};
-}
+NVE_DEFINE_INTERNAL_PLUGIN("NVIDIA plugin for Redis", "NVIDIA Corporation",
+                           nve::plugin::RedisClusterTableFactory,
+                           nve::plugin::RedisClusterTableFactoryConfig)

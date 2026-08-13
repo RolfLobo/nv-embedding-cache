@@ -17,23 +17,24 @@
 
 #include <stl_map_backed_table.hpp>
 #include <atomic>
+#include <random>
 #include <buffer_wrapper.hpp>
 #include <thread_pool.hpp>
 #include <execution_context.hpp>
 
 namespace nve {
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::STLContainerTable(
+STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::STLContainerTable(
     const table_id_t id, const config_type& config)
     : base_type(id, config), parts_(static_cast<size_t>(config.num_partitions)) {
   NVE_CHECK_(config.key_size == sizeof(key_type));
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::clear(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::clear(
     context_ptr_t& ctx) {
   const auto& __restrict config{this->config_};
 
@@ -52,9 +53,9 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::erase(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::erase(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw) {
   if (n <= 0) return;
   const auto& __restrict config{this->config_};
@@ -90,11 +91,11 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::find(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::find(
     context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys_bw,
-    buffer_ptr<max_bitmask_repr_t> hit_mask_bw, const int64_t value_stride,
+    buffer_ptr<bitmask64_t> hit_mask_bw, const int64_t value_stride,
     buffer_ptr<void> values_bw, buffer_ptr<int64_t> value_sizes_bw) const {
   if (n <= 0) return;
   const auto& __restrict config{this->config_};
@@ -103,7 +104,7 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   const void* const keys_vptr{
       keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
               : nullptr};
-  max_bitmask_repr_t* const hit_mask{
+  bitmask64_t* const hit_mask{
       hit_mask_bw ? hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
                                                lookup_stream)
                   : nullptr};
@@ -116,7 +117,7 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
                                                      false /*copy_content*/, lookup_stream)
                      : nullptr};
   const key_type* const keys{reinterpret_cast<const key_type*>(keys_vptr)};
-  mask_repr_type* const hm{reinterpret_cast<mask_repr_type*>(hit_mask)};
+  bitmask64_t* const hm{reinterpret_cast<bitmask64_t*>(hit_mask)};
   char* const values{reinterpret_cast<char*>(values_vptr)};
 
   if (config.prefetch_values) {
@@ -153,9 +154,9 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   *counter += n;
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::insert(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::insert(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
     const int64_t value_stride, const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
@@ -227,7 +228,7 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
         if constexpr (std::is_same_v<meta_type, no_meta_type>) {
           // Randomly shuffle slots.
           std::shuffle(keys_slots.begin(), keys_slots.end(),
-                       std::default_random_engine{random_device()});
+                       std::default_random_engine{random_seed()});
 
           (void)max_value_size;
         } else {
@@ -291,9 +292,9 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::size(
+int64_t STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::size(
     context_ptr_t& ctx, const bool) const {
   const auto& __restrict config{this->config_};
 
@@ -316,9 +317,9 @@ int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerTy
   return total_n.load(std::memory_order_relaxed);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::update(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::update(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
     const int64_t value_stride, const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
@@ -362,9 +363,9 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
-void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::update_accumulate(
+void STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::update_accumulate(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
     const int64_t update_stride, const int64_t update_size, buffer_ptr<const void> updates_bw,
     const DataType_t update_dtype) {
@@ -410,16 +411,16 @@ void STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>
   ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
 }
 
-template <typename ConfigType, typename MaskType, typename KeyType, typename MetaType,
+template <typename ConfigType, typename KeyType, typename MetaType,
           typename PartitionerType>
 template <bool PrefetchValues, bool WithValues, bool WithValueSizes>
-int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerType>::find_(
+int64_t STLContainerTable<ConfigType, KeyType, MetaType, PartitionerType>::find_(
     context_ptr_t& ctx, const int64_t n, const key_type* const __restrict keys,
-    mask_repr_type* const __restrict hit_mask, const int64_t value_stride, char* const __restrict values,
+    bitmask64_t* const __restrict hit_mask, const int64_t value_stride, char* const __restrict values,
     int64_t* const __restrict value_sizes) const {
   const auto& __restrict config{this->config_};
 
-  const int64_t hm_size{mask_type::mask_size(n)};
+  const int64_t hm_size{ceil_div(n, bitmask64::num_bits)};
 
   const int64_t max_value_size{config.max_value_size};
   NVE_CHECK_(value_stride >= max_value_size);
@@ -453,19 +454,18 @@ int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerTy
       const auto slot_map_end{slot_map.end()};
 
       char* __restrict prev_src{};
-      char* __restrict prev_dst;
+      char* __restrict prev_dst{};
       int64_t prev_value_size{max_value_size};
       const lru_meta_type lru_time{lru_meta_value()};
 
       for (int64_t hm_idx{}; hm_idx != task_size; ++hm_idx) {       
         const int64_t hm_off{(hm_off0 + hm_idx) % hm_size};
-        mask_repr_type mask{mask_type::load(&hit_mask[hm_off])};
-        num_hits -= mask_type::count(mask);
-        const int64_t i{hm_off * mask_type::num_bits};
+        bitmask64_t mask{bitmask64::load(&hit_mask[hm_off])};
+        num_hits -= bitmask64::count(mask);
+        const int64_t i{hm_off * bitmask64::num_bits};
 
-        for (auto it{mask_type::clip(mask_type::invert(mask), n - i)}; mask_type::has_next(it);
-             it = mask_type::skip(it)) {
-          const int64_t j{mask_type::next(it)};
+        for (auto it{bitmask64::clip(~mask, n - i)}; it; it = bitmask64::skip(it)) {
+          const int64_t j{bitmask64::next(it)};
           const int64_t ij{i + j};
 
           const key_type key{keys[ij]};
@@ -489,12 +489,7 @@ int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerTy
             if constexpr (PrefetchValues) {
               l1_prefetch(src, dst, std::min(value_size, 8 * cpu_cache_line_size));
               if (prev_src) {
-#pragma GCC diagnostic push
-#if !defined(__clang__)
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
                 std::copy_n(prev_src, static_cast<uint64_t>(prev_value_size), prev_dst);
-#pragma GCC diagnostic pop
               }
               prev_src = src;
               prev_dst = dst;
@@ -508,21 +503,16 @@ int64_t STLContainerTable<ConfigType, MaskType, KeyType, MetaType, PartitionerTy
           }
           
           update_meta_data<meta_type>(&src[max_value_size], lru_time);
-          mask = mask_type::set(mask, j);
+          mask |= bitmask64::single(j);
         }
 
-        num_hits += mask_type::count(mask);
-        mask_type::atomic_join(&hit_mask[hm_off], mask);
+        num_hits += bitmask64::count(mask);
+        bitmask64::atomic_join(&hit_mask[hm_off], mask);
       }
 
       if constexpr (WithValues && PrefetchValues) {
         if (prev_src) {
-#pragma GCC diagnostic push
-#if !defined(__clang__)
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
           std::copy_n(prev_src, static_cast<uint64_t>(prev_value_size), prev_dst);
-#pragma GCC diagnostic pop
         }
       }
     }

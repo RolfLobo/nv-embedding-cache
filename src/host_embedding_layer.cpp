@@ -22,7 +22,7 @@
 #include "include/thread_pool.hpp"
 #include "include/bit_ops.hpp"
 #include "include/layer_utils.hpp"
-#include "cpu_ops/cpu_pooling.h"
+#include "cpu_ops/cpu_pooling.hpp"
 #include <cstring>
 
 namespace nve {
@@ -30,7 +30,7 @@ namespace nve {
 template <typename KeyType>
 HostEmbeddingLayer<KeyType>::HostEmbeddingLayer(const Config& cfg, table_ptr_t table,
                                                 allocator_ptr_t allocator)
-    : config_(cfg), allocator_(allocator ? allocator : GetDefaultAllocator()), table_(std::move(table)) {
+    : config_(cfg), allocator_(allocator ? std::move(allocator) : GetDefaultAllocator()), table_(std::move(table)) {
   NVE_CHECK_(table_ != nullptr, "Invalid table");
   NVE_CHECK_(table_->get_device_id() < 0, "HostEmbeddingLayer requires a host table (device_id < 0)");
   if (config_.default_embedding.size() > 0) {
@@ -55,7 +55,7 @@ template <typename KeyType>
 void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_keys,
                                          const void* keys, void* output,
                                          const int64_t output_stride,
-                                         max_bitmask_repr_t* output_hitmask,
+                                         bitmask64_t* output_hitmask,
                                          const PoolingParams* pool_params,
                                          float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
@@ -66,9 +66,9 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   const cudaStream_t lookup_stream = ctx->get_lookup_stream();
 
   const size_t num_keys_sz = static_cast<size_t>(num_keys);
-  constexpr size_t hitmask_elem_bits = sizeof(max_bitmask_repr_t) * 8;
+  constexpr size_t hitmask_elem_bits = sizeof(bitmask64_t) * 8;
   const size_t hitmask_elements = (num_keys_sz + hitmask_elem_bits - 1) / hitmask_elem_bits;
-  const size_t hitmask_buffer_size = hitmask_elements * sizeof(max_bitmask_repr_t);
+  const size_t hitmask_buffer_size = hitmask_elements * sizeof(bitmask64_t);
   const size_t key_buffer_size = sizeof(KeyType) * num_keys_sz;
   const size_t row_size = static_cast<size_t>(table_->get_max_row_size());
 
@@ -121,14 +121,14 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   // a host-resident scratch buffer from the context. When neither applies, pass
   // null through to the table (it skips recording hits entirely).
   const bool need_hitmask = (output_hitmask != nullptr) || (config_.default_embedding.size() > 0);
-  std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw;
+  std::shared_ptr<BufferWrapper<bitmask64_t>> hitmask_bw;
   if (need_hitmask) {
-    max_bitmask_repr_t* hitmask_ptr = output_hitmask;
+    bitmask64_t* hitmask_ptr = output_hitmask;
     if (hitmask_ptr == nullptr) {
-      hitmask_ptr = reinterpret_cast<max_bitmask_repr_t*>(
+      hitmask_ptr = reinterpret_cast<bitmask64_t*>(
           ctx->get_buffer("hitmask", hitmask_buffer_size, /*host_alloc=*/true));
     }
-    hitmask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(ctx, "hitmask", hitmask_ptr, hitmask_buffer_size);
+    hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", hitmask_ptr, hitmask_buffer_size);
     auto* hitmask_host = hitmask_bw->access_buffer(cudaMemoryTypeUnregistered,
                                                    /*copy_content=*/false,
                                                    lookup_stream);
@@ -139,7 +139,7 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   // when not pooling, or a host scratch buffer of raw per-key rows when pooling).
   table_->reset_lookup_counter(ctx);
   std::shared_ptr<BufferWrapper<int64_t>> value_sizes{nullptr};
-  table_->find(ctx, num_keys, keys_bw, hitmask_bw, gather_stride, gather_bw, std::move(value_sizes));
+  table_->find(ctx, num_keys, std::move(keys_bw), hitmask_bw, gather_stride, gather_bw, std::move(value_sizes));
   int64_t hits = 0;
   table_->get_lookup_counter(ctx, &hits);
   if (!table_->lookup_counter_hits()) {
@@ -171,7 +171,7 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
       for (int64_t k = start_key; k < end_key; k++) {
         const size_t k_sz = static_cast<size_t>(k);
         const auto elem = hit_mask_buf[k_sz / hitmask_elem_bits];
-        const auto bit = (elem >> (k_sz % hitmask_elem_bits)) & static_cast<max_bitmask_repr_t>(1);
+        const auto bit = (elem >> (k_sz % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
         if (bit == 0) {
           std::memcpy(gather_bytes + k * gather_stride, default_emb, row_size);
         }

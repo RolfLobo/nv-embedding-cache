@@ -16,27 +16,8 @@
  */
 
 #include <abseil_flat_map_table.hpp>
-#include <plugin.hpp>
+#include <plugin/nve_internal_plugin.hpp>
 
-extern "C" const char* plugin_ident() noexcept { return "Google Abseil hashtable plugin"; }
-
-extern "C" const char* plugin_developer() noexcept { return "NVIDIA Corporation"; }
-
-extern "C" void enum_host_table_implementations(void* dll,
-                                                void (*callback)(void*, const char*)) noexcept {
-  callback(dll, "abseil_flat_map");
-}
-
-using namespace nve;
-using namespace nve::plugin;
-
-#pragma GCC diagnostic push
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-extern "C" host_table_factory_ptr_t create_abseil_flat_map_table_factory(
-    const nlohmann::json& json) {
-#pragma GCC diagnostic pop
-  return {new AbseilFlatMapTableFactory(static_cast<AbseilFlatMapTableFactoryConfig>(json)),
-          [](AbseilFlatMapTableFactory* const p) { delete p; }};
-}
+NVE_DEFINE_INTERNAL_PLUGIN("Google Abseil hashtable plugin", "NVIDIA Corporation",
+                           nve::plugin::AbseilFlatMapTableFactory,
+                           nve::plugin::AbseilFlatMapTableFactoryConfig)

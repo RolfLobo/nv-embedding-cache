@@ -22,13 +22,16 @@
 namespace nve {
 
 template <typename T, typename U>
-void cpu_update_kernel(char* const __restrict table_values,
-                       const char* const __restrict update_values, int64_t n) noexcept {
+constexpr void cpu_update_kernel(void* const __restrict table_values,
+                                 const void* const __restrict update_values, int64_t n) noexcept {
   using tmp_type =
       std::conditional_t<(sizeof(T) > sizeof(float) || sizeof(U) > sizeof(float)), double, float>;
 
-  T* __restrict tab{reinterpret_cast<T* __restrict>(table_values)};
-  const U* __restrict upd{reinterpret_cast<const U* __restrict>(update_values)};
+  T* __restrict const tab{static_cast<T*>(table_values)};
+  NVE_ASSERT_(reinterpret_cast<uintptr_t>(tab) % alignof(T) == 0);
+
+  const U* __restrict const upd{static_cast<const U*>(update_values)};
+  NVE_ASSERT_(reinterpret_cast<uintptr_t>(upd) % alignof(U) == 0);
 
   NVE_ASSERT_(n % sizeof(U) == 0);
   n /= sizeof(U);
@@ -40,7 +43,7 @@ void cpu_update_kernel(char* const __restrict table_values,
   }
 }
 
-using update_kernel_t = void (*)(char* __restrict, const char* __restrict, int64_t n);
+using update_kernel_t = void (*)(void* __restrict, const void* __restrict, int64_t n);
 
 template <typename TableType>
 inline update_kernel_t pick_cpu_update_kernel(const DataType_t update_dtype) {
@@ -64,7 +67,7 @@ inline update_kernel_t pick_cpu_update_kernel(const DataType_t update_dtype) {
   }
 }
 
-update_kernel_t pick_cpu_update_kernel(const DataType_t table_dtype, const DataType_t update_dtype) {
+inline update_kernel_t pick_cpu_update_kernel(const DataType_t table_dtype, const DataType_t update_dtype) {
   switch (table_dtype) {
     case DataType_t::Float32:
       return pick_cpu_update_kernel<type_t<DataType_t::Float32>>(update_dtype);

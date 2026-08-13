@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev
 
 # Copy repo source and build pynve
-WORKDIR /workspace/trt-recsys
+WORKDIR /workspace/nve
 COPY . .
 RUN pip install .
 

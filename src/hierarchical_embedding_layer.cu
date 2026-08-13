@@ -125,7 +125,7 @@ template <typename KeyType>
 void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_keys,
                                                  const void* keys, void* output,
                                                  const int64_t output_stride,
-                                                 max_bitmask_repr_t* output_hitmask,
+                                                 bitmask64_t* output_hitmask,
                                                  const PoolingParams* pool_params,
                                                  float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
@@ -157,9 +157,9 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   // gather straight into the user output. gather_stride is the raw stored row stride for pooling.
   const int64_t gather_stride = do_pool ? row_size : output_stride;
 
-  auto constexpr hitmask_elem_bits = sizeof(max_bitmask_repr_t) * 8;
+  auto constexpr hitmask_elem_bits = sizeof(bitmask64_t) * 8;
   const auto hitmask_elements = (num_keys + hitmask_elem_bits - 1) / hitmask_elem_bits;
-  const auto hitmask_buffer_size = hitmask_elements * sizeof(max_bitmask_repr_t);
+  const auto hitmask_buffer_size = hitmask_elements * sizeof(bitmask64_t);
   const auto output_buffer_size = num_keys * output_stride;
   const auto gather_buffer_size = num_keys * gather_stride;
   const auto key_buffer_size = sizeof(KeyType) * num_keys;
@@ -177,15 +177,15 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   } else {
     gather_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
   }
-  std::shared_ptr<BufferWrapper<max_bitmask_repr_t>> hitmask_bw(nullptr);
+  std::shared_ptr<BufferWrapper<bitmask64_t>> hitmask_bw(nullptr);
 
   // allocate hitmask buffer if needed
   const auto first_device = (*tables_.begin())->get_device_id();
   if (output_hitmask == nullptr) {
-    auto hitmask_buf = reinterpret_cast<max_bitmask_repr_t*>(ctx->get_buffer("hitmask", hitmask_buffer_size, first_device < 0));
-    hitmask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(ctx, "hitmask", hitmask_buf, hitmask_buffer_size);
+    auto hitmask_buf = reinterpret_cast<bitmask64_t*>(ctx->get_buffer("hitmask", hitmask_buffer_size, first_device < 0));
+    hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", hitmask_buf, hitmask_buffer_size);
   } else {
-    hitmask_bw = std::make_shared<BufferWrapper<max_bitmask_repr_t>>(ctx, "hitmask", output_hitmask, hitmask_buffer_size);
+    hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", output_hitmask, hitmask_buffer_size);
   }
   // zero initial hitmask
   const auto hitmask_first_access = hitmask_bw->get_last_access();
@@ -262,7 +262,7 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
       const int64_t end_key = std::min<int64_t>(start_key + keys_per_task, num_keys);
       for (int64_t k = start_key; k < end_key; k++) {
         const auto elem = hit_mask_buf[k / hitmask_elem_bits];
-        const auto bit = (elem >> (k % hitmask_elem_bits)) & static_cast<max_bitmask_repr_t>(1);
+        const auto bit = (elem >> (k % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
         if (bit == 0) {
           std::memcpy(output_bytes + k * gather_stride, default_emb, default_row_size);
         }

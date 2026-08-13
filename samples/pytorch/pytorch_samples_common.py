@@ -119,9 +119,9 @@ def torch_data_type_to_nve_data_type(data_type: torch.dtype):
 def get_remote_interface(path_to_remote_table: str, num_embeddings: int, embedding_dim: int, data_type: torch.dtype):
     """Build a Hierarchical-friendly remote PS via the custom_remote plugin.
 
-    ``path_to_remote_table`` is no longer used (the plugin is resolved by the
-    nve runtime via ``load_host_table_plugin``). The argument is kept so
-    existing callers don't need updating.
+    ``path_to_remote_table`` is no longer used (the plugin SO is resolved by
+    the nve runtime from ``plugin_name``). The argument is kept so existing
+    callers don't need updating.
     """
     nve_dtype = torch_data_type_to_nve_data_type(data_type)
     elem_bytes = 4 if data_type == torch.float32 else 2
@@ -129,7 +129,7 @@ def get_remote_interface(path_to_remote_table: str, num_embeddings: int, embeddi
         row_elements=embedding_dim,
         data_type=nve_dtype,
         plugin_name="libnve-plugin-custom_remote.so",
-        factory_config_json='{"implementation": "custom_remote"}',
+        factory_config_json='{}',
         table_config_json='{"key_size": 8, "max_value_size": '
                           + str(embedding_dim * elem_bytes) + '}',
         num_rows=num_embeddings,

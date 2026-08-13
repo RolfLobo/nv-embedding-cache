@@ -35,8 +35,11 @@ class LinearUVMEmbeddingLayer : public EmbeddingLayerBase {
     std::string layer_name;
     std::shared_ptr<InsertHeuristic> insert_heuristic = nullptr; // nullptr will result in using the default InsertHeuristic
                                                                  // auto inserts can be disabled by using the NeverInsertHeuristic class
-    int64_t min_insert_freq_gpu = 0; // Minimal amount of lookups between inserts on GPU. increase this to throttle down auto inserts
-    int64_t min_insert_size_gpu = 1 << 16; // Minimal amount of keys to trigger an insert on GPU (smaller amounts will be collected)
+    int64_t min_insert_freq_gpu{0};       // Minimal amount of lookups between inserts on GPU. increase this to throttle down auto inserts
+    int64_t min_insert_size_gpu{1 << 16}; // Minimal amount of keys to trigger an insert on GPU (smaller amounts will be collected)
+    int64_t default_row_index{-1};        // Index of a UVM table row holding the default embedding, used by lookups of keys
+                                          // outside [0, uvm_num_rows).
+                                          // Negative disables the check, user is responsible for all keys being valid.
   };
 
   NVE_PREVENT_COPY_AND_MOVE_(LinearUVMEmbeddingLayer);
@@ -49,7 +52,7 @@ class LinearUVMEmbeddingLayer : public EmbeddingLayerBase {
   ~LinearUVMEmbeddingLayer() override;
 
   void lookup(context_ptr_t& ctx, const int64_t num_keys, const void* keys, void* output,
-              const int64_t output_stride, max_bitmask_repr_t* hitmask,
+              const int64_t output_stride, bitmask64_t* hitmask,
               const PoolingParams* pool_params, float* hitrates) override;
   void insert(context_ptr_t& ctx, const int64_t num_keys, const void* keys,
               const int64_t value_stride, const int64_t value_size, const void* values,

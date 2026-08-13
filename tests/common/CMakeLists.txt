@@ -27,6 +27,9 @@ add_executable(logger_test logger_test.cpp)
 target_link_libraries(logger_test PUBLIC nve-common)
 target_link_libraries(logger_test PUBLIC gtest_main)
 
+add_executable(bit_ops_test bit_ops_test.cpp)
+target_link_libraries(bit_ops_test PUBLIC gtest_main nve-common)
+
 add_executable(thread_pool_test thread_pool_test.cpp)
 target_link_libraries(thread_pool_test PUBLIC gtest_main nve-common)
 
@@ -38,6 +41,9 @@ target_link_libraries(allocator_test PUBLIC gtest_main nve-common)
 
 add_executable(buffer_wrapper_test buffer_wrapper_test.cpp)
 target_link_libraries(buffer_wrapper_test PUBLIC gtest_main nve-common)
+
+add_executable(serialization_test serialization_test.cpp)
+target_link_libraries(serialization_test PUBLIC gtest_main nve-common)
 
 # mpi_buffer_test links MPI directly; skip it in an MPI-less build where the dependency is removed.
 if(NOT NVE_DISABLE_MPI)

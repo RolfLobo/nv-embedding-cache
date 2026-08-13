@@ -22,6 +22,7 @@
 #include <cuda_support.hpp>
 #include <unordered_map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace nve {
@@ -41,11 +42,10 @@ class ExecutionContext {
   inline thread_pool_ptr_t get_thread_pool() const { return thread_pool_; }
   inline allocator_ptr_t get_allocator() const { return allocator_; }
 
-  // get temporary buffer
+  // Get a temporary buffer. Storage lookup and resizing are synchronized, but the caller
+  // is responsible to not call get_buffer again with the same name and a larger size
+  // (potentially triggering a realloc) before the work on the buffer is done.
   void* get_buffer(const std::string& name, size_t size, bool host_alloc);
-
-  // check if a buffer is owned by the context
-  bool is_owned(const void* ptr, const std::string& name, bool host_alloc);
 
   // get aux streams
   virtual std::vector<cudaStream_t> get_aux_streams(const std::string& name, size_t num_streams);
@@ -58,17 +58,7 @@ class ExecutionContext {
   // The flag is read directly off a base member rather than via a virtual, so it
   // stays correct even when wait() is invoked from ~ExecutionContext() (where
   // virtual dispatch resolves to this base implementation, not a derived override).
-  virtual void wait() {
-    if (driver_available_) {
-      NVE_CHECK_(cudaStreamSynchronize(lookup_stream_));
-      NVE_CHECK_(cudaStreamSynchronize(modify_stream_));
-      for (auto& kv : aux_streams_storage_) {
-        for (auto& stream : kv.second) {
-          NVE_CHECK_(cudaStreamSynchronize(stream));
-        }
-      }
-    }
-  }
+  virtual void wait();
 
  protected:
   // using nullptr for threadpool/allocator implies use the default one.
@@ -85,9 +75,12 @@ class ExecutionContext {
   // Whether a usable CUDA driver is present in this process (detected via cuInit).
   // When false, the context must not enter the CUDA runtime during wait()/teardown.
   const bool driver_available_;
+  std::mutex buffer_storage_mutex_;
   std::unordered_map<std::string, std::shared_ptr<ResizeableBuffer>> buffer_storage_;
+  std::mutex aux_streams_mutex_;
   std::unordered_map<std::string, std::vector<cudaStream_t>> aux_streams_storage_;
   static std::string internal_name(const std::string& name, bool host_alloc);
+  std::vector<cudaStream_t> snapshot_aux_streams();
 };
 
 }  // namespace nve

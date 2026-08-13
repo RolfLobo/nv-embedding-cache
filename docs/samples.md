@@ -27,6 +27,7 @@ These samples demonstrate more complex usages.
 |Layer sample|[../samples/layer_sample/](../samples/layer_sample/)|Layer inference (lookup)|
 |PyTorch Inference|[../samples/pytorch/inference_sample/](../samples/pytorch/inference_sample/)|Multi threaded inference with parallel updates|
 |C API custom remote plugin|[../samples/c_api_custom_remote/](../samples/c_api_custom_remote/)|Custom remote host table plugin with three-tier hierarchical layer using the C API|
+|External table plugin|[../samples/external_plugin/](../samples/external_plugin/)|Pure-C external-ABI table plugin (`libnve-plugin-external-map.so`) built with no C++ toolchain dependency, plus a consumer executable (`external_plugin_sample`) that loads it — see [plugins.md](plugins.md)|
 |Triton Inference Server|[../samples/triton_server_sample/](../samples/triton_server_sample/)|Inference deployment using [NVIDIA Triton Inference Server](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/introduction/index.html)|
 |C++ Inference|[../samples/cpp_inference/](../samples/cpp_inference/)|End-to-end C++ inference of an NVEmbedding model exported from Python via AOTInductor — supports both LinearUVM and Hierarchical (plugin-backed remote PS) modes|
 ||[]()||

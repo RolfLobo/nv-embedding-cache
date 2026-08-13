@@ -58,7 +58,6 @@ The supported `NVE_FEATURES` values are:
 | Category | Values |
 |---|---|
 | Plugins | `abseil_plugin`, `nvhm_plugin`, `phmap_plugin`, `redis_plugin`, `rocksdb_plugin` |
-| Host tables mask sizes | `ht_mask_8`, `ht_mask_16`, `ht_mask_32`, `ht_mask_64` |
 | Host tables key sizes | `ht_key_8`, `ht_key_16`, `ht_key_32`, `ht_key_64` |
 | Host tables kernel sizes | `ht_kernel_8`, `ht_kernel_16`, `ht_kernel_32`, `ht_kernel_64`, `ht_kernel_128`, `ht_kernel_256`, `ht_kernel_512`, `ht_kernel_1024` |
 | Host tables partitioners | `ht_part_fnv1a`, `ht_part_murmur3`, `ht_part_rrxmrrxmsx0`, `ht_part_std_hash` |
@@ -67,13 +66,13 @@ The standard default set contains:
 
 ```text
 abseil_plugin;nvhm_plugin;phmap_plugin;redis_plugin;rocksdb_plugin;
-ht_mask_64;ht_key_32;ht_key_64;ht_kernel_64;ht_kernel_128;ht_part_fnv1a
+ht_key_32;ht_key_64;ht_kernel_64;ht_kernel_128;ht_part_fnv1a
 ```
 
 The minimal set selected by `NVE_DISABLE_PLUGINS=ON` contains:
 
 ```text
-ht_mask_64;ht_key_64;ht_kernel_64;ht_part_fnv1a
+ht_key_64;ht_kernel_64;ht_part_fnv1a
 ```
 
 For example, a build with Redis and a wider set of hash-table specializations can
@@ -81,7 +80,7 @@ be configured with:
 
 ```bash
 cmake -S . -B build \
-  -DNVE_FEATURES="redis_plugin;ht_mask_32;ht_mask_64;ht_key_64;ht_kernel_64;ht_kernel_256;ht_part_murmur3"
+  -DNVE_FEATURES="redis_plugin;ht_key_64;ht_kernel_64;ht_kernel_256;ht_part_murmur3"
 ```
 
 An unknown feature causes CMake configuration to fail.

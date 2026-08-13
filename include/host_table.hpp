@@ -25,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <plugin/plugin.hpp>
 #include <string>
 #include <string_view>
 #include <table.hpp>
@@ -61,6 +62,8 @@ struct FowlerNollVoPartitioner final : public Partitioner {
 
     x ^= UINT64_C(14'695'981'039'346'656'037);
     x *= UINT64_C(591'798'841);
+    x ^= x >> 32;
+    x ^= x >> 16;
 
     return static_cast<int64_t>(x) & mask;
   }
@@ -118,7 +121,9 @@ struct StdHashPartitioner final : public Partitioner {
   template <typename KeyType>
   constexpr int64_t operator()(const KeyType key, const int64_t mask) const noexcept {
     constexpr std::hash<KeyType> hash;
-    return static_cast<int64_t>(hash(key)) & mask;
+    uint64_t x{hash(key)};
+
+    return static_cast<int64_t>(x) & mask;
   }
 };
 
@@ -133,21 +138,23 @@ enum class Partitioner_t : uint64_t {
   StdHash,
 };
 
+static constexpr Partitioner_t default_partitioner{
 #if defined(NVE_FEATURE_HT_PART_FNV1A)
-static constexpr Partitioner_t default_partitioner{Partitioner_t::FowlerNollVo};
-#elif defined(NVE_FEATURE_HT_PART_MURMUR)
-static constexpr Partitioner_t default_partitioner{Partitioner_t::Murmur3};
+  Partitioner_t::FowlerNollVo
+#elif defined(NVE_FEATURE_HT_PART_MURMUR3)
+  Partitioner_t::Murmur3
 #elif defined(NVE_FEATURE_HT_PART_RRXMRRXMSX0)
-static constexpr Partitioner_t default_partitioner{Partitioner_t::Rrxmrrxmsx0};
+  Partitioner_t::Rrxmrrxmsx0
 #elif defined(NVE_FEATURE_HT_PART_STD_HASH)
-static constexpr Partitioner_t default_partitioner{Partitioner_t::StdHash};
+  Partitioner_t::StdHash
 #elif defined(NVE_FEATURE_HT_PART_ALWAYS_ZERO)
-static constexpr Partitioner_t default_partitioner{Partitioner_t::AlwaysZero};
+  Partitioner_t::AlwaysZero
 #else
 #error At least one NVE_FEATURE_HT_PART_xxx must be enabled. See CMakeLists.txt!
 #endif
+};
 
-static constexpr const char* to_string(const Partitioner_t p) {
+constexpr const char* to_string(const Partitioner_t p) {
   switch (p) {
     case Partitioner_t::AlwaysZero:
       return AlwaysZeroPartitioner::name;
@@ -163,7 +170,7 @@ static constexpr const char* to_string(const Partitioner_t p) {
   NVE_THROW_("Unknown overflow handler!");
 }
 
-static inline std::ostream& operator<<(std::ostream& o, const Partitioner_t p) {
+inline std::ostream& operator<<(std::ostream& o, const Partitioner_t p) {
   return o << to_string(p);
 }
 
@@ -180,9 +187,9 @@ enum class OverflowHandler_t : uint64_t {
   EvictLFU,     // Evict the least frequently used key-value pairs.
 };
 
-static constexpr OverflowHandler_t default_overflow_handler{OverflowHandler_t::EvictRandom};
+constexpr OverflowHandler_t default_overflow_handler{OverflowHandler_t::EvictRandom};
 
-static constexpr const char* to_string(const OverflowHandler_t oh) {
+constexpr const char* to_string(const OverflowHandler_t oh) {
   switch (oh) {
     case OverflowHandler_t::EvictRandom:
       return "evict_random";
@@ -194,7 +201,7 @@ static constexpr const char* to_string(const OverflowHandler_t oh) {
   NVE_THROW_("Unknown overflow handler!");
 }
 
-static inline std::ostream& operator<<(std::ostream& o, const OverflowHandler_t oh) {
+inline std::ostream& operator<<(std::ostream& o, const OverflowHandler_t oh) {
   return o << to_string(oh);
 }
 
@@ -209,13 +216,13 @@ using lfu_meta_type = int64_t;
 static_assert(sizeof(lru_meta_type) <= sizeof(int64_t));
 static_assert(sizeof(lfu_meta_type) <= sizeof(int64_t));
 
-static inline lru_meta_type lru_meta_value() noexcept {
+inline lru_meta_type lru_meta_value() noexcept {
   // TODO: Assumes nodes are in sync. Add synchronized network timestamp provider?
   return std::chrono::system_clock::now();
 }
 
 template <typename MetaType>
-static constexpr OverflowHandler_t overflow_handler() noexcept {
+constexpr OverflowHandler_t overflow_handler() noexcept {
   if constexpr (std::is_same_v<MetaType, no_meta_type>) {
     return OverflowHandler_t::EvictRandom;
   } else if constexpr (std::is_same_v<MetaType, lru_meta_type>) {
@@ -227,7 +234,7 @@ static constexpr OverflowHandler_t overflow_handler() noexcept {
   }
 }
 
-static constexpr int64_t meta_size(const OverflowHandler_t handler) noexcept {
+constexpr int64_t meta_size(const OverflowHandler_t handler) noexcept {
   switch (handler) {
     case OverflowHandler_t::EvictRandom:
       return 0; /* sizeof(no_meta_type); */
@@ -240,8 +247,21 @@ static constexpr int64_t meta_size(const OverflowHandler_t handler) noexcept {
   return 0;
 }
 
+constexpr int64_t meta_align(const OverflowHandler_t handler) noexcept {
+  switch (handler) {
+    case OverflowHandler_t::EvictRandom:
+      return 1;
+    case OverflowHandler_t::EvictLRU:
+      return alignof(lru_meta_type);
+    case OverflowHandler_t::EvictLFU:
+      return alignof(lfu_meta_type);
+  }
+  NVE_ASSERT_(false);
+  return 1;
+}
+
 template <typename MetaType>
-static constexpr void update_meta_data(void* __restrict const value, const lru_meta_type lru_time) noexcept {
+constexpr void update_meta_data(void* __restrict const value, const lru_meta_type lru_time) noexcept {
   if constexpr (std::is_same_v<MetaType, no_meta_type>) {
     // Do nothing.
   } else if constexpr (std::is_same_v<MetaType, lru_meta_type>) {
@@ -253,50 +273,46 @@ static constexpr void update_meta_data(void* __restrict const value, const lru_m
   }
 }
 
+// Largest 64-bit integer that survives `int64_t -> double -> int64_t`.
+constexpr int64_t max_overflow_margin{std::numeric_limits<int64_t>::max() - 1023};
+
 struct OverflowPolicyConfig {
-  int64_t overflow_margin{INT64_MAX};  // Margin at which overflow an condition is triggered.
-                                       // INT64_MAX = Disable overflow checks.
+  int64_t overflow_margin{max_overflow_margin};  // Margin at which overflow an condition is triggered.
+                                                 // max_overflow_margin = Disable overflow checks.
   OverflowHandler_t handler{default_overflow_handler};  // How to resolve such a condition?
   double resolution_margin{0.8};  // Margin at which the overflow condition is considered resolved?
 
   void check() const;
 
-  inline int64_t meta_size() const noexcept { return nve::meta_size(handler); }
+  constexpr int64_t meta_size() const noexcept { return nve::meta_size(handler); }
+
+  constexpr int64_t abs_resolution_margin() const noexcept {
+    return static_cast<int64_t>(static_cast<double>(overflow_margin) * resolution_margin);
+  }
 };
 
 void from_json(const nlohmann::json& json, OverflowPolicyConfig& conf);
 
 void to_json(nlohmann::json& json, const OverflowPolicyConfig& conf);
 
-#if defined(NVE_FEATURE_HT_MASK_64)
-static constexpr int64_t default_ht_mask_size{bitmask64_t::size};
-#elif defined(NVE_FEATURE_HT_MASK_32)
-static constexpr int64_t default_ht_mask_size{bitmask32_t::size};
-#elif defined(NVE_FEATURE_HT_MASK_16)
-static constexpr int64_t default_ht_mask_size{bitmask16_t::size};
-#elif defined(NVE_FEATURE_HT_MASK_8)
-static constexpr int64_t default_ht_mask_size{bitmask8_t::size};
-#else
-#error At least one NVE_FEATURE_HT_MASK_xxx must be enabled. See CMakeLists.txt!
-#endif
-
+constexpr int64_t default_ht_key_size{
 #if defined(NVE_FEATURE_HT_KEY_64)
-static constexpr int64_t default_ht_key_size{sizeof(int64_t)};
+  sizeof(int64_t)
 #elif defined(NVE_FEATURE_HT_KEY_32)
-static constexpr int64_t default_ht_key_size{sizeof(int32_t)};
+  sizeof(int32_t)
 #elif defined(NVE_FEATURE_HT_KEY_16)
-static constexpr int64_t default_ht_key_size{sizeof(int16_t)};
+  sizeof(int16_t)
 #elif defined(NVE_FEATURE_HT_KEY_8)
-static constexpr int64_t default_ht_key_size{sizeof(int8_t)};
+  sizeof(int8_t)
 #else
 #error At least one NVE_FEATURE_HT_KEY_xxx must be enabled. See CMakeLists.txt!
 #endif
+};
 
 struct HostTableConfig {
-  int64_t mask_size{default_ht_mask_size};  // Granularity at which to read/write masks.
   int64_t key_size{default_ht_key_size};    // Key size to use.
   int64_t max_value_size{8};  // Maximum size of each table value in bytes. Must be in [1,
-                              // 2^32-5], should be a multiple of value_dtype.
+                              // 2^31-5], should be a multiple of value_dtype.
   DataType_t value_dtype{DataType_t::Unknown};  // Storage data type of the table values. Only used
                                                 // by `update_accumulate()`.
   int64_t invalid_key{-1};  // Key used to signal invalid entries (cast to int64_t)
@@ -380,19 +396,6 @@ void from_json(const nlohmann::json& json, HostTableFactoryConfig& conf);
 
 void to_json(nlohmann::json& json, const HostTableFactoryConfig& conf);
 
-class HostTableLikeFactory {
- public:
-  NVE_PREVENT_COPY_AND_MOVE_(HostTableLikeFactory);
-
-  HostTableLikeFactory() = default;
-
-  virtual ~HostTableLikeFactory() = default;
-
-  virtual host_table_ptr_t produce(table_id_t id, const nlohmann::json& json) = 0;
-};
-
-using host_table_factory_ptr_t = std::shared_ptr<HostTableLikeFactory>;
-
 template <typename ConfigType>
 class HostTable : public HostTableLike {
  public:
@@ -419,9 +422,9 @@ class HostTable : public HostTableLike {
 };
 
 template <typename ConfigType, typename TableConfigType>
-class HostTableFactory : public HostTableLikeFactory {
+class HostTableFactory : public TableFactory {
  public:
-  using base_type = HostTableLikeFactory;
+  using base_type = TableFactory;
   using config_type = ConfigType;
   using table_config_type = TableConfigType;
 
@@ -438,45 +441,11 @@ class HostTableFactory : public HostTableLikeFactory {
 
   ~HostTableFactory() override = default;
 
-  host_table_ptr_t produce(table_id_t id, const nlohmann::json& json) override final {
+  table_ptr_t produce(table_id_t id, const nlohmann::json& json) override final {
     return produce(id, static_cast<table_config_type>(json));
   }
 
   virtual host_table_ptr_t produce(table_id_t id, const table_config_type& config) = 0;
 };
-
-/**
- * Loads a host table plugin DLL, and registers all table implementations
- *
- * @param plugin_name Shared object name/path to load. Bare names such as
- * `libnve-plugin-abseil.so` are resolved by the dynamic linker; absolute or
- * relative paths such as `/tmp/my_plugin.so` are loaded directly.
- */
-void load_host_table_plugin(const std::string_view& plugin_name);
-
-template <typename It>
-inline void load_host_table_plugins(const It& first, const It& last) {
-  std::for_each(first, last, load_host_table_plugin);
-}
-
-/**
- * Creates a HostTableFactory using the provided arguments.
- *
- * @param json JSON object containing the properties of the factory. The set of properties depends
- * on the selected `implementation`.
- *
- * @return The newly created factory.
- */
-host_table_factory_ptr_t create_host_table_factory(const nlohmann::json& json);
-
-/**
- * All-in-one function to process `host_database` JSON configuration.
- *
- * @param json JSON object containing the `plugins`, `table_factories`, and `tables` sub-objects.
- * `plugins` entries are shared object names/paths passed directly to `dlopen()`.
- *
- * @return Set of tables that represent the provided database implementation.
- */
-std::map<table_id_t, host_table_ptr_t> build_host_database(const nlohmann::json& json);
 
 }  // namespace nve

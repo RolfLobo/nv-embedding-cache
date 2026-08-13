@@ -16,7 +16,7 @@
  */
 
 #include "gtest/gtest.h"
-#include "cpu_ops/cpu_pooling.h"
+#include "cpu_ops/cpu_pooling.hpp"
 #include "include/thread_pool.hpp"
 #include "include/nve_types.hpp"
 #include "mock_host_table.hpp"

@@ -45,9 +45,14 @@ class MockHostTable final : public HostTable<HostTableConfig> {
   void clear(context_ptr_t&) override { data_.clear(); }
 
   void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) override {
+    if (n <= 0) {
+      return;
+    }
+    NVE_CHECK_(ctx != nullptr, "Invalid context");
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
                                                       ctx->get_modify_stream())
                                 : nullptr;
+    NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
     const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
     for (int64_t i = 0; i < n; i++) {
       data_.erase(typed_keys[i]);
@@ -55,13 +60,17 @@ class MockHostTable final : public HostTable<HostTableConfig> {
   }
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override {
-    constexpr auto mask_elements = sizeof(max_bitmask_repr_t) * 8;
+    if (n <= 0) {
+      return;
+    }
+    NVE_CHECK_(ctx != nullptr, "Invalid context");
+    constexpr auto mask_elements = sizeof(bitmask64_t) * 8;
     auto lookup_stream = ctx->get_lookup_stream();
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
                                 : nullptr;
-    max_bitmask_repr_t* hit_mask_buf =
+    bitmask64_t* hit_mask_buf =
         hit_mask ? hit_mask->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
                  : nullptr;
     void* values_buf = values ? values->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/, lookup_stream)
@@ -69,8 +78,10 @@ class MockHostTable final : public HostTable<HostTableConfig> {
     int64_t* value_sizes_buf =
         value_sizes ? value_sizes->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/, lookup_stream)
                     : nullptr;
-    const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
+    NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
+    NVE_CHECK_(values_buf != nullptr, "Invalid values");
     NVE_CHECK_(value_stride > 0, "Invalid stride");
+    const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
     const uint64_t stride = static_cast<uint64_t>(value_stride);
     int64_t total_hits = 0;
     for (uint64_t i = 0; i < static_cast<uint64_t>(n); i++) {
@@ -116,14 +127,20 @@ class MockHostTable final : public HostTable<HostTableConfig> {
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t value_stride, int64_t value_size,
               buffer_ptr<const void> values) override {
+    if (n <= 0) {
+      return;
+    }
+    NVE_CHECK_(ctx != nullptr, "Invalid context");
     auto modify_stream = ctx->get_modify_stream();
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                                 : nullptr;
     const void* values_buf =
         values ? values->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                : nullptr;
+    NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
+    NVE_CHECK_(values_buf != nullptr, "Invalid values");
+    NVE_CHECK_(value_size > 0, "Invalid value size");
     const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
-    NVE_CHECK_(value_size > 0);
     const uint64_t vsize = static_cast<uint64_t>(value_size);
     if (functional_ref_) {
       for (int64_t i = 0; i < n; i++) {
@@ -151,14 +168,20 @@ class MockHostTable final : public HostTable<HostTableConfig> {
 
   void update(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t update_stride,
               int64_t update_size, buffer_ptr<const void> updates) override {
+    if (n <= 0) {
+      return;
+    }
+    NVE_CHECK_(ctx != nullptr, "Invalid context");
     auto modify_stream = ctx->get_modify_stream();
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                                 : nullptr;
     const void* updates_buf =
         updates ? updates->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                : nullptr;
+    NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
+    NVE_CHECK_(updates_buf != nullptr, "Invalid updates");
+    NVE_CHECK_(update_size > 0, "Invalid update size");
     const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
-    NVE_CHECK_(update_size > 0);
     const uint64_t vsize = static_cast<uint64_t>(update_size);
     if (functional_ref_) {
       for (int64_t i = 0; i < n; i++) {
@@ -188,12 +211,18 @@ class MockHostTable final : public HostTable<HostTableConfig> {
   void update_accumulate(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t update_stride,
                          int64_t update_size, buffer_ptr<const void> updates,
                          DataType_t update_dtype) override {
+    if (n <= 0) {
+      return;
+    }
+    NVE_CHECK_(ctx != nullptr, "Invalid context");
     auto modify_stream = ctx->get_modify_stream();
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                                 : nullptr;
     const void* updates_buf =
         updates ? updates->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
                 : nullptr;
+    NVE_CHECK_(keys_buf != nullptr, "Invalid keys");
+    NVE_CHECK_(updates_buf != nullptr, "Invalid updates");
     const IndexT* typed_keys = reinterpret_cast<const IndexT*>(keys_buf);
     const auto update_element_size = dtype_size(update_dtype);
     if (update_size % update_element_size) {

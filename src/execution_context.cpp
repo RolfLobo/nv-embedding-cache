@@ -29,6 +29,7 @@ namespace nve {
 // Calling this function potentially invalidates previously returned buffers for the same name.
 void* ExecutionContext::get_buffer(const std::string& name, size_t size, bool host_alloc) {
     const std::string key = internal_name(name, host_alloc);
+    std::lock_guard lock(buffer_storage_mutex_);
     auto kv = buffer_storage_.find(key);
     if (kv == buffer_storage_.end()) {
         auto res = buffer_storage_.emplace(
@@ -41,6 +42,7 @@ void* ExecutionContext::get_buffer(const std::string& name, size_t size, bool ho
 }
 
 std::vector<cudaStream_t> ExecutionContext::get_aux_streams(const std::string& name, size_t num_streams) {
+    std::lock_guard lock(aux_streams_mutex_);
     auto kv = aux_streams_storage_.find(name);
     if (kv == aux_streams_storage_.end()) {
         std::vector<cudaStream_t> streams(num_streams);
@@ -60,10 +62,28 @@ std::vector<cudaStream_t> ExecutionContext::get_aux_streams(const std::string& n
     return kv->second;
 }
 
-bool ExecutionContext::is_owned(const void* ptr, const std::string& name, bool host_alloc) {
-    const std::string key = internal_name(name, host_alloc);
-    auto kv = buffer_storage_.find(key);
-    return (kv != buffer_storage_.end()) && (kv->second->get_ptr(0) == ptr);
+std::vector<cudaStream_t> ExecutionContext::snapshot_aux_streams() {
+  std::lock_guard lock(aux_streams_mutex_);
+  size_t num_streams{0};
+  for (const auto& kv : aux_streams_storage_) {
+    num_streams += kv.second.size();
+  }
+  std::vector<cudaStream_t> streams;
+  streams.reserve(num_streams);
+  for (const auto& kv : aux_streams_storage_) {
+    streams.insert(streams.end(), kv.second.begin(), kv.second.end());
+  }
+  return streams;
+}
+
+void ExecutionContext::wait() {
+  if (driver_available_) {
+    NVE_CHECK_(cudaStreamSynchronize(lookup_stream_));
+    NVE_CHECK_(cudaStreamSynchronize(modify_stream_));
+    for (auto stream : snapshot_aux_streams()) {
+      NVE_CHECK_(cudaStreamSynchronize(stream));
+    }
+  }
 }
 
 std::string ExecutionContext::internal_name(const std::string& name, bool host_alloc) {
@@ -91,10 +111,8 @@ ExecutionContext::~ExecutionContext() {
   // Without a CUDA driver there are no aux streams to destroy, and the runtime
   // calls would fail anyway — skip them during teardown.
   if (driver_available_) {
-    for (auto& kv : aux_streams_storage_) {
-      for (auto& stream : kv.second) {
-        NVE_CHECK_(cudaStreamDestroy(stream));
-      }
+    for (auto stream : snapshot_aux_streams()) {
+      NVE_CHECK_(cudaStreamDestroy(stream));
     }
   }
 }

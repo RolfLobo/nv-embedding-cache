@@ -4,6 +4,30 @@ Releases will be listed below, latest at the top.
 
 Releases are named/tagged in the format of `vYY.MM[.P]` e.g. `v26.02.3` means release of February 2026 with patch 3.
 
+## NV Embedding Cache 26.08
+### New Features
+- New table-plugin architecture with versioned internal C++ and external pure-C ABI modes (see: [plugins.md](docs/plugins.md))
+- Added defined out-of-range key handling for dense GPU and Linear UVM layers: lookups return a configured default row, while update and accumulate ignore invalid keys (see default_row_index in layer configs)
+- Python parameter-server (NVEParameterServer) construction from an arbitrary table plugin shared object in Python through `plugin_name`, `factory_config`, and `table_config`
+### Improvements
+- Reduced build time by pruning and repartitioning generated template instantiations across a fixed set of translation units
+- Bounds-checked the Python binding buffer copies and staged writable views through Python-owned storage
+### Bug Fixes
+- Fixed dense GPU, Linear UVM, and linear host tables reading and writing beyond their allocated rows for out-of-range keys
+- Fixed `RocksDBTable::clear()` leaving behind keys whose first byte was at least `0x7E`
+- Fixed single-host distributed buffer sharing failing with a `pidfd_getfd` permission error under `torchrun`
+- Fixed NumPy tensor loading to validate the declared shape and size against the file instead of trusting the header
+### API Changes
+- Replaced the host-specific plugin APIs with general table factories
+  - C callers now use `nve_create_table_factory`, `nve_table_factory_produce` instead of  `nve_load_host_table_plugin`, `nve_create_host_table_factory`, `nve_host_factory_produce`
+  - C++ callers now use `nve::Plugin` or `nve::create_table_from_plugin` instead of `nve::load_host_table_plugin`, `nve::create_host_table_factory`
+  - Removed the plugin registry and the `"implementation"` JSON selector, plugins are selected by shared-object path.
+  - See the updated code examples in [docs/c_api.md](docs/c_api.md) / [docs/cpp_api.md](docs/cpp_api.md)
+
+- `GPUTableConfig::uvm_num_rows` is required whenever `uvm_table` is set, `LinearHostTableConfig::num_rows` is required, and GPU/Linear UVM layer configs add `default_row_index` for invalid keys
+- Hit masks are fixed at 64 bits elements. Removed `HostTableConfig::mask_size`, the C `mask_size` field, the `ht_mask_*` build features, and the `max_bitmask_*` C++ types in favor of `bitmask64_t`
+- C status and data-type scalars are fixed-width 32-bit values with unchanged symbolic constants, for plugin ABI stability
+
 ## NV Embedding Cache 26.07
 ### New Features
 - Extended pooling and rowwise dequantization to GPU, Linear UVM, and hierarchical embedding layers, with fixed-hotness and CSR layouts; sum, mean, weighted-sum, and weighted-mean reductions; and QInt8/QUint8 rowwise storage

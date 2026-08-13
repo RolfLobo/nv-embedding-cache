@@ -129,7 +129,4 @@ pytest tests
     pip install .
     pip install -r benchmarks/requirements.txt
     ```
-
-## Pooling support status
-
-Pooling support is under active development. At this time, only a limited set of pooling configurations is supported and expected to work reliably.
+* Note 2: some tests rely on torchrec/fbgemm_gpu, it's recommended to build these from source.

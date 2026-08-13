@@ -18,6 +18,8 @@
 #include <gtest/gtest.h>
 #include <nve_c_api.h>
 
+#include <limits>
+
 #include "test_utils.hpp"
 
 TEST(NveCApiBasic, Version) {
@@ -53,11 +55,13 @@ TEST(NveCApiBasic, ConfigDefaults) {
   auto emb_cfg = nve_gpu_embedding_layer_config_default();
   EXPECT_EQ(0, emb_cfg.device_id);
   EXPECT_EQ(NVE_DTYPE_UNKNOWN, emb_cfg.value_dtype);
+  EXPECT_EQ(-1, emb_cfg.default_row_index);
 
   auto uvm_cfg = nve_linear_uvm_layer_config_default();
   EXPECT_EQ(0, uvm_cfg.min_insert_freq_gpu);
   EXPECT_EQ(1 << 16, uvm_cfg.min_insert_size_gpu);
   EXPECT_EQ(nullptr, uvm_cfg.insert_heuristic);
+  EXPECT_EQ(-1, uvm_cfg.default_row_index);
 
   auto hier_cfg = nve_hierarchical_layer_config_default();
   EXPECT_EQ(0, hier_cfg.min_insert_freq_gpu);
@@ -71,6 +75,7 @@ TEST(NveCApiBasic, ConfigDefaults) {
   EXPECT_EQ(0, host_layer_cfg.default_embedding_size);
 
   auto overflow_cfg = nve_overflow_policy_config_default();
+  EXPECT_EQ(std::numeric_limits<int64_t>::max() - 1023, overflow_cfg.overflow_margin);
   EXPECT_EQ(NVE_OVERFLOW_EVICT_RANDOM, overflow_cfg.handler);
   EXPECT_DOUBLE_EQ(0.8, overflow_cfg.resolution_margin);
 
@@ -86,7 +91,7 @@ TEST(NveCApiBasic, DestroyNull) {
   EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_context_destroy(nullptr));
   EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_heuristic_destroy(nullptr));
   EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_thread_pool_destroy(nullptr));
-  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_host_factory_destroy(nullptr));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_table_factory_destroy(nullptr));
 }
 
 TEST(NveCApiBasic, HeuristicCreateDestroy) {
@@ -109,15 +114,29 @@ TEST(NveCApiBasic, HeuristicInvalidArgs) {
   EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_heuristic_create_default(&h, nullptr, 1));
 }
 
-TEST(NveCApiBasic, LoadPluginInvalidName) {
-  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_load_host_table_plugin(nullptr));
-  // Shorthand plugin names are no longer expanded to libnve-plugin-<name>.so.
-  EXPECT_NE(NVE_SUCCESS, nve_load_host_table_plugin("abseil"));
+TEST(NveCApiBasic, CreateTableFactoryInvalidArgs) {
+  nve_table_factory_t factory = nullptr;
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT,
+            nve_create_table_factory(nullptr, "libnve-plugin-stl-map.so", "{}"));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_create_table_factory(&factory, nullptr, "{}"));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_create_table_factory(&factory, "", "{}"));
   // Loading a non-existent shared object should produce a runtime error.
-  EXPECT_NE(NVE_SUCCESS, nve_load_host_table_plugin("nonexistent_plugin_xyz.so"));
+  EXPECT_NE(NVE_SUCCESS, nve_create_table_factory(&factory, "nonexistent_plugin_xyz.so", "{}"));
 }
 
-TEST(NveCApiBasic, LoadPluginFullPath) {
-  SKIP_IF_ABSEIL_UNAVAILABLE();
-  EXPECT_EQ(NVE_SUCCESS, nve_load_host_table_plugin(nve_test::plugin_full_path("abseil").c_str()));
+// A bare soname resolves through the loader's fallback beside libnve-common.so.
+TEST(NveCApiBasic, CreateTableFactoryBareSoname) {
+  nve_table_factory_t factory = nullptr;
+  EXPECT_EQ(NVE_SUCCESS,
+            nve_create_table_factory(&factory, "libnve-plugin-stl-map.so", "{}"));
+  EXPECT_NE(nullptr, factory);
+  EXPECT_EQ(NVE_SUCCESS, nve_table_factory_destroy(factory));
+}
+
+TEST(NveCApiBasic, CreateTableFactoryFullPath) {
+  nve_table_factory_t factory = nullptr;
+  const std::string path = nve_test::plugin_full_path("stl-map");
+  EXPECT_EQ(NVE_SUCCESS, nve_create_table_factory(&factory, path.c_str(), "{}"));
+  EXPECT_NE(nullptr, factory);
+  EXPECT_EQ(NVE_SUCCESS, nve_table_factory_destroy(factory));
 }

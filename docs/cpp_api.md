@@ -9,7 +9,16 @@ For more specific information, please consult the headers in [include/](../inclu
 ## Compilation
 
 To build the SDK, follow the instructions in [Getting started](../README.md#getting-started). If you installed the Python bindings, then it's already built in the [build](../build/) folder.
-Most applications using the SDK should link with `build/lib/libnve-common.so`, `libcudart.so`. Pass plugins to `load_host_table_plugin()` as shared object names that the dynamic linker can resolve (e.g. `libnve-plugin-redis.so`) or as explicit paths (e.g. `/tmp/my_plugin.so`).
+Most applications using the SDK should link with `build/lib/libnve-common.so`, `libcudart.so`. Table plugins are loaded through `nve::Plugin` (include `plugin/plugin_loader.hpp`), passing shared object names that the dynamic linker can resolve (e.g. `libnve-plugin-redis.so`) or explicit paths (e.g. `/tmp/my_plugin.so`):
+
+```cpp
+#include <plugin/plugin_loader.hpp>
+
+nve::Plugin plugin("libnve-plugin-abseil.so");
+auto factory = plugin.create_table_factory(factory_json);  // plugin-specific options only
+```
+
+Factories and tables keep the plugin shared object loaded for their own lifetimes, so a stack-allocated `Plugin` may be destroyed immediately. The convenience helper `nve::create_table_from_plugin(so, factory_config, table_config, id)` loads a plugin and produces a single table in one call. See [plugins.md](plugins.md) for the full plugin system documentation.
 
 ## Embedding Layer API
 
@@ -23,7 +32,7 @@ There are several layer types, differentiated by the embedding storage:
 4. [HostEmbeddingLayer](../include/host_embedding_layer.hpp) holds all embedding data in host memory and runs lookup/update operations on CPU threads. It is intended for CPU-only inference.
 
 The main operations supported by layers are:
-1. Lookup: given a list of keys, return the embeddings rows corresponding to them. This can involve lookups in multiple tables and reading from local or remote memories, depending on the layer. This op may change the content of tables (see [insert heuristic](advanced.md#insert-heuristic)).
+1. Lookup: given a list of keys, return the embeddings rows corresponding to them. This can involve lookups in multiple tables and reading from local or remote memories, depending on the layer. This op may change the content of tables (see [insert heuristic](advanced.md#insert-heuristic)).  
 2. Insert: given a table, a list of keys and their respective embedding rows, the table decids which keys should reside in it. This method is for updating table residency (i.e. which key should reside in the table). Layers perform this internally (see [insert heuristic](advanced.md#insert-heuristic)).  
     Notes:
     * Inserting new rows may evict existing ones.  
@@ -55,7 +64,7 @@ The main table API is in: [table.hpp](../include/table.hpp) and specific table t
 5. [RedisClusterTable](../plugins/redis/include/redis_cluster_table.hpp) - a table accessing a remote [Redis](https://redis.io/) deployment: either a Redis **Cluster** (hash-sharded) or a **standalone single-node** server using Redis strings. The mode is selected with the `single_node` factory option. In standalone string mode `num_partitions` controls client-side parallelism (the MSET/MGET work is split across that many threads) while storage stays plain Redis strings.
 6. [RocksDBTable](../plugins/rocksdb/include/rocksdb_table.hpp) - a table accessing remote [RocksDB](https://rocksdb.org/) storage.
 
-Tables (except the GPUTable) are built separately as plugins, to reduce dependencies where possible.
+Tables (except the GPUTable) are built separately as plugins, to reduce dependencies where possible. A simple STL `std::unordered_map` reference plugin is also available as `libnve-plugin-stl-map.so`. See [plugins.md](plugins.md) for how plugins are loaded and how to write your own.
 
 ## Low-level Componmenets API
 

@@ -77,7 +77,7 @@ def main():
         embedding_size=embedding_size,
         data_type=torch.float32,
         plugin_name="libnve-plugin-custom_remote.so",
-        factory_config={"implementation": "custom_remote"},
+        factory_config={},
         table_config={"key_size": 8, "max_value_size": embedding_size * 4},
     )
 

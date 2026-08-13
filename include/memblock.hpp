@@ -40,6 +40,8 @@ public:
     MemBlock(MemBlockType type) : type_(type) {}
     MemBlockType get_type() const { return type_; }
     virtual void* get_ptr() const = 0;
+    // Size in bytes of the memory backing get_ptr().
+    virtual size_t get_size_in_bytes() const = 0;
     virtual ~MemBlock() = default;
     uint64_t get_handle() const { return reinterpret_cast<uint64_t>(get_ptr()); }
 protected:
@@ -52,9 +54,11 @@ public:
     LinearMemBlock(size_t size_to_alloc, int device_id = -1);
     ~LinearMemBlock();
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override { return size_; }
 
 private:
     void* ptr_;
+    size_t size_;
     allocator_ptr_t allocator_;
     int device_id_;
 };
@@ -65,9 +69,11 @@ public:
     ManagedMemBlock(size_t size_to_alloc, const std::vector<int>& gpu_ids);
     ~ManagedMemBlock();
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override { return size_; }
 
 private:
     void* ptr_;
+    size_t size_;
 };
 
 class NVLMemBlock : public MemBlock {
@@ -76,6 +82,7 @@ public:
     NVLMemBlock(size_t size_to_alloc, const std::vector<int>& gpu_ids);
     ~NVLMemBlock();
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override { return total_bytes_; }
 
 private:
     CUdeviceptr ptr_;
@@ -90,6 +97,7 @@ public:
     MPIMemBlock(size_t size_to_alloc, const std::vector<size_t> ranks, const std::vector<int> devices);
     ~MPIMemBlock() = default;
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override;
 
 private:
     std::shared_ptr<CUDADistributedBuffer> mpi_buffer_;
@@ -101,6 +109,7 @@ public:
     DistMemBlock(std::shared_ptr<DistributedEnv> env, size_t row_size, size_t num_embeddings, nve::DataType_t dtype);
     ~DistMemBlock() = default;
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override;
 
 private:
     std::shared_ptr<CUDADistributedBuffer> dist_buffer_;
@@ -112,6 +121,7 @@ public:
     DistHostMemBlock(std::shared_ptr<DistributedEnv> env, size_t row_size, size_t num_embeddings, nve::DataType_t dtype);
     ~DistHostMemBlock() = default;
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override;
 
 private:
     std::shared_ptr<CUDADistributedBuffer> dist_buffer_;
@@ -120,12 +130,14 @@ private:
 // Memblock to allow application to provide a raw ptr that's GPU accessible
 class UserMemBlock : public MemBlock {
 public:
-    UserMemBlock(uint64_t ptr);
+    UserMemBlock(uint64_t ptr, size_t size);
     ~UserMemBlock() = default;
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override { return size_; }
 
 private:
     void* ptr_;
+    size_t size_;
 };
 
 // Owning host-resident block backed by the default allocator's host_allocate,
@@ -137,9 +149,11 @@ public:
     HostMemBlock(size_t size_to_alloc);
     ~HostMemBlock();
     void* get_ptr() const override;
+    size_t get_size_in_bytes() const override { return size_; }
 
 private:
     void* ptr_;
+    size_t size_;
     allocator_ptr_t allocator_;
 };
 // Helper function returns the gpu_ids to use when reconstructing a memblock of the given type

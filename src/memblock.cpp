@@ -29,6 +29,7 @@ LinearMemBlock::LinearMemBlock(size_t row_size, size_t num_embeddings, nve::Data
 
 LinearMemBlock::LinearMemBlock(size_t size_to_alloc, int device_id)
     : MemBlock(MemBlockType::LINEAR),
+    size_(size_to_alloc),
     allocator_(GetDefaultAllocator()),
     device_id_(device_id) {
     NVE_CHECK_(allocator_ != nullptr);
@@ -63,6 +64,10 @@ void* DistMemBlock::get_ptr() const {
     return dist_buffer_->ptr();
 }
 
+size_t DistMemBlock::get_size_in_bytes() const {
+    return dist_buffer_->total_size();
+}
+
 DistHostMemBlock::DistHostMemBlock(std::shared_ptr<DistributedEnv> env, size_t row_size, size_t num_embeddings, nve::DataType_t dtype) 
     : MemBlock(MemBlockType::MPI) {
     auto size_to_alloc = row_size * num_embeddings * static_cast<size_t>(dtype_size(dtype));
@@ -74,7 +79,13 @@ void* DistHostMemBlock::get_ptr() const {
     return dist_buffer_->ptr();
 }
 
-UserMemBlock::UserMemBlock(uint64_t ptr) : MemBlock(MemBlockType::USER), ptr_(reinterpret_cast<void*>(ptr)) {}
+size_t DistHostMemBlock::get_size_in_bytes() const {
+    return dist_buffer_->total_size();
+}
+
+UserMemBlock::UserMemBlock(uint64_t ptr, size_t size)
+    : MemBlock(MemBlockType::USER), ptr_(reinterpret_cast<void*>(ptr)), size_(size) {}
+
 void* UserMemBlock::get_ptr() const {
     return ptr_;
 }
@@ -83,7 +94,7 @@ HostMemBlock::HostMemBlock(size_t row_size, size_t num_embeddings, nve::DataType
     : HostMemBlock(row_size * num_embeddings * static_cast<size_t>(dtype_size(dtype))) {}
 
 HostMemBlock::HostMemBlock(size_t size_to_alloc)
-    : MemBlock(MemBlockType::HOST), ptr_(nullptr), allocator_(GetDefaultAllocator()) {
+    : MemBlock(MemBlockType::HOST), ptr_(nullptr), size_(size_to_alloc), allocator_(GetDefaultAllocator()) {
     NVE_CHECK_(allocator_ != nullptr);
     NVE_CHECK_((allocator_->host_allocate(&ptr_, size_to_alloc)));
     NVE_CHECK_(ptr_ != nullptr);
@@ -100,7 +111,8 @@ void* HostMemBlock::get_ptr() const {
 ManagedMemBlock::ManagedMemBlock(size_t row_size, size_t num_embeddings, nve::DataType_t dtype, const std::vector<int>& gpu_ids) 
     : ManagedMemBlock(row_size * num_embeddings * static_cast<size_t>(dtype_size(dtype)), gpu_ids) {}
 
-ManagedMemBlock::ManagedMemBlock(size_t size_to_alloc, const std::vector<int>& gpu_ids) : MemBlock(MemBlockType::MANAGED) {
+ManagedMemBlock::ManagedMemBlock(size_t size_to_alloc, const std::vector<int>& gpu_ids)
+    : MemBlock(MemBlockType::MANAGED), size_(size_to_alloc) {
     NVE_CHECK_(cudaMallocManaged(&ptr_, size_to_alloc));
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
     cudaMemLocation loc;

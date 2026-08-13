@@ -19,6 +19,7 @@ include_directories(
 
 # Unit level tests
 add_subdirectory(common)
+add_subdirectory(plugin)
 add_subdirectory(gpu_table)
 add_subdirectory(embedding_layer)
 add_subdirectory(host_table)
@@ -29,3 +30,4 @@ add_subdirectory(linear_host_table)
 add_subdirectory(c_api)
 add_subdirectory(layer_pooling)
 add_subdirectory(driverless_host_layer)
+add_subdirectory(python_binding)

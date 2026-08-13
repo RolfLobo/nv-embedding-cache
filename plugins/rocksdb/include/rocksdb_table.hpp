@@ -27,7 +27,7 @@ struct RocksDBTableConfig final : public HostTableConfig {
   using base_type = HostTableConfig;
 
   int64_t max_batch_size{16'384};  // Maximum batch size to use for queries into the column family.
-                                   // Must be a multiple of `mask_size`.
+                                   // Must be a multiple of `64`.
 
   std::string column_family{rocksdb::kDefaultColumnFamilyName};
   bool verify_checksums{true};  // Toggle to `false` turn off checksum verifications.
@@ -42,12 +42,9 @@ void to_json(nlohmann::json& json, const RocksDBTableConfig& conf);
 struct RocksDBContext;
 using rdb_ctx_ptr_t = std::shared_ptr<RocksDBContext>;
 
-template <typename MaskType>
 class RocksDBTable final : public HostTable<RocksDBTableConfig> {
  public:
   using base_type = HostTable<RocksDBTableConfig>;
-  using mask_type = MaskType;
-  using mask_repr_type = typename mask_type::repr_type;
 
   NVE_PREVENT_COPY_AND_MOVE_(RocksDBTable);
 
@@ -65,7 +62,7 @@ class RocksDBTable final : public HostTable<RocksDBTableConfig> {
   void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) override;
 
   void find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
-            buffer_ptr<max_bitmask_repr_t> hit_mask, int64_t value_stride,
+            buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
             buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override;
 
   void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys, int64_t value_stride,

@@ -316,11 +316,10 @@ NumaThreadPool::~NumaThreadPool() {
   }
 
   // Queue termination tasks.
-  const uint64_t num_workers_per_node{workers_.size() / tasks_.size()};
   for (uint64_t j{}; j < tasks_.size(); ++j) {
     {
       std::lock_guard lk(tasks_guards_[j]);
-      for (uint64_t i{}; i < num_workers_per_node; ++i) {
+      for (uint64_t i{}; i < workers_.size(); ++i) {
         tasks_[j].emplace();
       }
     }

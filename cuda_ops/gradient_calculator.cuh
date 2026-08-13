@@ -19,14 +19,19 @@
 #include "cuda_ops/cuda_common.h"
 #include "cuda_ops/kernels_common.cuh"
 #include "cuda_ops/cuda_utils.cuh"
+#include "include/allocator.hpp"
 #include "include/nve_types.hpp"
 
+#include <utility>
+
+namespace nve {
+
 template <typename IndexType, typename DataType, bool FIXED_HOTNESS = true>
-__global__ void ComputeNormalizedWeights(const  DataType* __restrict__ input_weights,
-                                         const uint32_t hotness,
-                                         const  IndexType* __restrict__ csr_offsets,
-                                         DataType* __restrict__ output_weights,
-                                         const uint32_t num_bags) {
+__global__ void compute_normalized_weights(const  DataType* __restrict__ input_weights,
+                                           const uint32_t hotness,
+                                           const  IndexType* __restrict__ csr_offsets,
+                                           DataType* __restrict__ output_weights,
+                                           const uint32_t num_bags) {
     uint32_t bag_id = blockIdx.x * blockDim.y + threadIdx.y;
 
     if (bag_id >= num_bags) {
@@ -60,7 +65,7 @@ __global__ void ComputeNormalizedWeights(const  DataType* __restrict__ input_wei
 }
 
 template<typename IndexType, bool FIXED_HOTNESS = true>
-__global__ void ComputePoolingInverseMapping(
+__global__ void compute_pooling_inverse_mapping(
     const uint32_t hotness,
     const IndexType* __restrict__ key_offsets,
     IndexType* __restrict__ output_location_mapping,
@@ -78,7 +83,7 @@ __global__ void ComputePoolingInverseMapping(
 }
 
 template<typename IndexType, typename DataType, typename WeightType>
-__global__ void ComputePoolingGradients(
+__global__ void compute_pooling_gradients(
     const IndexType* __restrict__ inverse_weight_mapping,
     const IndexType* __restrict__ grad_mapping,
     const IndexType* __restrict__ offsets,
@@ -133,7 +138,7 @@ __global__ void ComputePoolingGradients(
 }
 
 template<typename IndexType, typename DataType, typename WeightType>
-void CallComputePoolingGradients(
+void call_compute_pooling_gradients(
     const IndexType* __restrict__ inverse_weight_mapping,
     const IndexType* __restrict__ grad_mapping,
     const IndexType* __restrict__ offsets,
@@ -156,18 +161,18 @@ void CallComputePoolingGradients(
 
     if ((embedding_width % 4) == 0) {
         using Vec4 = typename nve::VecWidthHelper<DataType>::Vec4;
-        ComputePoolingGradients<IndexType, Vec4, WeightType><<<grid_size, block_size, 0, stream>>>(
+        compute_pooling_gradients<IndexType, Vec4, WeightType><<<grid_size, block_size, 0, stream>>>(
             inverse_weight_mapping, grad_mapping, offsets, output_loc_map,
             reinterpret_cast<const Vec4*>(gradients_in), normalized_weights,
             reinterpret_cast<Vec4*>(gradients_out), num_unique_keys, embedding_width / 4);
     } else if ((embedding_width % 2) == 0) {
         using Vec2 = typename nve::VecWidthHelper<DataType>::Vec2;
-        ComputePoolingGradients<IndexType, Vec2, WeightType><<<grid_size, block_size, 0, stream>>>(
+        compute_pooling_gradients<IndexType, Vec2, WeightType><<<grid_size, block_size, 0, stream>>>(
             inverse_weight_mapping, grad_mapping, offsets, output_loc_map,
             reinterpret_cast<const Vec2*>(gradients_in), normalized_weights,
             reinterpret_cast<Vec2*>(gradients_out), num_unique_keys, embedding_width / 2);
     } else { 
-        ComputePoolingGradients<IndexType, DataType, WeightType><<<grid_size, block_size, 0, stream>>>(
+        compute_pooling_gradients<IndexType, DataType, WeightType><<<grid_size, block_size, 0, stream>>>(
             inverse_weight_mapping, grad_mapping, offsets, output_loc_map,
             gradients_in, normalized_weights, gradients_out, num_unique_keys, embedding_width);
     }
@@ -178,13 +183,17 @@ template<typename IndexT, int32_t MAX_RUN_SIZE = -1>
 class GradientCalculator
 {
 public:
-    GradientCalculator() {
+    explicit GradientCalculator(nve::allocator_ptr_t allocator)
+        : allocator_(std::move(allocator)), deduper_(allocator_)
+    {
+        NVE_CHECK_(allocator_ != nullptr, "GradientCalculator requires a non-null allocator");
         // allocate buffers
-        NVE_CHECK_(cudaMallocHost(&h_num_runs_out_, sizeof(IndexT) * 2));
+        NVE_CHECK_(allocator_->host_allocate(reinterpret_cast<void**>(&h_num_runs_out_), sizeof(IndexT) * 2));
     }
 
     ~GradientCalculator() {
-        NVE_CHECK_(cudaFreeHost(h_num_runs_out_));
+        // No check here: throwing from a destructor calls std::terminate.
+        allocator_->host_free(h_num_runs_out_);
     }
 
     void get_alloc_requirements(IndexT num_keys, size_t data_element_size, size_t& tmp_mem_size_device, size_t& tmp_mem_size_host) {
@@ -258,16 +267,16 @@ public:
             bool normalize_weigts = (pooling_type == nve::PoolingType_t::Mean) || (pooling_type == nve::PoolingType_t::WeightedMean);
             if (normalize_weigts) {
                 // TODO: need to init weights to all 1 for non weighted
-                ComputeNormalizedWeights<IndexT, DataT, FIXED_HOTNESS><<<grid_size, block_size, 0, stream>>>(
+                compute_normalized_weights<IndexT, DataT, FIXED_HOTNESS><<<grid_size, block_size, 0, stream>>>(
                     weights, hotness, offsets, reinterpret_cast<DataT*>(d_normalized_weights_), batch);
                 NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
             }
 
-            ComputePoolingInverseMapping<IndexT, FIXED_HOTNESS><<<grid_size, block_size, 0, stream>>>(
+            compute_pooling_inverse_mapping<IndexT, FIXED_HOTNESS><<<grid_size, block_size, 0, stream>>>(
                 hotness, offsets, d_grad_mapping_, batch);
             NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
 
-            CallComputePoolingGradients<IndexT, DataT, DataT>(
+            call_compute_pooling_gradients<IndexT, DataT, DataT>(
                 d_inverse_weight_mapping_, d_grad_mapping_,
                 d_dedup_offsets_, 
                 (MAX_RUN_SIZE == -1) ? nullptr : d_output_loc_map_,
@@ -291,6 +300,9 @@ public:
     }
 
 private:
+    // Declared first: deduper_ is initialized from it in the member-init list.
+    nve::allocator_ptr_t allocator_;
+
     IndexT* d_location_buffer_ = nullptr;
     void* d_normalized_weights_ = nullptr;
     IndexT* d_inverse_weight_mapping_ = nullptr;
@@ -301,3 +313,5 @@ private:
 
     Deduper<IndexT, MAX_RUN_SIZE> deduper_;
 };
+
+}  // namespace nve

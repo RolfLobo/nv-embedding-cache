@@ -82,7 +82,7 @@ class NVEParameterServer ():
                                       Valid parameters will depend on ps_type.
                                       E.g. when using a Redis PS, use the following to set the server address {"plugin": {"address": "localhost:12345"}}
         plugin_name (Optional[str]): Plugin shared object name/path. Mutually exclusive with ``ps_type``.
-        factory_config (Optional[dict]): JSON-serializable factory config; must include the ``"implementation"`` key.
+        factory_config (Optional[dict]): JSON-serializable, plugin-specific factory options; plugin selection is by ``plugin_name`` (the ``.so``).
         table_config (Optional[dict]): JSON-serializable table config passed to the plugin's ``produce()``.
     """
     def __init__(self,

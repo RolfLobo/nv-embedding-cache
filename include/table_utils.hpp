@@ -30,13 +30,13 @@
 
 namespace nve {
 
-// Loads the plugin shared object named by plugin_name, builds the host-table
-// factory from factory_config (must contain "implementation"), and produces
-// the underlying host table with table_config.
-host_table_ptr_t create_table_from_plugin(const std::string& plugin_name,
-                                          const nlohmann::json& factory_config,
-                                          const nlohmann::json& table_config,
-                                          table_id_t table_id = 1000);
+// Loads the plugin shared object named by plugin_name, builds the table
+// factory from the plugin-specific factory_config, and produces the
+// underlying table with table_config.
+table_ptr_t create_table_from_plugin(const std::string& plugin_name,
+                                     const nlohmann::json& factory_config,
+                                     const nlohmann::json& table_config,
+                                     table_id_t table_id = 1000);
 
 // Streams (key, value) pairs from already-opened tensor-file readers into
 // `table` in batches of `batch_size` rows. row_bytes is the size of a single

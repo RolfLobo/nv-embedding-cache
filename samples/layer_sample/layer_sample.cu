@@ -23,6 +23,7 @@
 #include <linear_host_table.hpp>
 #include <gpu_table.hpp>
 #include <host_table.hpp>
+#include <plugin/plugin_loader.hpp>
 #include <insert_heuristic.hpp>
 #include <iostream>
 #include <memory>
@@ -221,7 +222,6 @@ int main(int argc, char* argv[]) {
         const int64_t num_partitions = 1; // Single partition is better for inference
         const int64_t keys_per_partition = host_cache_size / row_size / num_partitions;
 
-        std::vector<std::string> plugin_names{"libnve-plugin-nvhm.so"};
         nlohmann::json nvhm_conf = {
           {"key_size", sizeof(IndexT)},
           {"max_value_size", row_size},
@@ -236,9 +236,9 @@ int main(int argc, char* argv[]) {
             }
           }
         };
-        nve::load_host_table_plugins(plugin_names.begin(), plugin_names.end());
-        nve::host_table_factory_ptr_t nvhm_fac{
-          nve::create_host_table_factory(R"({"implementation": "nvhm_map"})"_json)};
+        nve::Plugin nvhm_plugin("libnve-plugin-nvhm.so");
+        nve::table_factory_ptr_t nvhm_fac{
+          nvhm_plugin.create_table_factory(nlohmann::json::object())};
           
         using layer_type = nve::HierarchicalEmbeddingLayer<IndexT>;
         for (uint64_t i = 0; i < num_layers; i++) {
@@ -291,6 +291,7 @@ int main(int argc, char* argv[]) {
           gpu_tab_cfg.max_modify_size = (1l << 20);
           gpu_tab_cfg.row_size_in_bytes = row_size;
           gpu_tab_cfg.uvm_table = ptr;
+          gpu_tab_cfg.uvm_num_rows = num_rows;
           gpu_tab_cfg.count_misses = true;
           gpu_tab_cfg.modify_on_gpu = modify_on_gpu;
           gpu_tab_cfg.kernel_mode_type = kernel_mode;
@@ -331,6 +332,7 @@ int main(int argc, char* argv[]) {
           nve::LinearHostTableConfig table_cfg;
           table_cfg.max_threads = std::numeric_limits<int64_t>::max(); // will use all available threads in the thread pool
           table_cfg.max_value_size = row_size;
+          table_cfg.num_rows = static_cast<int64_t>(num_rows);
           table_cfg.value_dtype = nve::DataType_t::Float32;
           table_cfg.emb_table = ptr;
           auto host_tab = std::make_shared<nve::LinearHostTable<IndexT>>(table_cfg);

@@ -74,26 +74,38 @@ class TorchDistEnv(nve.DistributedEnv):
 
     @override
     def broadcast(self,
-                  buffer_ptr,
+                  buffer,
                   size,
                   root: int = 0):
-        data = torch.zeros(size, dtype=torch.int8)
-        nve.raw_copy(data.data_ptr(), buffer_ptr, size)
+        # buffer is a bounded writable memoryview provided by the C++ trampoline
+        if buffer.nbytes != size:
+            raise ValueError(
+                f"broadcast buffer is {buffer.nbytes} bytes, expected {size}")
+        data = torch.frombuffer(buffer, dtype=torch.uint8)
         data = data.to(device=self.device)
         dist.broadcast(tensor=data, src=root)
-        data = data.to(device=torch.device("cpu"))
-        nve.raw_copy(buffer_ptr, data.data_ptr(), size)
+        # copy_ accepts a cross-device source, so the D2H transfer lands
+        # directly in the staging buffer without an intermediate CPU tensor
+        torch.frombuffer(buffer, dtype=torch.uint8).copy_(data)
 
     @override
     def all_gather(self,
                    send_buffer,
                    recv_buffer,
                    size):
-        send_data = torch.zeros(size, dtype=torch.int8)
-        nve.raw_copy(send_data.data_ptr(), send_buffer, size)
-        send_data = send_data.to(device=self.device)
+        # send_buffer/recv_buffer are bounded memoryviews provided by the C++
+        # trampoline; recv_buffer spans world_size * size bytes
+        if send_buffer.nbytes != size:
+            raise ValueError(
+                f"all_gather send buffer is {send_buffer.nbytes} bytes, expected {size}")
+        expected_recv_size = size * self.world_size()
+        if recv_buffer.nbytes != expected_recv_size:
+            raise ValueError(
+                f"all_gather receive buffer is {recv_buffer.nbytes} bytes, "
+                f"expected {expected_recv_size}")
+        send_data = torch.frombuffer(send_buffer, dtype=torch.uint8).to(device=self.device)
         recv_data = [torch.zeros_like(send_data) for _ in range(self.world_size())]
         dist.all_gather(recv_data, send_data)
-        recv_data = torch.cat(recv_data)
-        recv_data = recv_data.to(device=torch.device("cpu"))
-        nve.raw_copy(recv_buffer, recv_data.data_ptr(), recv_data.size(0))
+        # copy_ accepts a cross-device source, so the D2H transfer lands
+        # directly in the staging buffer without an intermediate CPU tensor
+        torch.frombuffer(recv_buffer, dtype=torch.uint8).copy_(torch.cat(recv_data))

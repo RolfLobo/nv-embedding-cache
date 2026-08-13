@@ -1,0 +1,173 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Root config: pipeline-mode selection plus definitions shared by all modes.
+# The jobs themselves live in ci/.
+
+# Pipeline mode selection.  RUN_BUILD_BASE, RUN_COVERITY, and PERF_CADENCE are
+# set from the "Run pipeline" form or from a schedule.  Base builds take
+# precedence; when all modes are unset (MR / default-branch pipelines), the
+# normal L0 pipeline runs.
+# Note: include:rules cannot see the default value declared under variables:
+# below, so the conditions must treat "unset" or empty as the L0 case.
+include:
+  # Both the L0 and the perf pipelines run inside the image this builds.
+  - local: ci/build.yml
+    rules:
+      - if: $RUN_BUILD_BASE != "true" && $RUN_COVERITY != "true"
+  - local: ci/l0.yml
+    rules:
+      - if: $RUN_BUILD_BASE != "true" && $RUN_COVERITY != "true" && ($PERF_CADENCE == null || $PERF_CADENCE == "")
+  - local: ci/coverity.yml
+    rules:
+      - if: $RUN_BUILD_BASE != "true" && $RUN_COVERITY == "true"
+  - local: ci/perf.yml
+    rules:
+      - if: $RUN_BUILD_BASE != "true" && $PERF_CADENCE
+  - local: ci/base.yml
+    rules:
+      - if: $RUN_BUILD_BASE == "true"
+
+workflow:
+  rules:
+    # Run on every MR push (code review CI).
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Run when a commit lands on the default branch (post-merge validation).
+    # - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # Allow manual triggering from the GitLab UI / API without a code push.
+    - if: $CI_PIPELINE_SOURCE == "web"
+    # Nightly / weekly perf schedules.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+stages:
+  - build
+  - test
+  - coverity
+  - perf
+  - report
+
+default:
+  tags:
+    - computelab
+  before_script:
+    # 1. Initialize the counter for this job
+    - export SECTION_COUNTER=0
+    # 2. Define the function
+    - |
+      # Sections are collapsed for readability.
+      # On failure, the tail is replayed *outside* the section for highlighting failures.
+      SECTION_TAIL_LINES=${SECTION_TAIL_LINES:-100}
+      function run_section() {
+        local header="$1"
+        shift
+        local cmd="$@"
+
+        # Increment the counter and create a guaranteed unique ID
+        ((++SECTION_COUNTER))
+        local id="section_id_${SECTION_COUNTER}"
+        # Job id in the name: the counter restarts at 1 per job, so two jobs
+        # sharing a host (shell executor) would otherwise share the file.
+        local log="/tmp/section_${CI_JOB_ID:-0}_${SECTION_COUNTER}.log"
+
+        echo -e "\e[0Ksection_start:`date +%s`:${id}[collapsed=true]\r\e[0K${header}"
+
+        # Safely run the command and catch the exit code.  stderr is folded into
+        # stdout so the replay below keeps both, and PIPESTATUS[0] is the
+        # command's status - $? would be tee's.
+        # Two consequences of the pipe: the command runs in a subshell, so a cd
+        # or export inside a section does not outlive it; and anything it
+        # backgrounds must redirect stdout, or tee never sees EOF and the
+        # section hangs until that process exits.
+        set +e
+        eval "$cmd" 2>&1 | tee "$log"
+        local exit_code=${PIPESTATUS[0]}
+        set -e
+
+        echo -e "\e[0Ksection_end:`date +%s`:${id}\r\e[0K"
+
+        # Fail the job if the inner command failed, after replaying the tail.
+        if [ $exit_code -ne 0 ]; then
+          echo -e "\e[0;31m✖ FAILED: ${header} (exit ${exit_code})\e[0m"
+          echo "--- last ${SECTION_TAIL_LINES} lines; full output in the '${header}' section above ---"
+          tail -n "${SECTION_TAIL_LINES}" "$log"
+          rm -f "$log"
+          exit $exit_code
+        fi
+        rm -f "$log"
+      }
+
+variables:
+  CI_SLURM_FRONTEND: "computelab-sc-01"
+  CI_SLURM_TIME: "120"
+  DOCKER_BUILDKIT: "1"
+  GCC_IMAGE: "$CI_REGISTRY_IMAGE/l0:$CI_PIPELINE_ID"
+  # Source root baked into the L0 image at docker-build time (REPO_DIR in ci/Dockerfile*).
+  SRC_DIR: /nve
+  # Rendered as dropdowns in the "Run pipeline" form.
+  RUN_BUILD_BASE:
+    value: "false"
+    options: ["false", "true"]
+    description: "Build and push the ci/Dockerfile.base image to the registry"
+  BASE_IMAGE_TAG:
+    value: "keep-torch-2.11-fbgemm-1.6"
+    description: "Tag for the base image (must start with keep-). Update this when rebuilding the base."
+  RUN_COVERITY:
+    value: "false"
+    options: ["false", "true"]
+    description: "Run a Coverity scan instead of the normal build/test pipeline"
+  COVERITY_PUBLISH:
+    value: "false"
+    options: ["false", "true"]
+    description: "Publish Coverity defects to the IPP server (report-only when false)"
+  COVERITY_OSS:
+    value: "false"
+    options: ["false", "true"]
+    description: "Run Coverity scan on the OSS repo"
+  PERF_CADENCE:
+    value: ""
+    options: ["", "nightly", "weekly"]
+    description: "Run the perf pipeline instead of L0 (also set by the perf schedules)"
+
+.cpu_runner:
+  variables:
+    CI_CRUN_QUERY: 'cpu.arch="x86_64" and system.gpu_count=0'
+    CI_CRUN_GPUS: "0"
+    CI_CRUN_QOS: "oversubscribe"
+
+# Jobs run inside the pre-built CI image; the source is baked in at $SRC_DIR,
+# so GIT_STRATEGY: none is safe (no checkout needed).  Defined here rather than
+# in ci/l0.yml because ci/perf.yml needs it too, and the two are mutually
+# exclusive by include rules - extends only resolves within one pipeline.
+.test_l0:
+  stage: test
+  image: "$GCC_IMAGE"
+  needs: [build:gcc]
+  variables:
+    GIT_STRATEGY: none
+
+# GPU selection for perf jobs: the matrix supplies GPU_TYPE / CPU_TYPE, which
+# are plugged into the runner query.  Shared by L0's test:perf and the
+# scheduled perf jobs.
+.perf_matrix:
+  extends: .gpu_runner
+  variables:
+    CI_CRUN_QUERY: 'gpu.product_name="${GPU_TYPE}" and cpu.arch=x86_64 and cpu.product_name="${CPU_TYPE}"'
+
+.gpu_runner:
+  variables:
+    CI_CRUN_QUERY: "gpu.product_name=*L40 and cpu.arch=x86_64"
+    CI_CRUN_GPUS: "1"
+    CI_CRUN_QOS: "batch-short"
+    CI_CRUN_EXCLUSIVE: "true"
