@@ -93,7 +93,7 @@ Plugin::Plugin(const std::filesystem::path& so_path) {
   NVE_LOG_INFO_("Attempting to load table plugin '", plugin_path, "'.");
 
   // RTLD_LOCAL: external SOs may carry conflicting symbols from unknown toolchains.
-  void* handle{dlopen(plugin_path.c_str(), RTLD_NOW | RTLD_LOCAL)};
+  void* handle{dlopen(plugin_path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)};
   if (handle == nullptr) {
     const char* error{dlerror()};
     const std::string first_error{error ? error : "unknown dlopen error"};
@@ -106,7 +106,7 @@ Plugin::Plugin(const std::filesystem::path& so_path) {
                "Failed to resolve the nve-common library path for the plugin fallback.");
     const std::filesystem::path fallback{
         std::filesystem::path{dli.dli_fname}.parent_path() / plugin_path};
-    handle = dlopen(fallback.c_str(), RTLD_NOW | RTLD_LOCAL);
+    handle = dlopen(fallback.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
     NVE_CHECK_(handle != nullptr, "Failed to load table plugin '", plugin_path, "': ", first_error,
                "; fallback '", fallback.string(), "': ", dlerror());
   }
