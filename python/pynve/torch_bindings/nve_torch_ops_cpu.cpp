@@ -34,6 +34,7 @@
 #include <stdexcept>
 
 #include "nve_registry.hpp"
+#include "nve_torch_ops_checks.hpp"
 
 namespace ts = torch::stable;
 
@@ -60,6 +61,7 @@ extern "C" AtenTensorHandle nve_embedding_lookup_cpu(
 {
     ts::Tensor marker(marker_handle);
     ts::Tensor keys(keys_handle);
+    nve::check_index_tensor(keys, "keys");
     auto binding = nve::NVELayerRegistry::instance().get_binding(marker.data_ptr());
 
     int64_t num_keys = keys.numel();
@@ -93,6 +95,8 @@ extern "C" AtenTensorHandle nve_embedding_lookup_with_pooling_cpu(
     ts::Tensor marker(marker_handle);
     ts::Tensor keys(keys_handle);
     ts::Tensor offsets(offsets_handle);
+    nve::check_index_tensor(keys, "keys");
+    nve::check_bag_offsets(offsets);
     auto binding = nve::NVELayerRegistry::instance().get_binding(marker.data_ptr());
 
     int64_t num_bags = offsets.numel() - 1;
@@ -109,9 +113,7 @@ extern "C" AtenTensorHandle nve_embedding_lookup_with_pooling_cpu(
     uintptr_t weight_ptr = 0;
     if (weights_handle != nullptr) {
         ts::Tensor weights(weights_handle);
-        auto st = weights.scalar_type();
-        weight_dtype = (st == ts::ScalarType::Float) ? nve::kBindingDtypeFloat32
-                                                     : nve::kBindingDtypeFloat16;
+        weight_dtype = nve::check_pooling_weights(weights, keys.numel());
         weight_ptr = reinterpret_cast<uintptr_t>(weights.data_ptr());
     }
 

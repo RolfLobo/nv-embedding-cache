@@ -84,8 +84,8 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
                     (pooling_type == PoolingType_t::WeightedMean);
 
   const int64_t workers = std::max<int64_t>(1, num_workers);
-  const int64_t bags_per_task = std::max<int64_t>(1, (num_bags + workers - 1) / workers);
-  const int64_t num_tasks = (num_bags + bags_per_task - 1) / bags_per_task;
+  const int64_t bags_per_task = std::max<int64_t>(1, ceil_div(num_bags, workers));
+  const int64_t num_tasks = ceil_div(num_bags, bags_per_task);
 
   const auto pool_task = [=](const int64_t task_idx) {
     const int64_t bag_start = task_idx * bags_per_task;
@@ -95,7 +95,7 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
     // element index as the inner loop (contiguous in both the input row and acc)
     // turns the accumulation into an element-wise map the compiler can auto-vectorize,
     // rather than a per-element scalar reduction.
-    std::vector<float> acc(static_cast<size_t>(row_width));
+    std::vector<float> acc(to_uint(row_width));
 
     for (int64_t bag = bag_start; bag < bag_end; bag++) {
       // Resolve the [start_key, end_key) span for this bag.
@@ -112,7 +112,7 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
 
       auto* out_row = reinterpret_cast<OutT*>(output + bag * output_stride);
       if (count <= 0) {
-        std::memset(out_row, 0, static_cast<size_t>(row_width) * sizeof(OutT));
+        std::memset(out_row, 0, to_uint(row_width) * sizeof(OutT));
         continue;
       }
 
@@ -128,7 +128,7 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
           if (weighted) {
             v *= w;
           }
-          acc[static_cast<size_t>(e)] += v;
+          acc[to_uint(e)] += v;
         }
       }
 
@@ -141,7 +141,7 @@ void cpu_kernel_pooling(thread_pool_ptr_t thread_pool,
         inv = (denom != 0.f) ? 1.f / denom : 0.f;
       }
       for (int64_t e = 0; e < row_width; e++) {
-        out_row[e] = pooling_from_float<OutT>(acc[static_cast<size_t>(e)] * inv);
+        out_row[e] = pooling_from_float<OutT>(acc[to_uint(e)] * inv);
       }
     }
   };
@@ -182,15 +182,15 @@ void cpu_kernel_pooling_quant(thread_pool_ptr_t thread_pool,
                     (pooling_type == PoolingType_t::WeightedMean);
 
   const int64_t workers = std::max<int64_t>(1, num_workers);
-  const int64_t bags_per_task = std::max<int64_t>(1, (num_bags + workers - 1) / workers);
-  const int64_t num_tasks = (num_bags + bags_per_task - 1) / bags_per_task;
+  const int64_t bags_per_task = std::max<int64_t>(1, ceil_div(num_bags, workers));
+  const int64_t num_tasks = ceil_div(num_bags, bags_per_task);
 
   const auto pool_task = [=](const int64_t task_idx) {
     const int64_t bag_start = task_idx * bags_per_task;
     const int64_t bag_end = std::min<int64_t>(bag_start + bags_per_task, num_bags);
 
     // Per-task float accumulator reused across this task's bags.
-    std::vector<float> acc(static_cast<size_t>(row_width));
+    std::vector<float> acc(to_uint(row_width));
 
     for (int64_t bag = bag_start; bag < bag_end; bag++) {
       int64_t start_key;
@@ -206,7 +206,7 @@ void cpu_kernel_pooling_quant(thread_pool_ptr_t thread_pool,
 
       auto* out_row = reinterpret_cast<OutT*>(output + bag * output_stride);
       if (count <= 0) {
-        std::memset(out_row, 0, static_cast<size_t>(row_width) * sizeof(OutT));
+        std::memset(out_row, 0, to_uint(row_width) * sizeof(OutT));
         continue;
       }
 
@@ -237,7 +237,7 @@ void cpu_kernel_pooling_quant(thread_pool_ptr_t thread_pool,
           if (weighted) {
             v *= w;
           }
-          acc[static_cast<size_t>(e)] += v;
+          acc[to_uint(e)] += v;
         }
       }
       // Averaging denominator: WeightedMean divides by the sum of weights, Mean by
@@ -249,7 +249,7 @@ void cpu_kernel_pooling_quant(thread_pool_ptr_t thread_pool,
         inv = (denom != 0.f) ? 1.f / denom : 0.f;
       }
       for (int64_t e = 0; e < row_width; e++) {
-        const float val = acc[static_cast<size_t>(e)] * inv;
+        const float val = acc[to_uint(e)] * inv;
         out_row[e] = pooling_from_float<OutT>(val);
       }
     }
@@ -278,8 +278,8 @@ void cpu_kernel_concatenate(thread_pool_ptr_t thread_pool,
                             const int64_t output_stride,
                             const int64_t num_workers) {
   const int64_t workers = std::max<int64_t>(1, num_workers);
-  const int64_t rows_per_task = std::max<int64_t>(1, (num_rows + workers - 1) / workers);
-  const int64_t num_tasks = (num_rows + rows_per_task - 1) / rows_per_task;
+  const int64_t rows_per_task = std::max<int64_t>(1, ceil_div(num_rows, workers));
+  const int64_t num_tasks = ceil_div(num_rows, rows_per_task);
 
   const auto task = [=](const int64_t task_idx) {
     const int64_t row_start = task_idx * rows_per_task;
@@ -316,8 +316,8 @@ void cpu_kernel_concatenate_quant(thread_pool_ptr_t thread_pool,
                                   const int64_t output_stride,
                                   const int64_t num_workers) {
   const int64_t workers = std::max<int64_t>(1, num_workers);
-  const int64_t rows_per_task = std::max<int64_t>(1, (num_rows + workers - 1) / workers);
-  const int64_t num_tasks = (num_rows + rows_per_task - 1) / rows_per_task;
+  const int64_t rows_per_task = std::max<int64_t>(1, ceil_div(num_rows, workers));
+  const int64_t num_tasks = ceil_div(num_rows, rows_per_task);
 
   const auto task = [=](const int64_t task_idx) {
     const int64_t row_start = task_idx * rows_per_task;

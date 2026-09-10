@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-26.08.0-green.svg)](version.txt)
+[![Version](https://img.shields.io/badge/version-26.09.0-green.svg)](version.txt)
 
 NV Embedding Cache is a domain-specific SDK for high performance recommender systems embedding lookup.
 We accelerate embedding lookups with a combination of SW caches in GPU/Host memory and customized CUDA kernels.
@@ -76,10 +76,10 @@ Samples are listed in [docs/samples.md](docs/samples.md). The basics are covered
 
 Benchmarking scripts are available in [benchmarks/](benchmarks/). See instructions at [docs/benchmarks.md](docs/benchmarks.md)
 
-## Citations
+## Blogs/Citations
 
+* https://developer.nvidia.com/blog/how-generative-recommenders-are-redefining-recsys-at-scale/
 * https://developer.nvidia.com/blog/nvidia-platform-delivers-lowest-token-cost-enabled-by-extreme-co-design/
-
 
 ## License
  The NV Embedding Cache SDK is licensed under the terms of the Apache 2.0 license. See [LICENSE](LICENSE) for more information.

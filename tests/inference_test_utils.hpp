@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
+
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -35,6 +37,15 @@
 #include <vector>
 
 namespace nve_test {
+
+// Expects every substring in `expected` to appear in a process's `output`.
+inline void expect_output_contains(const std::string& output,
+                                   const std::vector<const char*>& expected) {
+  for (const char* e : expected) {
+    EXPECT_NE(output.find(e), std::string::npos)
+        << "Missing output: " << e << "\nProcess output:\n" << output;
+  }
+}
 
 struct ProcessResult {
   int exit_code;

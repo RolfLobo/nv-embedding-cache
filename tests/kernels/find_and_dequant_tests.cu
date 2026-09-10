@@ -84,30 +84,30 @@ class FindAndDequantRefTest : public ::testing::Test {
   }
 
   FindAndDequantRefTest()
-      : m_cache_allocator(nve::DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD) {
-    CHECK_CUDA_ERROR(cudaStreamCreate(&m_stream));
+      : cache_allocator_(nve::DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD) {
+    CHECK_CUDA_ERROR(cudaStreamCreate(&stream_));
   }
   ~FindAndDequantRefTest() {
     if constexpr (USE_CACHE) {
-      if (m_cache_ptr) {
-        CHECK_CUDA_ERROR(m_cache_ptr->lookup_context_destroy(m_handle_lookup));
-        CHECK_CUDA_ERROR(m_cache_ptr->modify_context_destroy(m_handle_modify));
+      if (cache_ptr_) {
+        CHECK_CUDA_ERROR(cache_ptr_->lookup_context_destroy(handle_lookup_));
+        CHECK_CUDA_ERROR(cache_ptr_->modify_context_destroy(handle_modify_));
       }
     }
   }
 
   void LaunchTest(uint64_t num_rows, uint32_t num_elements, uint64_t num_keys, bool allocOnHost) {
-    m_num_rows = num_rows;
-    m_num_elements = num_elements;
-    m_num_keys = static_cast<IndexType>(num_keys);
-    m_allocOnHost = allocOnHost;
-    m_row_bytes = m_num_elements * sizeof(StorageType)
+    num_rows_ = num_rows;
+    num_elements_ = num_elements;
+    num_keys_ = static_cast<IndexType>(num_keys);
+    allocOnHost_ = allocOnHost;
+    row_bytes_ = num_elements_ * sizeof(StorageType)
                 + (HAS_OFFSET ? 2 : 1) * sizeof(ParamType);  // q + scale [+ offset]
     // Pad the row stride to 4 bytes so every row base stays aligned for the Vec4 (char4) load path.
-    m_row_bytes = (m_row_bytes + 3u) & ~static_cast<uint64_t>(3u);
+    row_bytes_ = (row_bytes_ + 3u) & ~static_cast<uint64_t>(3u);
     // load_indices=false reads rows positionally over [0, num_keys); load_indices=true uses keys in
     // [1, num_rows). Either way every accessed row must be < num_rows.
-    ASSERT_LT(static_cast<uint64_t>(m_num_keys), m_num_rows)
+    ASSERT_LT(static_cast<uint64_t>(num_keys_), num_rows_)
         << "num_keys must be < table rows so positional (load_indices=false) reads stay in-bounds";
     AllocateTable();
     AllocateKeys();
@@ -171,36 +171,36 @@ class FindAndDequantRefTest : public ::testing::Test {
   }
 
   void AllocateTable() {
-    m_table = std::make_shared<TestBuffer<int8_t>>(m_num_rows * m_row_bytes);
+    table_ = std::make_shared<TestBuffer<int8_t>>(num_rows_ * row_bytes_);
     std::mt19937 gen(0X814753);
     // Values in [-1, 1] expressed as a / 2^b to keep float rounding small.
     std::uniform_int_distribution<int32_t> dist_nom(-8, 8);
     std::uniform_int_distribution<uint32_t> dist_denom(3, 9);
 
-    std::vector<float> v(m_num_elements);
-    for (uint64_t i = 0; i < m_num_rows; i++) {
-      for (uint32_t j = 0; j < m_num_elements; j++) {
+    std::vector<float> v(num_elements_);
+    for (uint64_t i = 0; i < num_rows_; i++) {
+      for (uint32_t j = 0; j < num_elements_; j++) {
         v[j] = float(dist_nom(gen)) / float(1 << dist_denom(gen));
       }
-      int8_t* row = m_table->ph + i * m_row_bytes;
+      int8_t* row = table_->ph + i * row_bytes_;
       ParamType scale{}, offset{};
       Quantize(v, reinterpret_cast<StorageType*>(row), scale, offset);
-      int8_t* meta = row + m_num_elements * sizeof(StorageType);
+      int8_t* meta = row + num_elements_ * sizeof(StorageType);
       memcpy(meta, static_cast<const void*>(&scale), sizeof(ParamType));
       if (HAS_OFFSET) memcpy(meta + sizeof(ParamType), static_cast<const void*>(&offset), sizeof(ParamType));
     }
-    m_table->HtoD(m_stream);
+    table_->HtoD(stream_);
   }
 
   void AllocateKeys() {
-    m_keys = std::make_shared<TestBuffer<IndexType>>(m_num_keys * sizeof(IndexType));
+    keys_ = std::make_shared<TestBuffer<IndexType>>(num_keys_ * sizeof(IndexType));
     const float alpha = 1.05f;
     const size_t seed = 283982;
-    auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(m_num_rows),
-                                            static_cast<uint32_t>(m_num_keys), seed);
+    auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(num_rows_),
+                                            static_cast<uint32_t>(num_keys_), seed);
     auto sample = sg->getCategoryIndices();
-    std::copy(sample.begin(), sample.begin() + m_num_keys, m_keys->ph);
-    m_keys->HtoD(m_stream);
+    std::copy(sample.begin(), sample.begin() + num_keys_, keys_->ph);
+    keys_->HtoD(stream_);
   }
 
   // Builds the CacheData passed to the kernel: a populated set-associative cache when USE_CACHE,
@@ -208,13 +208,13 @@ class FindAndDequantRefTest : public ::testing::Test {
   CacheDataType MakeCacheData() {
     if constexpr (USE_CACHE) {
       InitCache();
-      std::vector<IndexType> cached = ComputeCachedIndices(m_cache_data.num_sets, CacheType::NUM_WAYS);
+      std::vector<IndexType> cached = ComputeCachedIndices(cache_data_.num_sets, CacheType::NUM_WAYS);
       PopulateCache(cached);
-      m_cache_data = m_cache_ptr->get_cache_data(m_handle_lookup);
-      return m_cache_data;
+      cache_data_ = cache_ptr_->get_cache_data(handle_lookup_);
+      return cache_data_;
     } else {
       NoCacheData data{};
-      data.row_size_in_bytes = static_cast<uint32_t>(m_row_bytes);
+      data.row_size_in_bytes = static_cast<uint32_t>(row_bytes_);
       data.count_misses = false;
       data.misses = nullptr;
       return data;
@@ -223,29 +223,29 @@ class FindAndDequantRefTest : public ::testing::Test {
 
   void InitCache() {
     const float cache_ratio = 0.15f;
-    const uint32_t num_rows_in_cache = static_cast<uint32_t>(cache_ratio * static_cast<float>(m_num_rows));
+    const uint32_t num_rows_in_cache = static_cast<uint32_t>(cache_ratio * static_cast<float>(num_rows_));
     typename CacheType::CacheConfig cfg;
-    cfg.embed_width_in_bytes = m_row_bytes;
+    cfg.embed_width_in_bytes = row_bytes_;
     cfg.cache_sz_in_bytes = num_rows_in_cache * cfg.embed_width_in_bytes;
     cfg.num_tables = 1;
-    cfg.allocate_data_on_host = m_allocOnHost;
-    m_cache_ptr = std::make_shared<CacheType>(&m_cache_allocator, &m_cache_logger, cfg);
-    m_cache_ptr->init();
-    m_cache_ptr->lookup_context_create(m_handle_lookup, nullptr, 0);
-    m_cache_data = m_cache_ptr->get_cache_data(m_handle_lookup);
+    cfg.allocate_data_on_host = allocOnHost_;
+    cache_ptr_ = std::make_shared<CacheType>(&cache_allocator_, &cache_logger_, cfg);
+    cache_ptr_->init();
+    cache_ptr_->lookup_context_create(handle_lookup_, nullptr, 0);
+    cache_data_ = cache_ptr_->get_cache_data(handle_lookup_);
   }
 
   std::vector<IndexType> ComputeCachedIndices(const int num_sets, const int num_ways) {
     std::set<IndexType> cached_indices;
     std::vector<int> counters(num_sets, 0);
-    uint64_t cache_capacity = static_cast<uint64_t>(static_cast<double>(m_num_rows) * 0.15);
-    while (cache_capacity > static_cast<uint64_t>(m_num_keys)) {
+    uint64_t cache_capacity = static_cast<uint64_t>(static_cast<double>(num_rows_) * 0.15);
+    while (cache_capacity > static_cast<uint64_t>(num_keys_)) {
       cache_capacity /= 2;
     }
-    uint32_t step = static_cast<uint32_t>(m_num_keys / cache_capacity);
+    uint32_t step = static_cast<uint32_t>(num_keys_ / cache_capacity);
     EXPECT_TRUE(step > 0);
-    for (IndexType i = 0; i < m_num_keys; i += step) {
-      IndexType idx = m_keys->ph[i];
+    for (IndexType i = 0; i < num_keys_; i += step) {
+      IndexType idx = keys_->ph[i];
       if (++counters[idx % num_sets] <= num_ways) {
         cached_indices.insert(idx);
       }
@@ -254,14 +254,14 @@ class FindAndDequantRefTest : public ::testing::Test {
   }
 
   void PopulateCache(const std::vector<IndexType>& cached_indices) {
-    m_cache_ptr->modify_context_create(m_handle_modify, static_cast<uint32_t>(cached_indices.size()));
+    cache_ptr_->modify_context_create(handle_modify_, static_cast<uint32_t>(cached_indices.size()));
     nve::DefaultHistogram<IndexType> hist(cached_indices.data(), cached_indices.size(),
-                                          m_table->ph, m_row_bytes, true);
+                                          table_->ph, row_bytes_, true);
     cudaEvent_t wait;
     CHECK_CUDA_ERROR(cudaEventCreate(&wait));
     nve::DefaultECEvent ec_event(std::vector<cudaStream_t>{});
-    m_cache_ptr->insert(m_handle_modify, hist.get_keys(), hist.get_priority(), hist.get_data(),
-                        hist.get_num_bins(), 0, &ec_event, m_stream);
+    cache_ptr_->insert(handle_modify_, hist.get_keys(), hist.get_priority(), hist.get_data(),
+                        hist.get_num_bins(), 0, &ec_event, stream_);
     CHECK_CUDA_ERROR(cudaEventRecord(wait));
     CHECK_CUDA_ERROR(cudaEventSynchronize(wait));
   }
@@ -269,35 +269,35 @@ class FindAndDequantRefTest : public ::testing::Test {
   void ComputeRefResults() {
     // Store the dequantized value (as float, already reflecting the kernel's ParamType rounding);
     // CheckResult rounds it through OutputType to model the kernel's final Cast.
-    m_ref_result.assign(static_cast<size_t>(m_num_keys) * m_num_elements, 0.0f);
-    for (uint64_t i = 0; i < static_cast<uint64_t>(m_num_keys); i++) {
+    ref_result_.assign(static_cast<size_t>(num_keys_) * num_elements_, 0.0f);
+    for (uint64_t i = 0; i < static_cast<uint64_t>(num_keys_); i++) {
       // load_indices=true resolves the row from the keys buffer; false reads positionally (tid).
-      IndexType idx = LOAD_INDICES ? m_keys->ph[i] : static_cast<IndexType>(i);
-      const int8_t* row = m_table->ph + static_cast<uint64_t>(idx) * m_row_bytes;
+      IndexType idx = LOAD_INDICES ? keys_->ph[i] : static_cast<IndexType>(i);
+      const int8_t* row = table_->ph + static_cast<uint64_t>(idx) * row_bytes_;
       const StorageType* q = reinterpret_cast<const StorageType*>(row);
-      const int8_t* meta = row + m_num_elements * sizeof(StorageType);
+      const int8_t* meta = row + num_elements_ * sizeof(StorageType);
       ParamType scale{}, offset{};
       memcpy(static_cast<void*>(&scale), meta, sizeof(ParamType));
       if (HAS_OFFSET) memcpy(static_cast<void*>(&offset), meta + sizeof(ParamType), sizeof(ParamType));
-      for (uint32_t el = 0; el < m_num_elements; el++) {
-        m_ref_result[i * m_num_elements + el] = Dequantize(q[el], scale, offset);
+      for (uint32_t el = 0; el < num_elements_; el++) {
+        ref_result_[i * num_elements_ + el] = Dequantize(q[el], scale, offset);
       }
     }
   }
 
   void LaunchKernel(CacheDataType& cache_data) {
-    m_result = std::make_shared<TestBuffer<OutputType>>(
-        static_cast<size_t>(m_num_keys) * m_num_elements * sizeof(OutputType));
-    const size_t stride = m_num_elements * sizeof(OutputType);
+    result_ = std::make_shared<TestBuffer<OutputType>>(
+        static_cast<size_t>(num_keys_) * num_elements_ * sizeof(OutputType));
+    const size_t stride = num_elements_ * sizeof(OutputType);
     CHECK_CUDA_ERROR((nve::call_find_and_dequant<IndexType, CacheDataType>(
-        m_keys->pd, static_cast<size_t>(m_num_keys), reinterpret_cast<int8_t*>(m_result->pd),
-        m_table->pd, VALUE_TYPE_ID, data_type<OutputType>(), m_num_elements, cache_data, m_stream,
+        keys_->pd, static_cast<size_t>(num_keys_), reinterpret_cast<int8_t*>(result_->pd),
+        table_->pd, VALUE_TYPE_ID, data_type<OutputType>(), num_elements_, cache_data, stream_,
         stride, /*load_indices=*/LOAD_INDICES, /*curr_table=*/0)));
-    CHECK_CUDA_ERROR(cudaStreamSynchronize(m_stream));
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
   }
 
   void CheckResult() {
-    m_result->DtoH(m_stream);
+    result_->DtoH(stream_);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     // Single dequant per element (no accumulation): a float output matches the reference exactly bar
     // rounding; a __half (ParamType or output) is limited by half granularity.
@@ -305,31 +305,31 @@ class FindAndDequantRefTest : public ::testing::Test {
         (std::is_same_v<ParamType, __half> || std::is_same_v<OutputType, __half>) ? 1e-2f : 1e-4f;
     Near near(tolerance);
     bool all_near = true;
-    for (size_t i = 0; i < m_ref_result.size(); ++i) {
-      const OutputType expected = to_output(m_ref_result[i]);
-      all_near = all_near && near(to_float(expected), to_float(m_result->ph[i]));
+    for (size_t i = 0; i < ref_result_.size(); ++i) {
+      const OutputType expected = to_output(ref_result_[i]);
+      all_near = all_near && near(to_float(expected), to_float(result_->ph[i]));
     }
     EXPECT_TRUE(all_near);
   }
 
-  cudaStream_t m_stream;
-  uint64_t m_num_rows{0};
-  uint32_t m_num_elements{0};
-  bool m_allocOnHost{false};
-  uint64_t m_row_bytes{0};
-  IndexType m_num_keys{0};
+  cudaStream_t stream_;
+  uint64_t num_rows_{0};
+  uint32_t num_elements_{0};
+  bool allocOnHost_{false};
+  uint64_t row_bytes_{0};
+  IndexType num_keys_{0};
 
-  std::shared_ptr<TestBuffer<int8_t>> m_table = nullptr;
-  std::shared_ptr<TestBuffer<IndexType>> m_keys = nullptr;
-  std::shared_ptr<TestBuffer<OutputType>> m_result = nullptr;
-  std::vector<float> m_ref_result;
+  std::shared_ptr<TestBuffer<int8_t>> table_ = nullptr;
+  std::shared_ptr<TestBuffer<IndexType>> keys_ = nullptr;
+  std::shared_ptr<TestBuffer<OutputType>> result_ = nullptr;
+  std::vector<float> ref_result_;
 
-  nve::DefaultAllocator m_cache_allocator;
-  nve::Logger m_cache_logger;
-  std::shared_ptr<CacheType> m_cache_ptr;
-  nve::LookupContextHandle m_handle_lookup;
-  nve::ModifyContextHandle m_handle_modify;
-  SACacheData m_cache_data{};
+  nve::DefaultAllocator cache_allocator_;
+  nve::Logger cache_logger_;
+  std::shared_ptr<CacheType> cache_ptr_;
+  nve::LookupContextHandle handle_lookup_;
+  nve::ModifyContextHandle handle_modify_;
+  SACacheData cache_data_{};
 };
 
 TYPED_TEST_SUITE_P(FindAndDequantRefTest);

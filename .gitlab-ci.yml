@@ -69,6 +69,25 @@ default:
       # Sections are collapsed for readability.
       # On failure, the tail is replayed *outside* the section for highlighting failures.
       SECTION_TAIL_LINES=${SECTION_TAIL_LINES:-100}
+      # Per-section wall-clock cap.  A hung command must fail its own section:
+      # if it instead runs out the Slurm allocation (CI_SLURM_TIME), the step is
+      # killed mid-section and the executor reports the job as *succeeded*.
+      # Keep the sum of the sections comfortably under CI_SLURM_TIME.
+      SECTION_TIMEOUT=${SECTION_TIMEOUT:-30m}
+      # Converts a `timeout`-style duration ("30m", "45s", "2h", or a bare
+      # number of seconds) to seconds, so an observed elapsed time can be
+      # compared against it.
+      function _duration_to_seconds() {
+        local val="$1"
+        local unit="${val: -1}"
+        case "$unit" in
+          s) echo "${val%s}" ;;
+          m) echo $(( ${val%m} * 60 )) ;;
+          h) echo $(( ${val%h} * 3600 )) ;;
+          d) echo $(( ${val%d} * 86400 )) ;;
+          *) echo "$val" ;;
+        esac
+      }
       function run_section() {
         local header="$1"
         shift
@@ -90,16 +109,33 @@ default:
         # or export inside a section does not outlive it; and anything it
         # backgrounds must redirect stdout, or tee never sees EOF and the
         # section hangs until that process exits.
+        # `timeout` needs a real command, so the string is re-parsed by `bash -c`
+        # rather than `eval`; SIGTERM first, then SIGKILL for anything that
+        # ignores it.
         set +e
-        eval "$cmd" 2>&1 | tee "$log"
+        SECONDS=0
+        timeout --kill-after=1m "$SECTION_TIMEOUT" bash -c "$cmd" 2>&1 | tee "$log"
         local exit_code=${PIPESTATUS[0]}
+        local elapsed=$SECONDS
         set -e
 
         echo -e "\e[0Ksection_end:`date +%s`:${id}\r\e[0K"
 
         # Fail the job if the inner command failed, after replaying the tail.
         if [ $exit_code -ne 0 ]; then
-          echo -e "\e[0;31m✖ FAILED: ${header} (exit ${exit_code})\e[0m"
+          # 124 = timed out (SIGTERM stage). 137 = SIGKILL, which `timeout`'s
+          # --kill-after escalation also produces - but so does an external
+          # SIGKILL (e.g. OOM killer) at any point, so 137 alone doesn't prove
+          # a timeout. Only call it a timeout if we actually ran long enough
+          # to have hit SECTION_TIMEOUT.
+          local section_timeout_s=$(_duration_to_seconds "$SECTION_TIMEOUT")
+          if [ $exit_code -eq 124 ] || { [ $exit_code -eq 137 ] && [ $elapsed -ge $((section_timeout_s - 2)) ]; }; then
+            echo -e "\e[0;31m✖ TIMED OUT after ${SECTION_TIMEOUT}: ${header}\e[0m"
+          elif [ $exit_code -eq 137 ]; then
+            echo -e "\e[0;31m✖ KILLED (signal 9) after ${elapsed}s, well under the ${SECTION_TIMEOUT} timeout - check for OOM or an external kill: ${header}\e[0m"
+          else
+            echo -e "\e[0;31m✖ FAILED: ${header} (exit ${exit_code})\e[0m"
+          fi
           echo "--- last ${SECTION_TAIL_LINES} lines; full output in the '${header}' section above ---"
           tail -n "${SECTION_TAIL_LINES}" "$log"
           rm -f "$log"
@@ -162,8 +198,13 @@ variables:
 # scheduled perf jobs.
 .perf_matrix:
   extends: .gpu_runner
+  # Allowing 2 retries for perf jobs
+  retry:
+    max: 2
   variables:
-    CI_CRUN_QUERY: 'gpu.product_name="${GPU_TYPE}" and cpu.arch=x86_64 and cpu.product_name="${CPU_TYPE}"'
+    PERF_MIN_AVAILABLE_GIB: "96"
+    KERNEL_VER: "*"
+    CI_CRUN_QUERY: 'gpu.product_name="${GPU_TYPE}" and cpu.arch=x86_64 and cpu.product_name="${CPU_TYPE}" and system.os_kernel_version="${KERNEL_VER}"'
 
 .gpu_runner:
   variables:

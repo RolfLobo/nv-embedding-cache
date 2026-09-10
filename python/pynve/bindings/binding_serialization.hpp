@@ -45,4 +45,4 @@ private:
     py::function flush_func_;
 };
 
-} // namespace nve
+}  // namespace nve

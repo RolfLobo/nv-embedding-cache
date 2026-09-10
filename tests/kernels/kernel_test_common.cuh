@@ -22,6 +22,7 @@
 #pragma once
 
 #include "gtest/gtest.h"
+#include <bit_ops.hpp>
 #include <datagen.h>
 #include <memory>
 #include <algorithm>
@@ -66,86 +67,86 @@ class EmbeddingCacheRefTest : public ::testing::Test {
     using CacheType = nve::CacheSAHostModify<IndexType, IndexType>;
     using CacheDataType = typename CacheType::CacheData;
 
-    EmbeddingCacheRefTest(): m_cache_allocator(nve::DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD) {
-        CHECK_CUDA_ERROR(cudaStreamCreate(&m_stream));
+    EmbeddingCacheRefTest(): cache_allocator_(nve::DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD) {
+        CHECK_CUDA_ERROR(cudaStreamCreate(&stream_));
     }
 
     ~EmbeddingCacheRefTest() {
-        CHECK_CUDA_ERROR(m_cache_ptr->lookup_context_destroy(m_handle_lookup));
-        CHECK_CUDA_ERROR(m_cache_ptr->modify_context_destroy(m_handle_modify));
+        CHECK_CUDA_ERROR(cache_ptr_->lookup_context_destroy(handle_lookup_));
+        CHECK_CUDA_ERROR(cache_ptr_->modify_context_destroy(handle_modify_));
     }
 
     void LaunchTest(uint64_t num_rows, uint32_t num_elements, uint32_t batch, uint32_t hotness, bool allocDataOnHost, int64_t kernel_param = 0) {
-        m_num_rows = num_rows;
-        m_num_elements = num_elements;
-        m_batch = batch;
-        m_hotness = hotness;
-        m_num_keys = static_cast<IndexType>(m_batch) * static_cast<IndexType>(m_hotness);
-        m_allocDataOnHost = allocDataOnHost;
-        m_kernel_param = kernel_param;
+        num_rows_ = num_rows;
+        num_elements_ = num_elements;
+        batch_ = batch;
+        hotness_ = hotness;
+        num_keys_ = static_cast<IndexType>(batch_) * static_cast<IndexType>(hotness_);
+        allocDataOnHost_ = allocDataOnHost;
+        kernel_param_ = kernel_param;
         AllocateTable();
         InitCache();
         InitTestExtras();
         AllocateKeys();
-        CacheDataType cache_data = m_cache_ptr->get_cache_data(m_handle_lookup);
+        CacheDataType cache_data = cache_ptr_->get_cache_data(handle_lookup_);
         std::vector<IndexType> cached_indices = 
             ComputeCachedIndices(cache_data.num_sets, CacheType::NUM_WAYS);
         PopulateCache(cached_indices);
-        ComputeRefResults(m_table->ph, m_keys->ph, cached_indices);
-        LaunchKernel(m_table->pd, m_keys->pd, cache_data);
+        ComputeRefResults(table_->ph, keys_->ph, cached_indices);
+        LaunchKernel(table_->pd, keys_->pd, cache_data);
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         CheckResult();
     }
 
-    cudaStream_t m_stream;
-    uint64_t m_num_rows{0};
-    uint32_t m_num_elements{0}; 
-    uint32_t m_batch{0};
-    uint32_t m_hotness{0};
-    IndexType m_num_keys{0};
-    bool m_allocDataOnHost{false};
-    int64_t m_kernel_param{0};
+    cudaStream_t stream_;
+    uint64_t num_rows_{0};
+    uint32_t num_elements_{0};
+    uint32_t batch_{0};
+    uint32_t hotness_{0};
+    IndexType num_keys_{0};
+    bool allocDataOnHost_{false};
+    int64_t kernel_param_{0};
   protected:
   
     ElemType* syncTable() {
-      m_table->DtoH(m_stream);
-      return m_table->ph;
+      table_->DtoH(stream_);
+      return table_->ph;
     }
 
     void GetCacheContent(ElemType* d_cache_content, std::shared_ptr<TestBuffer<IndexType>> keys_in_c, size_t& num_keys) 
     {
         
-        m_cache_ptr->get_keys_stored_in_cache(m_handle_lookup, keys_in_c->ph, num_keys);
-        keys_in_c->HtoD(m_stream);
-        int64_t num_hitmask_elems = (num_keys + 31) / 32;
+        cache_ptr_->get_keys_stored_in_cache(handle_lookup_, keys_in_c->ph, num_keys);
+        keys_in_c->HtoD(stream_);
+        int64_t num_hitmask_elems = nve::ceil_div(num_keys, static_cast<size_t>(32));
         auto hitmask = std::make_shared<TestBuffer<uint32_t>>(num_hitmask_elems * sizeof(uint32_t));
         CHECK_CUDA_ERROR(cudaMemset(hitmask->pd, 0, num_hitmask_elems * sizeof(uint32_t)));
 
         NVE_DEBUG_PRINTF_("launch lookup with hitmask kernel\n");
 
-        m_cache_ptr->lookup(m_handle_lookup, keys_in_c->pd, num_keys, (int8_t*)d_cache_content, (uint64_t*)hitmask->pd, 0, m_num_elements*sizeof(ElemType), m_stream);
+        cache_ptr_->lookup(handle_lookup_, keys_in_c->pd, num_keys, (int8_t*)d_cache_content, (uint64_t*)hitmask->pd, 0, num_elements_*sizeof(ElemType), stream_);
     }
 
     std::map<IndexType, std::vector<ElemType>> GetCacheContent()
     {
-        auto num_vec_in_c = m_cache_ptr->get_max_num_embedding_vectors_in_cache();
+        auto num_vec_in_c = cache_ptr_->get_max_num_embedding_vectors_in_cache();
         auto key_in_c = std::make_shared<TestBuffer<IndexType>>(sizeof(IndexType)*num_vec_in_c);
-        auto cache_content = std::make_shared<TestBuffer<ElemType>>(sizeof(ElemType)*this->m_num_elements*num_vec_in_c);
+        auto cache_content = std::make_shared<TestBuffer<ElemType>>(sizeof(ElemType)*this->num_elements_*num_vec_in_c);
         size_t num_keys_in_c = 0;
         this->GetCacheContent(cache_content->pd, key_in_c, num_keys_in_c);
-        cache_content->DtoH(this->m_stream);
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(this->m_stream));
+        cache_content->DtoH(this->stream_);
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(this->stream_));
         std::map<IndexType, std::vector<ElemType>> mock_cache;
         for (size_t i = 0; i < num_keys_in_c; i++)
         {
             auto key = key_in_c->ph[i];
-            mock_cache[key].resize(this->m_num_elements);
-            memcpy(mock_cache[key].data(), cache_content->ph + i*this->m_num_elements, this->m_num_elements* sizeof(ElemType));
+            mock_cache[key].resize(this->num_elements_);
+            memcpy(mock_cache[key].data(), cache_content->ph + i*this->num_elements_, this->num_elements_* sizeof(ElemType));
         }
         return mock_cache;
     }
 
-    std::shared_ptr<TestBuffer<IndexType>> m_keys = nullptr;
+    std::shared_ptr<TestBuffer<IndexType>> keys_ = nullptr;
 
   private:
     virtual void ComputeRefResults(const ElemType* /*table*/,
@@ -167,24 +168,24 @@ class EmbeddingCacheRefTest : public ::testing::Test {
 
     void InitCache() {
         const float cache_ratio = 0.15f;
-        const uint32_t num_rows_in_cache = static_cast<uint32_t>(cache_ratio * static_cast<float>(this->m_num_rows));
+        const uint32_t num_rows_in_cache = static_cast<uint32_t>(cache_ratio * static_cast<float>(this->num_rows_));
 
         typename CacheType::CacheConfig cfg;
-        cfg.embed_width_in_bytes = this->m_num_elements * sizeof(ElemType);
+        cfg.embed_width_in_bytes = this->num_elements_ * sizeof(ElemType);
 
-        NVE_DEBUG_PRINTF_("cache of %d entries\n", int(cache_ratio * float(this->m_num_rows)));
+        NVE_DEBUG_PRINTF_("cache of %d entries\n", int(cache_ratio * float(this->num_rows_)));
         cfg.cache_sz_in_bytes = num_rows_in_cache * cfg.embed_width_in_bytes;
         cfg.num_tables = 1;
-        cfg.allocate_data_on_host = m_allocDataOnHost;
+        cfg.allocate_data_on_host = allocDataOnHost_;
 
-        m_cache_ptr = std::make_shared<CacheType>(&m_cache_allocator, &m_cache_logger, cfg);
-        m_cache_ptr->init();
+        cache_ptr_ = std::make_shared<CacheType>(&cache_allocator_, &cache_logger_, cfg);
+        cache_ptr_->init();
 
-        m_cache_ptr->lookup_context_create(m_handle_lookup, nullptr, 0);
+        cache_ptr_->lookup_context_create(handle_lookup_, nullptr, 0);
     }
 
     void AllocateTable() {
-        m_table = std::make_shared<TestBuffer<ElemType>>(this->m_num_rows * this->m_num_elements * sizeof(ElemType));
+        table_ = std::make_shared<TestBuffer<ElemType>>(this->num_rows_ * this->num_elements_ * sizeof(ElemType));
         std::mt19937 gen(0X814753);
         // init to [a / 2^b] when a and b are in specific range,
         // to minimize arithmetic error in half when doing weigthed math
@@ -193,10 +194,10 @@ class EmbeddingCacheRefTest : public ::testing::Test {
         std::uniform_int_distribution<int32_t> dist_nom(-8, 8);
         std::uniform_int_distribution<uint32_t> dist_denom(3, 9);
 
-        for (uint64_t i = 0; i < this->m_num_rows; i++)
+        for (uint64_t i = 0; i < this->num_rows_; i++)
         {
-            ElemType* curr_row = reinterpret_cast<ElemType*>(m_table->ph + i * this->m_num_elements);
-            for (uint64_t j = 0; j < this->m_num_elements; j++)
+            ElemType* curr_row = reinterpret_cast<ElemType*>(table_->ph + i * this->num_elements_);
+            for (uint64_t j = 0; j < this->num_elements_; j++)
             {
                 float nom = float(dist_nom(gen));
                 float denom = float(1 << dist_denom(gen));
@@ -204,37 +205,37 @@ class EmbeddingCacheRefTest : public ::testing::Test {
             }
         }
 
-        m_table->HtoD(m_stream);
+        table_->HtoD(stream_);
     }
 
     virtual void AllocateKeys() {
-        m_keys = std::make_shared<TestBuffer<IndexType>>(m_num_keys * sizeof(IndexType));
+        keys_ = std::make_shared<TestBuffer<IndexType>>(num_keys_ * sizeof(IndexType));
         const float alpha = 1.05f;
 
-        auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(this->m_num_rows), this->m_hotness, 283982);
-        for (uint32_t b = 0; b < this->m_batch; b++)
+        auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(this->num_rows_), this->hotness_, 283982);
+        for (uint32_t b = 0; b < this->batch_; b++)
         {
             auto sample = sg->getCategoryIndices();
-            std::copy(sample.begin(), sample.end(), m_keys->ph + b*this->m_hotness);
+            std::copy(sample.begin(), sample.end(), keys_->ph + b*this->hotness_);
         }
-        m_keys->HtoD(m_stream);
+        keys_->HtoD(stream_);
     }
 
     std::vector<IndexType> ComputeCachedIndices(const int num_sets, const int num_ways) {
         std::set<IndexType> cached_indices;
         std::vector<int> counters(num_sets, 0);
 
-        uint64_t cache_capacity = static_cast<uint64_t>(static_cast<double>(this->m_num_rows) * 0.15);
+        uint64_t cache_capacity = static_cast<uint64_t>(static_cast<double>(this->num_rows_) * 0.15);
 
-        while (cache_capacity > static_cast<uint64_t>(this->m_num_keys)) {
+        while (cache_capacity > static_cast<uint64_t>(this->num_keys_)) {
             cache_capacity /= 2;
         }
 
-        uint32_t step = static_cast<uint32_t>(this->m_num_keys / cache_capacity);
+        uint32_t step = static_cast<uint32_t>(this->num_keys_ / cache_capacity);
         EXPECT_TRUE(step > 0); // batch_size * hotness > cache_capcitiy 
         // for now: random indices
-        for (IndexType i=0; i < this->m_num_keys; i+=step) {
-            IndexType idx = m_keys->ph[i];
+        for (IndexType i=0; i < this->num_keys_; i+=step) {
+            IndexType idx = keys_->ph[i];
             if (++counters[idx % num_sets] <= num_ways) {
                 cached_indices.insert(idx);
             }
@@ -251,31 +252,31 @@ class EmbeddingCacheRefTest : public ::testing::Test {
         NVE_DEBUG_PRINTF_("inserting %lu embeds to cache\n", cached_indices.size());
 
         std::vector<float> priorities(cached_indices.size(), 1.0f);
-        m_cache_ptr->modify_context_create(m_handle_modify, static_cast<uint32_t>(cached_indices.size()));
+        cache_ptr_->modify_context_create(handle_modify_, static_cast<uint32_t>(cached_indices.size()));
 
         nve::DefaultHistogram<IndexType> hist(cached_indices.data(), cached_indices.size(),
-                                              reinterpret_cast<const int8_t*>(m_table->ph),
-                                              this->m_num_elements * sizeof(ElemType), true);
+                                              reinterpret_cast<const int8_t*>(table_->ph),
+                                              this->num_elements_ * sizeof(ElemType), true);
         cudaEvent_t wait;
         CHECK_CUDA_ERROR(cudaEventCreate(&wait));
         nve::DefaultECEvent ec_event(std::vector<cudaStream_t>{});
 
-        m_cache_ptr->insert(
-            m_handle_modify, hist.get_keys(), hist.get_priority(), hist.get_data(), hist.get_num_bins(), 0, &ec_event, m_stream);
+        cache_ptr_->insert(
+            handle_modify_, hist.get_keys(), hist.get_priority(), hist.get_data(), hist.get_num_bins(), 0, &ec_event, stream_);
 
         CHECK_CUDA_ERROR(cudaEventRecord(wait));
         CHECK_CUDA_ERROR(cudaEventSynchronize(wait));
 
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_table = nullptr;
+    std::shared_ptr<TestBuffer<ElemType>> table_ = nullptr;
 
-    nve::DefaultAllocator m_cache_allocator;
-    nve::Logger m_cache_logger;
-    nve::PerformanceMetric m_miss_count;
-    std::shared_ptr<CacheType> m_cache_ptr;
-    nve::LookupContextHandle m_handle_lookup;
-    nve::ModifyContextHandle m_handle_modify;
+    nve::DefaultAllocator cache_allocator_;
+    nve::Logger cache_logger_;
+    nve::PerformanceMetric miss_count_;
+    std::shared_ptr<CacheType> cache_ptr_;
+    nve::LookupContextHandle handle_lookup_;
+    nve::ModifyContextHandle handle_modify_;
 };
 
 

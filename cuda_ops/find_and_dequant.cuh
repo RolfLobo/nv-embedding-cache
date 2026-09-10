@@ -135,7 +135,7 @@ cudaError_t call_find_and_dequant_resolved(const IndexT* d_keys, const size_t le
     {
         return cudaSuccess;
     }
-    const uint32_t nBlock = static_cast<uint32_t>((len + blockSize - 1) / blockSize);
+    const uint32_t nBlock = static_cast<uint32_t>(ceil_div<size_t>(len, blockSize));
     dim3 gridDims(nBlock);
     dim3 blockDims(blockX, blockY);
 
@@ -217,4 +217,4 @@ cudaError_t call_find_and_dequant(const IndexT* d_keys, const size_t len,
     return cudaErrorInvalidValue;
 }
 
-} // namespace nve
+}  // namespace nve

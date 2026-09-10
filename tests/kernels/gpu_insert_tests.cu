@@ -16,6 +16,7 @@
  */
 
 #include "gtest/gtest.h"
+#include <bit_ops.hpp>
 #include <datagen.h>
 #include <memory>
 #include <algorithm>
@@ -304,7 +305,7 @@ class SortAndInsertTest : public ::testing::Test {
             SetupAndRunTest(tags, counters, unique_keys, priorities, data_ptrs, replace_list,
                             extra_mem_size, extra_mem_buf,
                             num_sets, embedding_size, decay_rate, NUM_WAYS * 2, 60, 15, 0, 4);
-        EXPECT_TRUE(num_replacements_device == (NUM_WAYS * ((num_sets + 3) / 4)));
+        EXPECT_TRUE(num_replacements_device == (NUM_WAYS * nve::ceil_div(num_sets, static_cast<uint32_t>(4))));
 
         CHECK_CUDA_ERROR(cudaFree(extra_mem_buf));
     }

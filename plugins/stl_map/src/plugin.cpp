@@ -16,9 +16,10 @@
  */
 
 #include <plugin/nve_internal_plugin.hpp>
-#include <stl_map_backed_table.hpp>
+#include <stl_map_table.hpp>
 
 /* Replaces the former built-in registry aliases (stl_map/map/umap/...) with
  * one explicit, always-built plugin SO. */
 NVE_DEFINE_INTERNAL_PLUGIN("STL unordered_map hashtable plugin", "NVIDIA Corporation",
-                           nve::STLMapTableFactory, nve::STLMapTableFactoryConfig)
+                           nve::plugin::STLMapTableFactory,
+                           nve::plugin::STLMapTableFactoryConfig)

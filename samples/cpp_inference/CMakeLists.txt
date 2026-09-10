@@ -17,7 +17,7 @@
 # Built as part of the main NVE build when samples are enabled.
 # No Python or pybind11 dependency at runtime.
 
-if(NOT TORCH_FOUND)
+if (NOT TORCH_FOUND)
     message(FATAL_ERROR "Torch package was not found!")
 endif()
 

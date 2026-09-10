@@ -277,7 +277,7 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
     auto allocator = GetDefaultAllocator();
     NVE_CHECK_(allocator->device_allocate(&d_keys_, sizeof(KeyType) * static_cast<size_t>(params.max_keys)));
     NVE_CHECK_(allocator->device_allocate(&d_data_, static_cast<size_t>(params.row_size_bytes) * static_cast<size_t>(params.max_keys)));
-    hit_mask_size_in_bytes_ = ((static_cast<size_t>(params.max_keys) + 63) / 64) * sizeof(int64_t);
+    hit_mask_size_in_bytes_ = to_uint(ceil_div(params.max_keys, bitmask64::num_bits)) * sizeof(bitmask64_t);
     NVE_CHECK_(allocator->device_allocate(&d_hitmask_, hit_mask_size_in_bytes_));
 
     ASSERT_TRUE(d_keys_);
@@ -347,7 +347,7 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
                  std::move(values_bw), nullptr);
     NVE_CHECK_(cudaDeviceSynchronize());
 
-    std::vector<uint64_t> h_hitmask(hit_mask_size_in_bytes_/8 , 0);
+    std::vector<bitmask64_t> h_hitmask(hit_mask_size_in_bytes_/sizeof(bitmask64_t) , 0);
     
     NVE_CHECK_(cudaMemcpy(h_data, d_data_, static_cast<size_t>(row_size) * static_cast<size_t>(num_keys), cudaMemcpyDefault));
     NVE_CHECK_(cudaMemcpy(h_hitmask.data(), d_hitmask_, hit_mask_size_in_bytes_, cudaMemcpyDefault));
@@ -355,8 +355,8 @@ class GpuTableTest : public testing::TestWithParam<GpuTableTestParams> {
     NVE_CHECK_(cudaDeviceSynchronize());
     if (!params.allocate_uvm_table) {
       // verify results
-      for (size_t i = 0; i < hit_mask_size_in_bytes_/8; i++) {
-        hit_count += static_cast<int64_t>(__builtin_popcountll(h_hitmask[i]));
+      for (size_t i = 0; i < hit_mask_size_in_bytes_/sizeof(bitmask64_t); i++) {
+        hit_count += static_cast<int64_t>(bitmask64::count(h_hitmask[i]));
       }
       return hit_count == num_keys;
     } else {

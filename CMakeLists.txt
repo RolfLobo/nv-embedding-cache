@@ -55,16 +55,17 @@ list(APPEND NVE_AVAILABLE_FEATURES
   "phmap_plugin"
   "redis_plugin"
   "rocksdb_plugin"
+  "sph_plugin"
   "internal_plugin"
 )
 list(APPEND NVE_AVAILABLE_FEATURES "ht_key_8" "ht_key_16" "ht_key_32" "ht_key_64")
-list(APPEND NVE_AVAILABLE_FEATURES "ht_kernel_8" "ht_kernel_16" "ht_kernel_32" "ht_kernel_64" "ht_kernel_128" "ht_kernel_256" "ht_kernel_512" "ht_kernel_1024")
+list(APPEND NVE_AVAILABLE_FEATURES "ht_kernel_1" "ht_kernel_2" "ht_kernel_4" "ht_kernel_8" "ht_kernel_16" "ht_kernel_32" "ht_kernel_64" "ht_kernel_128" "ht_kernel_256" "ht_kernel_512")
 list(APPEND NVE_AVAILABLE_FEATURES "ht_part_fnv1a" "ht_part_murmur3" "ht_part_rrxmrrxmsx0" "ht_part_std_hash")
 
 set(NVE_MINIMAL_FEATURES "")
 list(APPEND NVE_MINIMAL_FEATURES "ht_key_64")
 list(APPEND NVE_MINIMAL_FEATURES "ht_part_fnv1a")
-list(APPEND NVE_MINIMAL_FEATURES "ht_kernel_64")
+list(APPEND NVE_MINIMAL_FEATURES "ht_kernel_8")
 
 set(NVE_DEFAULT_FEATURES ${NVE_MINIMAL_FEATURES})
 list(APPEND NVE_DEFAULT_FEATURES
@@ -73,18 +74,19 @@ list(APPEND NVE_DEFAULT_FEATURES
   "phmap_plugin"
   "redis_plugin"
   "rocksdb_plugin"
+  "sph_plugin"
 )
 list(APPEND NVE_DEFAULT_FEATURES "ht_key_32")
-list(APPEND NVE_DEFAULT_FEATURES "ht_kernel_128")
+list(APPEND NVE_DEFAULT_FEATURES "ht_kernel_16")
 
 #set(NVE_DEFAULT_FEATURES ${NVE_MINIMAL_FEATURES})  # Default = minimal set of features = fast compile, small binary size.
 #set(NVE_DEFAULT_FEATURES ${NVE_AVAILABLE_FEATURES})  # Default = enable all features = slow compile, large binary size.
 
 # Enabled features.
-if(DEFINED NVE_FEATURES)
+if (DEFINED NVE_FEATURES)
   string(REPLACE " " ";" NVE_FEATURES "${NVE_FEATURES}")
 else()
-  if(NVE_DISABLE_PLUGINS)
+  if (NVE_DISABLE_PLUGINS)
     set(NVE_FEATURES "${NVE_MINIMAL_FEATURES}" CACHE STRING "Enabled minimal features")
   else()
     set(NVE_FEATURES "${NVE_DEFAULT_FEATURES}" CACHE STRING "Enabled standard features")
@@ -94,7 +96,7 @@ list(REMOVE_DUPLICATES NVE_FEATURES)
 
 # Option to disable nvhm plugin specifically
 option(NVE_DISABLE_NVHM_PLUGIN "Disable the nvhm plugin" OFF)
-if(NVE_DISABLE_NVHM_PLUGIN)
+if (NVE_DISABLE_NVHM_PLUGIN)
   list(REMOVE_ITEM NVE_FEATURES "nvhm_plugin")
   message(STATUS "nvhm_plugin disabled via NVE_DISABLE_NVHM_PLUGIN")
 endif()
@@ -105,7 +107,7 @@ message(STATUS "Enabled optional NVE features:")
 foreach(NVE_FEATURE ${NVE_FEATURES})
   message(STATUS "  ${NVE_FEATURE}")
   list(FIND NVE_AVAILABLE_FEATURES "${NVE_FEATURE}" NVE_FEATURE_ENABLED)
-  if(${NVE_FEATURE_ENABLED} EQUAL -1)
+  if (${NVE_FEATURE_ENABLED} EQUAL -1)
     message(STATUS "Feature \"${NVE_FEATURE}\" is unknown. Available NVE features are:")
     foreach(NVE_FEATURE ${NVE_AVAILABLE_FEATURES})
       message(STATUS "  ${NVE_FEATURE}")
@@ -117,7 +119,7 @@ endforeach()
 unset(NVE_FEATURE)
 
 # Determine CPU cache line size. (need to set before third_party/nvhashmap)
-if(NOT NVE_CACHE_LINE_SIZE)
+if (NOT NVE_CACHE_LINE_SIZE)
   if (WIN32)
     set(NVE_CACHE_LINE_SIZE "64")
   else()
@@ -136,7 +138,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/nve_avx.cmake)
 nve_configure_avx()
 
 # set Release build by default
-if(NOT CMAKE_BUILD_TYPE)
+if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
 endif()
 message(STATUS "BUILD TYPE = " ${CMAKE_BUILD_TYPE})
@@ -180,7 +182,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DNVE_CACHE_LINE_SIZE=${NVE_CACHE_LINE
 
 find_path(hwloc_INCLUDE_DIRS hwloc.h)
 find_library(hwloc_LIBRARIES hwloc)
-if(NOT ${hwloc_INCLUDE_DIRS} STREQUAL "hwloc_INCLUDE_DIRS-NOTFOUND" AND
+if (NOT ${hwloc_INCLUDE_DIRS} STREQUAL "hwloc_INCLUDE_DIRS-NOTFOUND" AND
    NOT ${hwloc_LIBRARIES} STREQUAL "hwloc_LIBRARIES-NOTFOUND")
   message(STATUS "libhwloc: found @ ${hwloc_LIBRARIES} : ${hwloc_INCLUDE_DIRS}")
   option(NVE_WITH_LIBHWLOC "Enable hwloc NUMA control" ON)
@@ -196,7 +198,7 @@ endif()
 
 find_path(numa_INCLUDE_DIRS numa.h)
 find_library(numa_LIBRARIES numa)
-if(NOT ${numa_INCLUDE_DIRS} STREQUAL "numa_INCLUDE_DIRS-NOTFOUND" AND
+if (NOT ${numa_INCLUDE_DIRS} STREQUAL "numa_INCLUDE_DIRS-NOTFOUND" AND
    NOT ${numa_LIBRARIES} STREQUAL "numa_LIBRARIES-NOTFOUND")
   message(STATUS "libnuma: found @ ${numa_LIBRARIES}, ${numa_INCLUDE_DIRS}")
   option(NVE_WITH_LIBNUMA "Enable libnuma NUMA control" ON)
@@ -210,7 +212,7 @@ if (${NVE_WITH_LIBNUMA})
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNVE_WITH_LIBNUMA=1")
 endif()
 
-if(NOT DEFINED NVE_SM_VERSION)
+if (NOT DEFINED NVE_SM_VERSION)
     # Get target compute capability from current platform
     message(STATUS "NVE_SM_VERSION not defined")
     execute_process (
@@ -220,12 +222,12 @@ if(NOT DEFINED NVE_SM_VERSION)
     )
     # Default compute caps for CI
     set(DEFAULT_CMAKE_SM_VERSIONS 89 90 100 120)
-    if(SMI_FOUND EQUAL "0")
+    if (SMI_FOUND EQUAL "0")
         execute_process (
             COMMAND bash -c "nvidia-smi --query-gpu=compute_cap --id=0 --format=csv"
             OUTPUT_VARIABLE SMI_COMPUTE
         )
-        if(SMI_COMPUTE MATCHES "^No devices were found.*")
+        if (SMI_COMPUTE MATCHES "^No devices were found.*")
           set(NVE_SM_VERSION ${DEFAULT_CMAKE_SM_VERSIONS})
         else()
           string(REPLACE "compute_cap" "" SMI_COMPUTE ${SMI_COMPUTE})
@@ -248,7 +250,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Enabling NVE_ORIGIN_RPATH will allow relocated .so files (e.g. during pip install) to start
 # the search for .so dependencies in the local directory
-if(NVE_ORIGIN_RPATH)
+if (NVE_ORIGIN_RPATH)
   set(CMAKE_INSTALL_RPATH "\$ORIGIN:${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
   set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
@@ -278,7 +280,7 @@ foreach(NVE_FEATURE ${NVE_FEATURES})
 endforeach()
 unset(NVE_FEATURE)
 
-if(NVE_ENABLE_NVTX)
+if (NVE_ENABLE_NVTX)
   message(STATUS "NVTX enabled")
   add_compile_definitions(NVE_ENABLE_NVTX)
 else()
@@ -307,11 +309,11 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/nve_torch.cmake)
 #   TORCH_ARCH_STR           — space-separated arch list (e.g. "8.0 8.6") for TORCH_CUDA_ARCH_LIST
 #   CMAKE_PREFIX_PATH        — extended with the torch cmake prefix (on success only)
 nve_configure_torch()
-if(NOT NVE_DISABLE_TORCH_BINDINGS)
-    if(TORCH_ARCH_STR AND NOT TORCH_CUDA_ARCH_LIST)
+if (NOT NVE_DISABLE_TORCH_BINDINGS)
+    if (TORCH_ARCH_STR AND NOT TORCH_CUDA_ARCH_LIST)
         set(TORCH_CUDA_ARCH_LIST "${TORCH_ARCH_STR}")
     endif()
-    if(TORCH_CUDA_ARCH_LIST)
+    if (TORCH_CUDA_ARCH_LIST)
         message(STATUS "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}")
     endif()
 
@@ -329,7 +331,7 @@ if(NOT NVE_DISABLE_TORCH_BINDINGS)
 endif()
 
 add_subdirectory(python/pynve/bindings)
-if(NOT NVE_DISABLE_TESTS_AND_SAMPLES)
+if (NOT NVE_DISABLE_TESTS_AND_SAMPLES)
   message(STATUS "Tests and samples are enabled")
   add_subdirectory(samples)
   add_subdirectory(tests)

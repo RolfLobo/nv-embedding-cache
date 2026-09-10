@@ -27,6 +27,6 @@ target_link_libraries(layer_pooling_test PUBLIC gtest_main nve-common)
 
 # HierWithoutGPU dynamically loads the PHMap plugin for its first-level host cache. Make building
 # this test target sufficient to produce the plugin whenever that optional feature is enabled.
-if(TARGET nve-plugin-phmap)
+if (TARGET nve-plugin-phmap)
   add_dependencies(layer_pooling_test nve-plugin-phmap)
 endif()

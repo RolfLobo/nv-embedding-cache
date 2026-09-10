@@ -30,7 +30,7 @@ struct STLContainerTableConfig : public HostTableConfig {
   int64_t num_partitions{1};  // Number of partitions to create (Must be a power of 2).
   Partitioner_t partitioner{default_partitioner};  // Partitioner to use.
   std::vector<int64_t> workgroups{0};  // Workgroup to use per partition (thread pool feature). Will wrap around.
-  int64_t max_find_task_size{128};  // Maximum number of masks to parse per "find" task (Must be a power of 2.
+  int64_t max_find_task_size{128};  // Maximum number of masks to parse per "find" task.
 
   int64_t value_alignment{
       sizeof(float)};  // Alignment of stored value/meta tuples in memory. Must be a power of 2.
@@ -44,16 +44,18 @@ struct STLContainerTableConfig : public HostTableConfig {
 
   void check() const;
 
-  inline int64_t meta_size() const noexcept { return overflow_policy.meta_size(); }
+  constexpr int64_t meta_alignment() const noexcept { return overflow_policy.meta_alignment(); }
 
-  inline int64_t meta_offset() const noexcept {
+  constexpr int64_t meta_size() const noexcept { return overflow_policy.meta_size(); }
+
+  constexpr int64_t meta_offset() const noexcept {
     // To avoid alignment issues with the meta data on some platforms, need to pad the max_value_size.
-    return round_up(this->max_value_size, meta_align(overflow_policy.handler));
+    return round_up(this->max_value_size, meta_alignment());
   }
 
-  inline int64_t slot_size() const noexcept { return meta_offset() + meta_size(); }
+  constexpr int64_t slot_size() const noexcept { return meta_offset() + meta_size(); }
 
-  inline int64_t slot_stride() const noexcept { return round_up(slot_size(), value_alignment); }
+  constexpr int64_t slot_stride() const noexcept { return round_up(slot_size(), value_alignment); }
 };
 
 void from_json(const nlohmann::json& json, STLContainerTableConfig& conf);
@@ -108,7 +110,7 @@ class STLContainerTable : public HostTable<ConfigType> {
  private:
   template <bool PrefetchValues, bool WithValues, bool WithValueSizes>
   int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
-                int64_t value_stride, char* values, int64_t* value_sizes) const;
+                int64_t value_stride, std::byte* values, int64_t* value_sizes) const;
 
  protected:
   struct Partition final {
@@ -118,11 +120,12 @@ class STLContainerTable : public HostTable<ConfigType> {
 
     mutable std::shared_mutex read_write alignas(cpu_cache_line_size);
     map_type slot_map alignas(cpu_cache_line_size);
-    std::vector<char*> available_slots;
+    std::vector<std::byte*> available_slots;
     // TODO: Switch to aligned host memory allocator.
-    std::vector<std::vector<char>> slot_buffers;
+    std::vector<std::vector<std::byte>> slot_buffers;
   };
 
+  using base_type::config_;
   std::vector<Partition> parts_;
 };
 
@@ -138,46 +141,5 @@ void to_json(nlohmann::json& json, const STLContainerTableFactoryConfig& conf);
 
 template <typename ConfigType, typename TableConfigType>
 using STLContainerTableFactory = HostTableFactory<ConfigType, TableConfigType>;
-
-struct STLMapTableConfig : public STLContainerTableConfig {
-  using base_type = STLContainerTableConfig;
-
-  template <typename KeyType>
-  using map_type = std::unordered_map<KeyType, char*>;
-
-  void check() const;
-};
-
-void from_json(const nlohmann::json& json, STLMapTableConfig& conf);
-
-void to_json(nlohmann::json& json, const STLMapTableConfig& conf);
-
-template <typename KeyType, typename MetaType, typename PartitionerType>
-using STLMapTable = STLContainerTable<STLMapTableConfig, KeyType, MetaType, PartitionerType>;
-
-struct STLMapTableFactoryConfig : public STLContainerTableFactoryConfig {
-  using base_type = STLContainerTableFactoryConfig;
-
-  void check() const;
-};
-
-void from_json(const nlohmann::json& json, STLMapTableFactoryConfig& conf);
-
-void to_json(nlohmann::json& json, const STLMapTableFactoryConfig& conf);
-
-class STLMapTableFactory : public STLContainerTableFactory<STLMapTableFactoryConfig, STLMapTableConfig> {
- public:
-  using base_type = STLContainerTableFactory<STLMapTableFactoryConfig, STLMapTableConfig>;
-
-  NVE_PREVENT_COPY_AND_MOVE_(STLMapTableFactory);
-
-  STLMapTableFactory() = delete;
-
-  STLMapTableFactory(const config_type& config);
-
-  virtual ~STLMapTableFactory() = default;
-
-  virtual host_table_ptr_t produce(table_id_t id, const table_config_type& config) override;
-};
 
 }  // namespace nve

@@ -25,6 +25,6 @@ file(GLOB nve_plugin_phmap_src "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 add_library(nve-plugin-phmap SHARED ${nve_plugin_phmap_src})
 target_link_libraries(nve-plugin-phmap PUBLIC nve-common)
 
-if(NOT NVE_DISABLE_TESTS_AND_SAMPLES)
+if (NOT NVE_DISABLE_TESTS_AND_SAMPLES)
   add_subdirectory(tests)
 endif()

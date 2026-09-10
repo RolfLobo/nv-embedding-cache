@@ -42,7 +42,7 @@ do {                                    \
 
 #ifndef gpuErrChk
 #define gpuErrChk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort=true) {
     if (code != cudaSuccess) {
         fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
         if (abort) exit(code);
@@ -52,7 +52,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 #ifndef drvErrChk
 #define drvErrChk(ans) { drvAssert((ans), __FILE__, __LINE__); }
-inline void drvAssert(CUresult code, const char *file, int line, bool abort=true) {
+inline void drvAssert(CUresult code, const char* file, int line, bool abort=true) {
     if (code != CUDA_SUCCESS) {
         const char* pErrName;
         const char* pErrDesc;
@@ -70,7 +70,7 @@ inline void drvAssert(CUresult code, const char *file, int line, bool abort=true
 
 #ifndef ecErrChk
 #define ecErrChk(ans) { ecAssert((ans), __FILE__, __LINE__); }
-inline void ecAssert(nve::ECError code, const char *file, int line, bool abort=true) {
+inline void ecAssert(nve::ECError code, const char* file, int line, bool abort=true) {
     if (code != ECERROR_SUCCESS) {
         fprintf(stderr, "Embedding Cache assert: %d %s %d\n", code, file, line);
         if (abort) exit(static_cast<int>(code));
@@ -138,4 +138,3 @@ inline void fillBuffer<__half>(void* buffer, int64_t volume, __half min, __half 
 {
     fillBufferHalf(buffer, volume, min, max);
 }
-

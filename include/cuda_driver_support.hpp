@@ -49,7 +49,7 @@ class RuntimeError<CUresult> : public Exception {
                       const std::string& hint)
       : base_type(file, line, expr, hint), result_{result} {}
 
-  inline CUresult result() const noexcept { return result_; }
+  constexpr CUresult result() const noexcept { return result_; }
 
   inline const char* errorName() const noexcept {
     const char* name;
@@ -67,11 +67,11 @@ class RuntimeError<CUresult> : public Exception {
     return str;
   }
 
-  virtual const char* what() const noexcept override {
+  const char* what() const noexcept override {
     return hint().empty() ? errorString() : hint().c_str();
   }
 
-  virtual std::string to_string() const override {
+  std::string to_string() const override {
     std::ostringstream o;
 
     const char* const what{this->what()};

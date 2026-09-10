@@ -153,12 +153,12 @@ class ThreadPool {
     static constexpr int64_t N{1024 / sizeof(result_type)};
     static_assert(N > 0);
 
-    if (num_tasks < N) {
-      std::array<result_type, N> results;
-      task_idx = submit_n(task_idx, num_tasks, task, results.data(), workgroup);
-      await_n(results.data(), num_tasks);
+    if (num_tasks <= N) {
+      result_type results[N];
+      task_idx = submit_n(task_idx, num_tasks, task, results, workgroup);
+      await_n(results, num_tasks);
     } else {
-      std::vector<result_type> results(static_cast<size_t>(num_tasks));
+      std::vector<result_type> results(to_uint(num_tasks));
       task_idx = submit_n(task_idx, num_tasks, task, results.data(), workgroup);
       await(results.begin(), results.end());
     }
@@ -183,7 +183,7 @@ class ThreadPool {
   inline int64_t submit_n(int64_t task_idx, int64_t num_tasks, const indexed_task_type& task,
                           result_type* results, const It& first_workgroup, const It& last_workgroup,
                           int64_t tasks_per_workgroup) {
-    NVE_CHECK_(first_workgroup != last_workgroup, "Must select at least one workgroup!");
+    NVE_CHECK_(first_workgroup < last_workgroup, "Must select at least one workgroup!");
     tasks_per_workgroup = std::max<int64_t>(tasks_per_workgroup, 1);
 
     const int64_t num_workgroups{this->num_workgroups()};
@@ -221,13 +221,13 @@ class ThreadPool {
     static constexpr int64_t N{1024 / sizeof(result_type)};
     static_assert(N > 0);
 
-    if (num_tasks < N) {
-      std::array<result_type, N> results;
-      task_idx = submit_n(task_idx, num_tasks, task, results.data(), first_workgroup,
+    if (num_tasks <= N) {
+      result_type results[N];
+      task_idx = submit_n(task_idx, num_tasks, task, results, first_workgroup,
                           last_workgroup, tasks_per_workgroup);
-      await_n(results.data(), num_tasks);
+      await_n(results, num_tasks);
     } else {
-      std::vector<result_type> results(static_cast<size_t>(num_tasks));
+      std::vector<result_type> results(to_uint(num_tasks));
       task_idx = submit_n(task_idx, num_tasks, task, results.data(), first_workgroup,
                           last_workgroup, tasks_per_workgroup);
       await(results.begin(), results.end());

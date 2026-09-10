@@ -52,6 +52,7 @@ TEST(redis_plugin, parse_table_conf) {
       "partitioner": "always_zero",
       "workgroups": [1],
       "hash_key": "whatever",
+
       "string_namespace_id": 7,
 
       "overflow_policy": {
@@ -127,30 +128,29 @@ TEST(redis_plugin, single_node_string_crud) {
   const int64_t value_stride{max_value_size};
 
   // Unique keys so every lookup resolves to a distinct entry.
-  std::vector<key_type> keys(static_cast<size_t>(n));
+  std::vector<key_type> keys(to_uint(n));
   std::iota(keys.begin(), keys.end(), key_type{1});
 
   // Deterministic per-key value payloads.
-  std::vector<char> values(static_cast<size_t>(n * value_stride));
+  std::vector<char> values(to_uint(n * value_stride));
   for (int64_t i{}; i != n; ++i) {
     for (int64_t j{}; j != max_value_size; ++j) {
-      values[static_cast<size_t>(i * value_stride + j)] = static_cast<char>((i * 31 + j) & 0xff);
+      values[to_uint(i * value_stride + j)] = static_cast<char>((i * 31 + j) & 0xff);
     }
   }
 
   std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)));
-  std::vector<char> out_values(static_cast<size_t>(n * value_stride));
-  std::vector<int64_t> out_value_sizes(static_cast<size_t>(n));
+  std::vector<char> out_values(to_uint(n * value_stride));
+  std::vector<int64_t> out_value_sizes(to_uint(n));
 
-  const size_t keys_bytes{static_cast<size_t>(n) * sizeof(key_type)};
-  const size_t hit_mask_bytes{hit_mask.size() * sizeof(bitmask64_t)};
+  const size_t keys_bytes{to_uint(n) * sizeof(key_type)};
 
   auto keys_bw = [&](const key_type* p) {
     return std::make_shared<BufferWrapper<const void>>(ctx, "keys", p, keys_bytes);
   };
   auto hit_mask_bw = [&]() {
     return std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hit_mask", hit_mask.data(),
-                                                               hit_mask_bytes);
+                                                      hit_mask.size() * sizeof(bitmask64_t));
   };
   auto values_in_bw = [&]() {
     return std::make_shared<BufferWrapper<const void>>(ctx, "values_in", values.data(),
@@ -187,10 +187,10 @@ TEST(redis_plugin, single_node_string_crud) {
   tab->get_lookup_counter(ctx, &cnt);
   ASSERT_EQ(cnt, n);
   for (int64_t i{}; i != n; ++i) {
-    ASSERT_EQ(out_value_sizes[static_cast<size_t>(i)], max_value_size) << "i=" << i;
+    ASSERT_EQ(out_value_sizes[to_uint(i)], max_value_size) << "i=" << i;
     for (int64_t j{}; j != max_value_size; ++j) {
-      ASSERT_EQ(out_values[static_cast<size_t>(i * value_stride + j)],
-                values[static_cast<size_t>(i * value_stride + j)])
+      ASSERT_EQ(out_values[to_uint(i * value_stride + j)],
+                values[to_uint(i * value_stride + j)])
           << "mismatch at key " << i << " byte " << j;
     }
   }
@@ -248,15 +248,15 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
   }
 
   const int64_t n{1500};
-  std::vector<key_type> keys(static_cast<size_t>(n));
+  std::vector<key_type> keys(to_uint(n));
   std::iota(keys.begin(), keys.end(), key_type{1});
 
   // Distinct payloads per table so a cross-read would be detectable.
   auto make_values = [&](uint8_t salt) {
-    std::vector<char> v(static_cast<size_t>(n * value_stride));
+    std::vector<char> v(to_uint(n * value_stride));
     for (int64_t i{}; i != n; ++i) {
       for (int64_t j{}; j != max_value_size; ++j) {
-        v[static_cast<size_t>(i * value_stride + j)] = static_cast<char>((i + j + salt) & 0xff);
+        v[to_uint(i * value_stride + j)] = static_cast<char>((i + j + salt) & 0xff);
       }
     }
     return v;
@@ -266,7 +266,7 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
 
   auto do_insert = [&](host_table_ptr_t& tab, context_ptr_t& ctx, const std::vector<char>& vals) {
     auto kbw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys.data(),
-                                                           static_cast<size_t>(n) * sizeof(key_type));
+                                                           to_uint(n) * sizeof(key_type));
     auto vbw = std::make_shared<BufferWrapper<const void>>(ctx, "values", vals.data(), vals.size());
     tab->insert(ctx, n, std::move(kbw), value_stride, max_value_size, std::move(vbw));
   };
@@ -275,12 +275,12 @@ TEST(redis_plugin, single_node_string_namespace_id_isolation) {
   // asserts the returned payloads match it byte-for-byte. Void return so ASSERT_* is allowed.
   auto find_check = [&](host_table_ptr_t& tab, context_ptr_t& ctx, const std::vector<char>* expected,
                         int64_t& cnt_out) {
-    std::vector<bitmask64_t> hm(to_uint(ceil_div(n, bitmask64::num_bits)), 0);
-    std::vector<char> out(static_cast<size_t>(n * value_stride), 0);
+    std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), 0);
+    std::vector<char> out(to_uint(n * value_stride), 0);
     auto kbw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys.data(),
-                                                           static_cast<size_t>(n) * sizeof(key_type));
+                                                           to_uint(n) * sizeof(key_type));
     auto hbw = std::make_shared<BufferWrapper<bitmask64_t>>(
-        ctx, "hit_mask", hm.data(), hm.size() * sizeof(bitmask64_t));
+        ctx, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(bitmask64_t));
     auto vbw = std::make_shared<BufferWrapper<void>>(ctx, "values", out.data(), out.size());
     tab->reset_lookup_counter(ctx);
     tab->find(ctx, n, std::move(kbw), std::move(hbw), value_stride,
@@ -353,22 +353,22 @@ TEST(redis_plugin, single_node_string_parallel_crud) {
 
   // Span many mask words so the work genuinely splits across the 4 partitions.
   const int64_t n{8000};
-  std::vector<key_type> keys(static_cast<size_t>(n));
+  std::vector<key_type> keys(to_uint(n));
   std::iota(keys.begin(), keys.end(), key_type{1});
 
-  std::vector<char> values(static_cast<size_t>(n * value_stride));
+  std::vector<char> values(to_uint(n * value_stride));
   for (int64_t i{}; i != n; ++i) {
     for (int64_t j{}; j != max_value_size; ++j) {
-      values[static_cast<size_t>(i * value_stride + j)] = static_cast<char>((i * 7 + j) & 0xff);
+      values[to_uint(i * value_stride + j)] = static_cast<char>((i * 7 + j) & 0xff);
     }
   }
 
   std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)));
-  std::vector<char> out_values(static_cast<size_t>(n * value_stride));
+  std::vector<char> out_values(to_uint(n * value_stride));
 
   auto keys_bw = [&]() {
     return std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys.data(),
-                                                       static_cast<size_t>(n) * sizeof(key_type));
+                                                       to_uint(n) * sizeof(key_type));
   };
   auto hit_mask_bw = [&]() {
     return std::make_shared<BufferWrapper<bitmask64_t>>(
@@ -395,8 +395,7 @@ TEST(redis_plugin, single_node_string_parallel_crud) {
   ASSERT_EQ(out_values, values) << "parallel find returned wrong payloads";
   // Every key's hit bit must be set.
   for (int64_t i{}; i != n; ++i) {
-    const bool hit{((hit_mask[static_cast<size_t>(i) / 64] >> (static_cast<size_t>(i) % 64)) &
-                    0x1u) != 0};
+    const bool hit{bitmask64::get(hit_mask[to_uint(i / bitmask64::num_bits)], i % bitmask64::num_bits)};
     ASSERT_TRUE(hit) << "missing hit for key " << i;
   }
 

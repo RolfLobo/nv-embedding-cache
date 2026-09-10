@@ -217,47 +217,22 @@ struct bitmask64 final {
       return full;
     }
   }
-  
+
   static constexpr bitmask64_t clip(bitmask64_t m, int64_t n) noexcept { return m & until(n); }
 
-  static inline bitmask64_t load(const void* const __restrict mem) noexcept {
+  static inline bitmask64_t atomic_load(bitmask64_t* mem) noexcept {
     NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    return *reinterpret_cast<const bitmask64_t*>(mem);
+    return __atomic_load_n(mem, __ATOMIC_RELAXED);
   }
 
-  static inline bitmask64_t load(const char* const __restrict mem, const int64_t ij) noexcept {
+  static inline bitmask64_t atomic_merge(bitmask64_t* mem, bitmask64_t h) noexcept {
     NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    NVE_ASSERT_(ij >= 0);
-    return load(&mem[ij / num_bits * size]);
-  }
-
-  static inline void store(void* const __restrict mem, const bitmask64_t repr) noexcept {
-    NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    *reinterpret_cast<bitmask64_t*>(mem) = repr;
-  }
-
-  static inline void store(char* const __restrict mem, const int64_t ij,
-                           const bitmask64_t repr) noexcept {
-    NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    NVE_ASSERT_(ij >= 0);
-    store(&mem[ij / num_bits * size], repr);
-  }
-
-  static inline void atomic_join(void* const __restrict mem, const bitmask64_t repr) noexcept {
-    NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    bitmask64_t* const dst{reinterpret_cast<bitmask64_t*>(mem)};
-    __atomic_or_fetch(dst, repr, __ATOMIC_RELAXED);
-  }
-
-  static inline void atomic_join(char* const __restrict mem, const int64_t ij, const bitmask64_t repr) noexcept {
-    NVE_ASSERT_(reinterpret_cast<uintptr_t>(mem) % size == 0);
-    NVE_ASSERT_(ij >= 0);
-    atomic_join(&mem[ij / num_bits * size], repr);
+    return __atomic_or_fetch(mem, h, __ATOMIC_RELAXED);
   }
 };
 
 static constexpr int64_t cpu_cache_line_size{NVE_CACHE_LINE_SIZE};
-static_assert(cpu_cache_line_size >= bitmask64::size && has_single_bit(static_cast<uint64_t>(cpu_cache_line_size)));
+static_assert(cpu_cache_line_size >= bitmask64::size && has_single_bit(to_uint(cpu_cache_line_size)));
 
 template<typename Byte>
 inline void l1_read_prefetch(const Byte* const __restrict r, const int64_t n) noexcept {

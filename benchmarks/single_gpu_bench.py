@@ -141,6 +141,9 @@ def parse_command_line():
     parser.add_argument("--prefill", "-pf", action='store_true',help="Prefill tables before warmup")
     parser.add_argument("--host_load_factor", "-hlf", default=0.01 ,help="Load factor of the CPU cache(default: 0.01)", type=float)
     parser.add_argument("--redis_address", "-ra", default='localhost:7000', help="Address of a Redis server in formatted as 'host:port' (default: 'localhost:7000', only for hierarchical)")
+    parser.add_argument("--redis_single_node", "-rsn", action='store_true', help="Connect to a standalone Redis server (string mode) instead of a cluster (only for hierarchical)")
+    parser.add_argument("--redis_num_partitions", "-rnp", default=1, type=int, help="Redis table partitions: hash shards in cluster mode, client-side parallelism in single-node mode; 0 or a power of 2 (default: 1)")
+    parser.add_argument("--redis_connections_per_node", "-rcn", default=5, type=int, help="Max parallel connections per Redis node (default: 5)")
     args = parser.parse_args()
     return args
 
@@ -284,7 +287,14 @@ def get_nve_model(args, data_type, embedding_dim, num_embeddings):
                 data_type,
                 initializer=None, # use the prefill_last_table option to initialize cache
                 ps_type=nve.Redis,
-                extra_params = {"plugin": {"address": args.redis_address}}
+                extra_params = {
+                    "plugin": {
+                        "address": args.redis_address,
+                        "single_node": args.redis_single_node,
+                        "connections_per_node": args.redis_connections_per_node,
+                    },
+                    "table": {"num_partitions": args.redis_num_partitions},
+                }
             )
 
             model = nve_layers.NVEmbedding(

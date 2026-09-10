@@ -16,8 +16,9 @@
  */
 
 /*
- * C++ inference using an AOTInductor-compiled NVEmbedding(HostLayer) model —
- * the driverless analogue of inference.cu. Everything here runs on
+ * C++ inference using an AOTInductor-compiled NVEmbedding / NVEmbeddingBag
+ * (HostLayer) model — the driverless analogue of inference.cu. With --pooled
+ * the model is fed (keys, offsets) and the per-bag pooled rows are printed. Everything here runs on
  * device_index=-1 (CPU): the AOTI package, the marker tensor, and the
  * HostEmbedding's malloc-backed storage. Built as a .cu file (nvcc, so the
  * CUDA toolkit's headers like cub are on the include path) even though no
@@ -52,6 +53,10 @@ int main(int argc, char* argv[]) {
         args.add_argument("save_dir")
             .help("Path to the exported model directory (metadata.json + weights/ + model.pt2)")
             .default_value(std::string("samples/cpp_inference/output_driverless"));
+        args.add_argument("--pooled")
+            .help("Model is an NVEmbeddingBag: feed (keys, offsets) instead of keys")
+            .default_value(false)
+            .implicit_value(true);
 
         try {
             args.parse_args(argc, argv);
@@ -62,6 +67,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::string save_dir = args.get<std::string>("save_dir");
+        const bool pooled = args.get<bool>("--pooled");
         constexpr int kCpuDeviceIndex = -1;
 
         // ---- Step 1: Load AOT-compiled model ----
@@ -80,19 +86,28 @@ int main(int argc, char* argv[]) {
         std::cout << "  Loaded " << dir.size() << " layer(s)" << std::endl;
 
         // ---- Step 3: Run inference ----
-        auto keys = torch::tensor({0L, 1L, 5L, 10L},
-            torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+        const auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        auto keys = torch::tensor({0L, 1L, 5L, 10L}, opts);
+        std::vector<torch::Tensor> inputs{keys};
+        if (pooled) {
+            // Two bags, torch include_last_offset convention: {0,1} and {5,10}.
+            inputs.push_back(torch::tensor({0L, 2L, 4L}, opts));
+        }
 
         std::cout << "Running inference..." << std::endl;
         c10::InferenceMode mode;
-        auto outputs = loader->run({keys});
+        auto outputs = loader->run(inputs);
 
         std::cout << "Output shape: [" << outputs[0].size(0)
                   << ", " << outputs[0].size(1) << "]" << std::endl;
         auto& out_cpu = outputs[0];
         for (int64_t i = 0; i < out_cpu.size(0); ++i) {
-            std::cout << "  key=" << keys[i].item<int64_t>()
-                      << " -> [" << out_cpu[i][0].item<float>();
+            if (pooled) {
+                std::cout << "  bag=" << i;
+            } else {
+                std::cout << "  key=" << keys[i].item<int64_t>();
+            }
+            std::cout << " -> [" << out_cpu[i][0].item<float>();
             for (int64_t j = 1; j < std::min(out_cpu.size(1), (int64_t)4); ++j)
                 std::cout << ", " << out_cpu[i][j].item<float>();
             std::cout << ", ...]" << std::endl;

@@ -51,4 +51,4 @@ void to_json(nlohmann::json& json, const LinearHostTableConfig& conf) {
   NVE_THROW_("LinearHostTable always requires a dynamically allocated pointer and cannot be configured from JSON");
 }
 
-} // namespace nve
+}  // namespace nve

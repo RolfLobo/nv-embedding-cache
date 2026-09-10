@@ -138,4 +138,4 @@ private:
     uint64_t get_name_from_key(const TableKey& key) const;
 };
 
-} // namespace nve
+}  // namespace nve

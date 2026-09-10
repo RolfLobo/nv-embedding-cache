@@ -54,46 +54,51 @@ class RedisConn final {
   bool is_single_node() const noexcept { return static_cast<bool>(standalone_); }
 
 // Commands shared by both connection types are forwarded to whichever connection is set.
-#define NVE_REDIS_FWD_(name)                                          \
-  template <typename... Args>                                         \
-  auto name(Args&&... args) {                                         \
-    if (cluster_) return cluster_->name(std::forward<Args>(args)...); \
-    return standalone_->name(std::forward<Args>(args)...);            \
+#define NVE_REDIS_FWD_(_func_name_, ...)                                     \
+  template <typename... Args>                                                \
+  auto _func_name_(Args&&... args) __VA_ARGS__ {                             \
+    if (cluster_) {                                                          \
+      return cluster_->_func_name_(std::forward<Args>(args)...);             \
+    } else {                                                                 \
+      return standalone_->_func_name_(std::forward<Args>(args)...);          \
+    }                                                                        \
   }
-
   NVE_REDIS_FWD_(del)
-  NVE_REDIS_FWD_(mget)
+  NVE_REDIS_FWD_(mget, const)
   NVE_REDIS_FWD_(mset)
   NVE_REDIS_FWD_(hset)
   NVE_REDIS_FWD_(hsetnx)
-  NVE_REDIS_FWD_(hmget)
+  NVE_REDIS_FWD_(hmget, const)
   NVE_REDIS_FWD_(hdel)
-  NVE_REDIS_FWD_(hlen)
-  NVE_REDIS_FWD_(hkeys)
-  NVE_REDIS_FWD_(hgetall)
+  NVE_REDIS_FWD_(hlen, const)
+  NVE_REDIS_FWD_(hkeys, const)
+  NVE_REDIS_FWD_(hgetall, const)
   NVE_REDIS_FWD_(hincrby)
 #undef NVE_REDIS_FWD_
 
   // Cluster pipelines require a hash-tag for slot routing; standalone pipelines ignore it.
   sw::redis::Pipeline pipeline(const sw::redis::StringView& hash_tag) {
-    if (cluster_) return cluster_->pipeline(hash_tag, false);
-    return standalone_->pipeline(false);
+    if (cluster_) {
+      return cluster_->pipeline(hash_tag, false);
+    } else {
+      return standalone_->pipeline(false);
+    }
   }
 
   // Keyspace-wide commands are only meaningful against a standalone node (string mode).
-  long long dbsize() {
-    NVE_CHECK_(static_cast<bool>(standalone_), "`DBSIZE` is only supported in single-node mode.");
+  long long dbsize() const {
+    NVE_CHECK_(is_single_node(), "`DBSIZE` is only supported in single-node mode.");
     return standalone_->dbsize();
   }
 
   void flushdb() {
-    NVE_CHECK_(static_cast<bool>(standalone_), "`FLUSHDB` is only supported in single-node mode.");
+    NVE_CHECK_(is_single_node(), "`FLUSHDB` is only supported in single-node mode.");
     standalone_->flushdb();
   }
 
   template <typename... Args>
-  sw::redis::Cursor scan(Args&&... args) {
-    NVE_CHECK_(static_cast<bool>(standalone_), "`SCAN` is only supported in single-node mode.");
+  sw::redis::Cursor scan(Args&&... args) const {
+    NVE_CHECK_(is_single_node(), "`SCAN` is only supported in single-node mode.");
     return standalone_->scan(std::forward<Args>(args)...);
   }
 

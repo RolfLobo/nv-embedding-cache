@@ -15,8 +15,15 @@
 
 message("NV Embedding Cache Plugin: STL map")
 
+include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 file(GLOB nve_plugin_stl_map_src "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 add_library(nve-plugin-stl-map SHARED ${nve_plugin_stl_map_src})
-
 target_link_libraries(nve-plugin-stl-map PUBLIC nve-common)
+
+if (NOT NVE_DISABLE_TESTS_AND_SAMPLES)
+  add_subdirectory(tests)
+endif()

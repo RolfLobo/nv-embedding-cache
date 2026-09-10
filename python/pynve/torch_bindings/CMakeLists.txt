@@ -15,7 +15,7 @@
 
 # libnve-torch-ops.so — PyTorch custom op registration + CUDA kernels + registry.
 
-if(NOT TORCH_FOUND)
+if (NOT TORCH_FOUND)
     message(FATAL_ERROR "Torch package was not found!")
 endif()
 
@@ -30,7 +30,7 @@ set(nve_torch_ops_src
     torch_binding.cpp
     nve_torch_ops_cpu.cpp
 )
-if(NOT NVE_DRIVERLESS_BUILD)
+if (NOT NVE_DRIVERLESS_BUILD)
     list(APPEND nve_torch_ops_src nve_torch_ops.cu torch_binding_cuda.cpp)
 endif()
 
@@ -53,7 +53,7 @@ target_include_directories(nve-torch-ops PRIVATE
 # -Wl,--no-as-needed even when no CUDA symbol is used (its interface is
 # "torch_cpu_library;torch_cuda_library"). For a driverless build, link only the CPU torch
 # interface so libnve-torch-ops.so carries no libtorch_cuda dependency.
-if(NVE_DRIVERLESS_BUILD)
+if (NVE_DRIVERLESS_BUILD)
     set(nve_torch_link_libs torch_cpu_library c10)
 else()
     set(nve_torch_link_libs ${TORCH_LIBRARIES})

@@ -17,7 +17,6 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <string>
 #include <vector>
 
@@ -45,7 +44,7 @@ keys = torch.tensor([0, 1, 5, 10], dtype=torch.int64, device=device)
 
 
 class Model(torch.nn.Module):
-    def __init__(self, layer_type, storage=None):
+    def __init__(self, layer_type, storage=None, weight_init=None):
         super().__init__()
         kwargs = {
             "num_embeddings": num_embeddings,
@@ -55,10 +54,12 @@ class Model(torch.nn.Module):
             "optimize_for_training": False,
             "device": device,
         }
-        if layer_type != nve_layers.LayerType.GPULayer:
+        if layer_type in (nve_layers.LayerType.LinearUVM, nve_layers.LayerType.Hierarchical):
             kwargs["gpu_cache_size"] = gpu_cache_size
         if storage is not None:
             kwargs["storage"] = storage
+        if weight_init is not None:
+            kwargs["weight_init"] = weight_init
         self.emb = nve_layers.NVEmbedding(**kwargs)
 
     def forward(self, input_keys):
@@ -70,6 +71,11 @@ if layer_kind == "linear_uvm":
     model = Model(nve_layers.LayerType.LinearUVM)
 elif layer_kind == "gpu":
     model = Model(nve_layers.LayerType.GPULayer)
+elif layer_kind == "host":
+    # HostLayer bound to a CUDA device: host-resident table, CUDA keys/outputs.
+    host_weights = torch.arange(num_embeddings, dtype=torch.float32) \
+        .unsqueeze(1).expand(num_embeddings, embedding_size).contiguous()
+    model = Model(nve_layers.LayerType.HostLayer, weight_init=host_weights)
 elif layer_kind == "custom_remote":
     parameter_server = nve_ps.NVEParameterServer(
         num_embeddings=num_embeddings,
@@ -92,7 +98,7 @@ elif layer_kind == "custom_remote":
 else:
     raise ValueError(f"Unknown layer kind: {layer_kind}")
 
-if layer_kind != "custom_remote":
+if layer_kind in ("linear_uvm", "gpu"):
     weights = torch.arange(num_embeddings, dtype=torch.float32, device=device) \
         .unsqueeze(1).expand(num_embeddings, embedding_size)
     model.emb.weight.data.copy_(weights)
@@ -100,15 +106,10 @@ if layer_kind != "custom_remote":
 export_aot(model, (keys,), save_dir, **export_options)
 )PY";
 
-void expect_known_inference_output(const std::string& output) {
-  constexpr std::array<const char*, 5> kExpectedOutput{
-      "Output shape: [4, 8]", "key=0 -> [0, 0, 0, 0", "key=1 -> [1, 1, 1, 1",
-      "key=5 -> [5, 5, 5, 5", "key=10 -> [10, 10, 10, 10"};
-  for (const char* expected : kExpectedOutput) {
-    EXPECT_NE(output.find(expected), std::string::npos)
-        << "Missing output: " << expected << "\nProcess output:\n" << output;
-  }
-}
+// Every layer kind seeds row i with the value i, so the output is kind-independent.
+const std::vector<const char*> kExpectedOutput{
+    "Output shape: [4, 8]", "key=0 -> [0, 0, 0, 0", "key=1 -> [1, 1, 1, 1",
+    "key=5 -> [5, 5, 5, 5", "key=10 -> [10, 10, 10, 10"};
 
 class NVEExportInferenceTest : public ::testing::TestWithParam<const char*> {};
 
@@ -126,10 +127,10 @@ TEST_P(NVEExportInferenceTest, ExportAndRunCppInference) {
       nve_test::run_process({NVE_TEST_INFERENCE_EXECUTABLE, save_dir});
   ASSERT_EQ(inference_result.exit_code, 0)
       << "C++ inference failed:\n" << inference_result.output;
-  expect_known_inference_output(inference_result.output);
+  nve_test::expect_output_contains(inference_result.output, kExpectedOutput);
 }
 
 INSTANTIATE_TEST_SUITE_P(LayerTypes, NVEExportInferenceTest,
-                         ::testing::Values("linear_uvm", "gpu", "custom_remote"));
+                         ::testing::Values("linear_uvm", "gpu", "host", "custom_remote"));
 
 }  // namespace

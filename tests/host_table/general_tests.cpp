@@ -151,7 +151,7 @@ TEST(host_table_invalid_key, valid_keys_survive_batch_with_sentinel) {
   // Insert with values=null (only registers presence; find_insert_tests.cpp does the same).
   {
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-        ctx, "keys", keys.data(), static_cast<size_t>(n) * sizeof(key_type));
+        ctx, "keys", keys.data(), to_uint(n) * sizeof(key_type));
     tab->insert(ctx, n, std::move(keys_bw), max_value_size + 1, 0, nullptr);
   }
 
@@ -159,7 +159,7 @@ TEST(host_table_invalid_key, valid_keys_survive_batch_with_sentinel) {
   tab->reset_lookup_counter(ctx);
   {
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-        ctx, "keys", keys.data(), static_cast<size_t>(n) * sizeof(key_type));
+        ctx, "keys", keys.data(), to_uint(n) * sizeof(key_type));
     auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
         ctx, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(bitmask64_t));
     tab->find(ctx, n, std::move(keys_bw), std::move(hit_mask_bw), max_value_size, nullptr, nullptr);

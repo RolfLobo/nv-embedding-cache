@@ -41,7 +41,7 @@ void from_json(const nlohmann::json& json, OverflowPolicyConfig& conf) {
 }
 
 void to_json(nlohmann::json& json, const OverflowPolicyConfig& conf) {
-  json = json.object();
+  json = nlohmann::json::object();
 
   NVE_WRITE_JSON_FIELD_(overflow_margin);
   NVE_WRITE_JSON_FIELD_(handler);
@@ -51,7 +51,7 @@ void to_json(nlohmann::json& json, const OverflowPolicyConfig& conf) {
 void HostTableConfig::check() const {
   static const auto key_sizes{
     make_array(sizeof(int8_t), sizeof(int16_t), sizeof(int32_t), sizeof(int64_t))};
-  NVE_CHECK_(std::find(key_sizes.begin(), key_sizes.end(), key_size) != key_sizes.end());
+  NVE_CHECK_(std::find(key_sizes.begin(), key_sizes.end(), to_uint(key_size)) != key_sizes.end());
 
   NVE_CHECK_(max_value_size > 0 &&
              max_value_size <=
@@ -67,7 +67,7 @@ void from_json(const nlohmann::json& json, HostTableConfig& conf) {
 }
 
 void to_json(nlohmann::json& json, const HostTableConfig& conf) {
-  json = json.object();
+  json = nlohmann::json::object();
 
   NVE_WRITE_JSON_FIELD_(key_size);
   NVE_WRITE_JSON_FIELD_(max_value_size);
@@ -79,7 +79,9 @@ void HostTableFactoryConfig::check() const {}
 
 void from_json(const nlohmann::json&, HostTableFactoryConfig&) {}
 
-void to_json(nlohmann::json& json, const HostTableFactoryConfig&) { json = json.object(); }
+void to_json(nlohmann::json& json, const HostTableFactoryConfig&) {
+  json = nlohmann::json::object();
+}
 
 HostTableLike::HostTableLike(const table_id_t id) : id{id} {}
 

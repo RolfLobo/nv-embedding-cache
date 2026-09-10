@@ -184,7 +184,7 @@ nve_status_t svc_get_scratch(nve_ext_context_t c, const char* name, size_t size,
     NVE_CHECK_ARG_(name != nullptr && out != nullptr, "invalid scratch arguments");
     ScopedDevice scope(c->device_id);
     // Table-op thread only: ExecutionContext::get_buffer is unsynchronized.
-    *out = (*c->ctx)->get_buffer(name, size, host_alloc != 0);
+    *out = (*c->ctx)->get_buffer(name, size, host_alloc != 0 /*host_alloc*/);
     return NVE_SUCCESS;
   });
 }
@@ -391,11 +391,12 @@ void ExternalPluginTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const v
                                buffer_ptr<void> values,
                                buffer_ptr<int64_t> value_sizes) const {
   ScopedDevice scope(caps_.device_id);
-  auto stream = ctx->get_lookup_stream();
-  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, stream) : nullptr;
-  uint64_t* h = hit_mask ? hit_mask->access_buffer(caps_.mem_type, true, stream) : nullptr;
-  void* v = values ? values->access_buffer(caps_.mem_type, false, stream) : nullptr;
-  int64_t* s = value_sizes ? value_sizes->access_buffer(caps_.mem_type, false, stream) : nullptr;
+  auto lookup_stream = ctx->get_lookup_stream();
+  NVE_CHECK_ARG_(n <= 0 || keys != nullptr, "keys must not be null");
+  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, lookup_stream) : nullptr;
+  uint64_t* h = hit_mask ? hit_mask->access_buffer(caps_.mem_type, true, lookup_stream) : nullptr;
+  void* v = values ? values->access_buffer(caps_.mem_type, false, lookup_stream) : nullptr;
+  int64_t* s = value_sizes ? value_sizes->access_buffer(caps_.mem_type, false, lookup_stream) : nullptr;
   nve_ext_context_s cctx{&ctx, caps_.device_id};  // opaque to the plugin; operation-scoped
   check_table_status(tbl_, tbl_.ops->find(tbl_.self, &cctx, n, k, h, value_stride, v, s),
                      "External table find failed");
@@ -405,9 +406,10 @@ void ExternalPluginTable::insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const
                                  int64_t value_stride, int64_t value_size,
                                  buffer_ptr<const void> values) {
   ScopedDevice scope(caps_.device_id);
-  auto stream = ctx->get_modify_stream();
-  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, stream) : nullptr;
-  const void* v = values ? values->access_buffer(caps_.mem_type, true, stream) : nullptr;
+  auto modify_stream = ctx->get_modify_stream();
+  NVE_CHECK_ARG_(n <= 0 || keys != nullptr, "keys must not be null");
+  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
+  const void* v = values ? values->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
   nve_ext_context_s cctx{&ctx, caps_.device_id};
   check_table_status(tbl_,
                      tbl_.ops->insert(tbl_.self, &cctx, n, k, value_stride, value_size, v),
@@ -418,9 +420,10 @@ void ExternalPluginTable::update(context_ptr_t& ctx, int64_t n, buffer_ptr<const
                                  int64_t value_stride, int64_t value_size,
                                  buffer_ptr<const void> values) {
   ScopedDevice scope(caps_.device_id);
-  auto stream = ctx->get_modify_stream();
-  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, stream) : nullptr;
-  const void* v = values ? values->access_buffer(caps_.mem_type, true, stream) : nullptr;
+  auto modify_stream = ctx->get_modify_stream();
+  NVE_CHECK_ARG_(n <= 0 || keys != nullptr, "keys must not be null");
+  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
+  const void* v = values ? values->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
   nve_ext_context_s cctx{&ctx, caps_.device_id};
   check_table_status(tbl_,
                      tbl_.ops->update(tbl_.self, &cctx, n, k, value_stride, value_size, v),
@@ -432,9 +435,10 @@ void ExternalPluginTable::update_accumulate(context_ptr_t& ctx, int64_t n,
                                             int64_t update_size, buffer_ptr<const void> updates,
                                             DataType_t update_dtype) {
   ScopedDevice scope(caps_.device_id);
-  auto stream = ctx->get_modify_stream();
-  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, stream) : nullptr;
-  const void* u = updates ? updates->access_buffer(caps_.mem_type, true, stream) : nullptr;
+  auto modify_stream = ctx->get_modify_stream();
+  NVE_CHECK_ARG_(n <= 0 || keys != nullptr, "keys must not be null");
+  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
+  const void* u = updates ? updates->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
   nve_ext_context_s cctx{&ctx, caps_.device_id};
   check_table_status(tbl_,
                      tbl_.ops->update_accumulate(tbl_.self, &cctx, n, k, update_stride,
@@ -445,8 +449,9 @@ void ExternalPluginTable::update_accumulate(context_ptr_t& ctx, int64_t n,
 
 void ExternalPluginTable::erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) {
   ScopedDevice scope(caps_.device_id);
-  auto stream = ctx->get_modify_stream();
-  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, stream) : nullptr;
+  auto modify_stream = ctx->get_modify_stream();
+  NVE_CHECK_ARG_(n <= 0 || keys != nullptr, "keys must not be null");
+  const void* k = keys ? keys->access_buffer(caps_.mem_type, true, modify_stream) : nullptr;
   nve_ext_context_s cctx{&ctx, caps_.device_id};
   check_table_status(tbl_, tbl_.ops->erase(tbl_.self, &cctx, n, k),
                      "External table erase failed");

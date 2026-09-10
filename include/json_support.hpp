@@ -87,15 +87,14 @@ template <typename T>
 using enum_json_pair_t = const std::pair<const T, const nlohmann::json>;
 
 template <typename T>
-constexpr enum_json_pair_t<T> make_enum_json_pair(const T value) {
+inline enum_json_pair_t<T> make_enum_json_pair(const T value) {
   static_assert(std::is_enum_v<T>, "Type T must be an enum type!");
   return {value, to_string(value)};
 }
 
-template <typename Arg0, typename... Args>
-constexpr std::array<enum_json_pair_t<Arg0>, 1 + sizeof...(Args)> make_enum_json_pairs(
-    const Arg0&& arg0, Args&&... args) {
-  return {make_enum_json_pair(arg0), make_enum_json_pair(args)...};
+template <typename... Args>
+inline auto make_enum_json_pairs(Args&&... args) {
+  return make_array(make_enum_json_pair(std::forward<Args>(args))...);
 }
 
 }  // namespace nve

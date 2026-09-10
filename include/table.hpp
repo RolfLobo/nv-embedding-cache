@@ -108,7 +108,7 @@ class Table {
    *
    * @param ctx Execution context to use if additional resources are needed to run the command.
    * @param n Number of keys in `keys`.
-   * @param keys Wrapped pointer to an array of `n` keys.
+   * @param keys Wrapped pointer to an array of `n` keys. Must not be `nullptr` when `n > 0`.
    */
   virtual void erase(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys) = 0;
 
@@ -118,7 +118,7 @@ class Table {
    *
    * @param ctx Execution context to use if additional resources are needed to run the command.
    * @param n The number of keys in `keys`.
-   * @param keys Wrapped pointer to the `n` key values.
+   * @param keys Wrapped pointer to the `n` key values. Must not be `nullptr` when `n > 0`.
    * @param hit_mask Wrapped pointer to the bitmask buffer, or `nullptr` to treat
    * all keys as unresolved on entry. See `find` for the layout requirements.
    * @param value_stride Spacing / stride between two values in `values`.
@@ -140,7 +140,7 @@ class Table {
    *
    * @param ctx Execution context to use if additional resources are needed to run the command.
    * @param n Number of keys in `keys`.
-   * @param keys Wrapped pointer to an array of `n` keys.
+   * @param keys Wrapped pointer to an array of `n` keys. Must not be `nullptr` when `n > 0`.
    * @param value_stride Spacing / raster between two values in `values`.
    * @param value_size Size of each value in bytes.
    * @param values Wrapped pointer to an array containing at least `n * value_stride` bytes.
@@ -153,7 +153,7 @@ class Table {
    *
    * @param ctx Execution context to use if additional resources are needed to run the command.
    * @param n Number of keys in `keys`.
-   * @param keys Wrapped pointer to an array of `n` keys.
+   * @param keys Wrapped pointer to an array of `n` keys. Must not be `nullptr` when `n > 0`.
    * @param value_stride Spacing / raster between two values in `values`.
    * @param value_size Size of each value in bytes.
    * @param values Wrapped pointer to an array containing at least `n * value_stride` bytes.
@@ -168,7 +168,7 @@ class Table {
    *
    * @param ctx Execution context to use if additional resources are needed to run the command.
    * @param n Number of keys in `keys`.
-   * @param keys Wrapped pointer to an array of `n` keys.
+   * @param keys Wrapped pointer to an array of `n` keys. Must not be `nullptr` when `n > 0`.
    * @param update_stride Spacing / raster between two updates in `updates`.
    * @param update_size Size of each update in bytes (must be >= 0 and a multiple of `dtype_size(update_dtype)`).
    * @param updates Wrapped pointer to an array containing at least `n * update_stride` bytes.

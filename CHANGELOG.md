@@ -4,6 +4,27 @@ Releases will be listed below, latest at the top.
 
 Releases are named/tagged in the format of `vYY.MM[.P]` e.g. `v26.02.3` means release of February 2026 with patch 3.
 
+## NV Embedding Cache 26.09
+### New Features
+- Published the experimental SPH plugin (`sph_plugin` feature, `libnve-plugin-sph-experimental.so`): a GPU-resident sharded perfect-hash table that slots in as a GPU tier (see: [plugins.md](docs/plugins.md#bundled-plugins))
+- `NVEmbeddingBag` now supports `LayerType.HostLayer`: sum/mean and weighted pooled lookups run on CPU threads, and empty batches return zero-filled bags
+### Improvements
+- Upgraded nvHashMap to v0.99.5 and aligned STL and NVHM eviction behavior (make sure to update git submodules in existing clones)
+- Python layer config exposes `default_embedding` for HostLayer and Hierarchical layers (misses return zeros unless configured, see: [python_api.md](docs/python_api.md))
+- Host table accumulate handles different stored and update data types and vector lengths consistently across plugins
+- Log messages are formatted only when their level is enabled
+- Improved Python embedding input validation for tensor types and layouts, per-sample weights, bag offsets, and unsupported pooling modes
+### Bug Fixes
+- Hardened GPU and UVM modification paths, including padded-row handling, CPU-accumulate validation, CUDA event lifetime, buffer growth failures, and error handling during CUDA runtime teardown
+- Fixed concurrency and failure propagation in the default thread pool, allocator, and asynchronous auto-insert paths
+- Fixed a `NaN` hit rate reported for hierarchical tiers left with no candidate keys, which poisoned the statistical insert heuristic
+- Fixed table validation and scratch state across STL, NVHM, Redis, and RocksDB, including null keys, internal hit masks, eviction metadata alignment, and the default NVHM kernel size
+- Fixed persistence and eviction correctness in RocksDB and Redis, including clear and read-only paths, probe-only lookups, overflow handling, and LFU counters
+- Fixed plugin loading by keeping plugin code resident while its objects are in use
+### API Changes
+- Added `nve_abi_version` and the `NVE_C_ABI_VERSION_MAJOR`/`NVE_C_ABI_VERSION_MINOR` macros to the C API
+- C API status codes: CUDA runtime and driver failures now return `NVE_ERROR_CUDA` (or `NVE_ERROR_OUT_OF_MEMORY`) and unimplemented paths return `NVE_ERROR_NOT_IMPLEMENTED` instead of `NVE_ERROR_RUNTIME`; C++ adds `nve::NotImplementedError`
+
 ## NV Embedding Cache 26.08
 ### New Features
 - New table-plugin architecture with versioned internal C++ and external pure-C ABI modes (see: [plugins.md](docs/plugins.md))
@@ -23,7 +44,6 @@ Releases are named/tagged in the format of `vYY.MM[.P]` e.g. `v26.02.3` means re
   - C++ callers now use `nve::Plugin` or `nve::create_table_from_plugin` instead of `nve::load_host_table_plugin`, `nve::create_host_table_factory`
   - Removed the plugin registry and the `"implementation"` JSON selector, plugins are selected by shared-object path.
   - See the updated code examples in [docs/c_api.md](docs/c_api.md) / [docs/cpp_api.md](docs/cpp_api.md)
-
 - `GPUTableConfig::uvm_num_rows` is required whenever `uvm_table` is set, `LinearHostTableConfig::num_rows` is required, and GPU/Linear UVM layer configs add `default_row_index` for invalid keys
 - Hit masks are fixed at 64 bits elements. Removed `HostTableConfig::mask_size`, the C `mask_size` field, the `ht_mask_*` build features, and the `max_bitmask_*` C++ types in favor of `bitmask64_t`
 - C status and data-type scalars are fixed-width 32-bit values with unchanged symbolic constants, for plugin ABI stability

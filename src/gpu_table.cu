@@ -148,12 +148,24 @@ class GPUTableExecutionContext: public ExecutionContext {
     if (count_misses_) {
       NVE_CHECK_(cache_->performance_metric_destroy(miss_metric_));
     }
+    for (auto e : events_) {
+      NVE_CHECK_(cudaEventDestroy(e));
+    }
     context_registry_->remove_context(this);
   }
 
   nve::LookupContextHandle lookup_context() { return lookup_context_; }
   nve::ModifyContextHandle modify_context() { return modify_context_; }
   nve::PerformanceMetric miss_metric() { return miss_metric_; }
+
+  /**
+   * Reusable timing-disabled events owned by this context. Modify ops record these instead of
+   * creating ad-hoc events per call (which used to leak one event per UVM update). Index 0 marks
+   * UVM update completion; the rest pace the chunked host copies in update_accumulate. Reuse is safe
+   * because a context runs one op at a time and every consumer of an event finishes within that op.
+   */
+  cudaEvent_t uvm_update_event() { return event(0); }
+  cudaEvent_t copy_event(size_t idx) { return event(idx + 1); }
 
  public:
   const int64_t max_modify_size_;
@@ -165,6 +177,17 @@ class GPUTableExecutionContext: public ExecutionContext {
   nve::ModifyContextHandle modify_context_;
   nve::PerformanceMetric miss_metric_;
   std::shared_ptr<ContextRegistry> context_registry_;
+  std::vector<cudaEvent_t> events_; // lazily created, see event()
+
+  cudaEvent_t event(size_t idx) {
+    events_.reserve(idx + 1); // grow first, so a failed push_back can't orphan a created event
+    while (events_.size() <= idx) {
+      cudaEvent_t e;
+      NVE_CHECK_(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+      events_.push_back(e);
+    }
+    return events_.at(idx);
+  }
 };
 
 template <typename KeyType>
@@ -176,6 +199,8 @@ GpuTable<KeyType>::GpuTable(const GPUTableConfig& config, allocator_ptr_t alloca
   NVE_CHECK_((config.row_size_in_bytes % 2) == 0, "Invalid cache row size (must divide by 2)");
   NVE_CHECK_(config.uvm_table == nullptr || config.uvm_num_rows > 0,
              "uvm_num_rows must be set to the number of rows in uvm_table");
+  NVE_CHECK_(config.kernel_mode_type != static_cast<uint64_t>(KernelType::PipelineGather) || config.count_misses,
+             "The PipelineGather kernel mode splits the gather on the miss count and requires count_misses");
   allocator_ = allocator ? allocator : GetDefaultAllocator();
   NVE_CHECK_(allocator_ != nullptr, "Failed to get default allocator");
 
@@ -221,7 +246,10 @@ void GpuTable<KeyType>::erase(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<c
   NVE_NVTX_SCOPED_FUNCTION_COL6_();
   ScopedDevice scope_device(config_.device_id);
   auto modify_stream = ctx->get_modify_stream();
-  NVE_CHECK_(keys != nullptr, "Invalid Keys buffer");
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf = config_.modify_on_gpu ?
                          keys->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, modify_stream) :
                          keys->access_buffer(cudaMemoryTypeHost, true /*copy_content*/, modify_stream);
@@ -301,7 +329,8 @@ static void run_find_uvm(const GPUTableConfig& config, std::shared_ptr<CacheType
         value_stride,
         tile_size,
         stream));
-      int8_t* aux_buffer = (int8_t*)gpu_table_ctx->get_buffer("d_aux_buffer", aux_buffer_size, false);
+      int8_t* aux_buffer = (int8_t*)gpu_table_ctx->get_buffer(
+        "d_aux_buffer", aux_buffer_size, false /*host_alloc*/);
       NVE_CHECK_(cache->lookup_sort_gather(
         lookup_ctx,
         reinterpret_cast<const KeyType*>(keys),
@@ -350,6 +379,10 @@ void GpuTable<KeyType>::find(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<co
   ScopedDevice scope_device(config_.device_id);
   NVE_CHECK_(value_sizes == nullptr, "value_sizes must be nullptr for GPU table");
   auto lookup_stream = ctx->get_lookup_stream();
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf = keys->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
   bitmask64_t* hit_mask_buf =
       hit_mask ? hit_mask->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;
@@ -385,6 +418,10 @@ void GpuTable<KeyType>::insert(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
   NVE_NVTX_SCOPED_FUNCTION_COL2_();
   ScopedDevice scope_device(config_.device_id);  
   auto modify_stream = ctx->get_modify_stream();
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf =
       keys->access_buffer(config_.modify_on_gpu ? cudaMemoryTypeDevice : cudaMemoryTypeHost,
                           true /*copy_content*/, modify_stream);
@@ -405,7 +442,8 @@ void GpuTable<KeyType>::insert(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
 
     nve::DefaultGPUHistogram<KeyType> histogram(num_keys);
     size_t histAllocSize = histogram.get_alloc_size();
-    void* d_hist_storage = ctx->get_buffer("d_hist_storage", histAllocSize, false);
+    void* d_hist_storage =
+      ctx->get_buffer("d_hist_storage", histAllocSize, false /*host_alloc*/);
     cudaStream_t mod_stream = modify_stream;
 
     histogram.compute_histogram(reinterpret_cast<const KeyType*>(keys_buf), num_keys,
@@ -458,6 +496,10 @@ void GpuTable<KeyType>::insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, bu
   ScopedDevice scope_device(config_.device_id);
   NVE_CHECK_(config_.uvm_table != nullptr, "insert_from_uvm requires a UVM table");
   auto modify_stream = ctx->get_modify_stream();
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf =
       keys->access_buffer(config_.modify_on_gpu ? cudaMemoryTypeDevice : cudaMemoryTypeHost,
                           true /*copy_content*/, modify_stream);
@@ -485,7 +527,8 @@ void GpuTable<KeyType>::insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, bu
 
     nve::DefaultGPUHistogram<KeyType, true /*LoadIndices*/> histogram(num_keys);
     size_t histAllocSize = histogram.get_alloc_size();
-    void* d_hist_storage = ctx->get_buffer("d_hist_storage", histAllocSize, false);
+    void* d_hist_storage =
+      ctx->get_buffer("d_hist_storage", histAllocSize, false /*host_alloc*/);
     cudaStream_t mod_stream = modify_stream;
 
     histogram.compute_histogram(reinterpret_cast<const KeyType*>(keys_buf), num_keys,
@@ -538,6 +581,10 @@ void GpuTable<KeyType>::update(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
   NVE_NVTX_SCOPED_FUNCTION_COL3_();
   ScopedDevice scope_device(config_.device_id);
   auto modify_stream = ctx->get_modify_stream();
+  if (num_keys <= 0) {
+    return;
+  }
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf =
       keys->access_buffer(config_.modify_on_gpu ? cudaMemoryTypeDevice : cudaMemoryTypeHost,
                           true /*copy_content*/, modify_stream);
@@ -614,8 +661,7 @@ void GpuTable<KeyType>::update(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<
                         static_cast<uint64_t>(config_.uvm_num_rows),
                         update_stream);
 
-    cudaEvent_t uvm_update_event;
-    NVE_CHECK_(cudaEventCreateWithFlags(&uvm_update_event, cudaEventDisableTiming));
+    const cudaEvent_t uvm_update_event = gpu_table_ctx->uvm_update_event();
     NVE_CHECK_(cudaEventRecord(uvm_update_event, update_stream));
 
     // If the modify stream is different from the update stream, it should wait for the update to complete
@@ -643,6 +689,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
     return;
   }
   auto modify_stream = ctx->get_modify_stream();
+  NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
   const void* keys_buf =
       keys->access_buffer(config_.modify_on_gpu ? cudaMemoryTypeDevice : cudaMemoryTypeHost,
                           true /*copy_content*/, modify_stream);
@@ -732,8 +779,11 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
 
       // copy updates to host
       NVE_CHECK_(update_size == update_stride, "Assuming updates are tightly packed");
+      // Both host paths below reinterpret the table rows and the updates as the same element type.
+      NVE_CHECK_(config_.value_dtype == update_dtype, "Unsupported update type combination"); // TODO: support other type combinations
       const auto update_buffer_size = num_keys * update_stride;
-      void* h_updates = ctx->get_buffer("h_updates_uvm_accumulate", update_buffer_size, true); // Create a temporary buffer for host updates (not using wrapper so we can manually copy updates in parts)
+      void* h_updates = ctx->get_buffer("h_updates_uvm_accumulate", update_buffer_size,
+                                        true /*host_alloc*/); // Create a temporary buffer for host updates (not using wrapper so we can manually copy updates in parts)
 
       const int64_t num_threads{ctx->get_thread_pool()->num_workers()};
       constexpr int64_t keys_per_task = 512;
@@ -742,8 +792,12 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
         // Use multiple cudaMemcpy calls to save latency of the CPU work
         const int64_t tasks_per_copy = num_threads;
         const int64_t keys_per_copy = keys_per_task * tasks_per_copy;
-        const int64_t num_copies = (num_keys + keys_per_copy - 1) / keys_per_copy;
-        std::vector<cudaEvent_t> copy_events(num_copies);
+        const int64_t num_copies = ceil_div(num_keys, keys_per_copy);
+        // Context-owned events, reused across calls: nothing to destroy afterwards.
+        std::vector<cudaEvent_t> copy_events(static_cast<size_t>(num_copies));
+        for (int64_t i=0 ; i<num_copies ; i++) {
+          copy_events.at(static_cast<size_t>(i)) = gpu_table_ctx->copy_event(static_cast<size_t>(i));
+        }
 
         // Launch copies
         for (int64_t i=0 ; i<num_copies ; i++) {
@@ -752,7 +806,6 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
           const int64_t used_keys = std::min<int64_t>((i+1) * keys_per_copy, num_keys) - (i * keys_per_copy);
           const auto copy_size = used_keys * update_stride;
           NVE_CHECK_(cudaMemcpyAsync(h_copy_start, d_copy_start, copy_size, cudaMemcpyDefault, update_stream));
-          NVE_CHECK_(cudaEventCreateWithFlags(&copy_events.at(i), cudaEventDisableTiming));
           NVE_CHECK_(cudaEventRecord(copy_events.at(i), update_stream));
         }
 
@@ -848,9 +901,6 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
 
         ctx->get_thread_pool()->submit(update_launcher_task);
         future.wait(); // wait on all tasks to complete
-        for (int64_t i=0 ; i<num_copies ; i++) {
-          NVE_CHECK_(cudaEventDestroy(copy_events.at(i))); // todo: keep events in the context and reuse them
-        }
       } else {
         // Use a single cudaMemcpy
         NVE_CHECK_(cudaMemcpyAsync(h_updates, updates_buf, update_buffer_size, cudaMemcpyDefault, update_stream));
@@ -862,9 +912,9 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
         const KeyType* typed_keys = reinterpret_cast<const KeyType*>(h_keys);
 
         const int64_t num_threads{ctx->get_thread_pool()->num_workers()};
-        const int64_t updates_per_task = std::min<size_t>(1<<10, (num_keys + num_threads -1) / num_threads);
+        const int64_t updates_per_task = std::min<size_t>(1<<10, ceil_div(num_keys, num_threads));
 
-        const auto num_tasks = (num_keys + updates_per_task - 1) / updates_per_task;
+        const auto num_tasks = ceil_div(num_keys, updates_per_task);
         const auto row_size = config_.row_size_in_bytes;
         const auto num_rows = static_cast<uint64_t>(config_.uvm_num_rows);
         
@@ -919,7 +969,6 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
           }
         }};
 
-        NVE_CHECK_(config_.value_dtype == update_dtype, "Unsupported update type combination"); // TODO: support other type combinations
         switch (update_dtype) {
           case DataType_t::Float16:
             ctx->get_thread_pool()->execute_n(0, num_tasks, update_task_fp16);
@@ -978,8 +1027,7 @@ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, 
       }
     }
 
-    cudaEvent_t uvm_update_event;
-    NVE_CHECK_(cudaEventCreateWithFlags(&uvm_update_event, cudaEventDisableTiming));
+    const cudaEvent_t uvm_update_event = gpu_table_ctx->uvm_update_event();
     NVE_CHECK_(cudaEventRecord(uvm_update_event, update_stream));
 
     // If the modify stream is different from the update stream, it should wait for the update to complete
@@ -1014,6 +1062,7 @@ void GpuTable<KeyType>::find_and_pool(
   // is not supported here: the stride must decode to a value count that fits within one stored row.
   validate_pool_output_stride(config_.value_dtype, config_.row_size_in_bytes, value_stride);
   auto lookup_stream = ctx->get_lookup_stream();
+  NVE_CHECK_ARG_(keys_bw != nullptr, "keys must not be null");
   const void* keys = keys_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream);
   const KeyType* offsets = offsets_bw ? offsets_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;
   const void* weights = weights_bw ? weights_bw->access_buffer(cudaMemoryTypeDevice, true /*copy_content*/, lookup_stream) : nullptr;

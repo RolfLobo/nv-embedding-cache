@@ -34,7 +34,7 @@ from pynve.torch.nve_export import (
     _gcd_memblock_type, _memblock_resource_descriptor, _collect_resources,
     _build_memblock_from_descriptor,
 )
-from conftest import requires_nvhm
+from conftest import requires_nvhm, make_host_layer_model
 
 DEVICE = torch.device("cuda")
 NUM_EMB = 1024
@@ -748,16 +748,7 @@ def test_host_layer_user_block_roundtrip():
     num_emb, emb_size = 512, 8
     weight = (torch.arange(num_emb, dtype=torch.float32)
               .unsqueeze(1).expand(num_emb, emb_size).contiguous())
-
-    class M(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb = nve_layers.NVEmbedding(
-                num_emb, emb_size, torch.float32,
-                layer_type=nve_layers.LayerType.HostLayer,
-                weight_init=weight, optimize_for_training=False)
-
-    model = M()
+    model = make_host_layer_model(num_emb, emb_size, weight, DEVICE)
     assert model.emb.memblock_type == nve.MemBlockType.User, \
         "precondition: auto HostLayer storage is a UserMemBlock"
 
@@ -780,6 +771,65 @@ def test_host_layer_user_block_roundtrip():
         assert out.device.type == "cpu"
         assert torch.equal(out, weight[keys]), "reloaded weights must match"
     print("PASS: HostLayer UserMemBlock round-trips as HostMemBlock with weights")
+
+
+def test_host_layer_cuda_aot_roundtrip():
+    """HostLayer bound to a CUDA device through export_aot / load_aot.
+
+    test_host_layer_cpu_aot_export_load_roundtrip covers the CPU device
+    (CPU op dispatch, device_index=-1). Here the marker, keys and outputs are on
+    CUDA while the table stays host-resident, so the CUDA op dispatch must route
+    to the HostEmbedding binding and copy the gathered rows back to the device.
+    Both the plain embedding and the pooled bag op are exercised.
+    """
+    num_emb, emb_size = 512, 8
+    weight = (torch.arange(num_emb, dtype=torch.float32)
+              .unsqueeze(1).expand(num_emb, emb_size).contiguous())
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nve_layers.NVEmbedding(
+                num_emb, emb_size, torch.float32,
+                layer_type=nve_layers.LayerType.HostLayer,
+                weight_init=weight, optimize_for_training=False, device=DEVICE)
+            self.bag = nve_layers.NVEmbeddingBag(
+                num_emb, emb_size, torch.float32,
+                layer_type=nve_layers.LayerType.HostLayer, mode="sum",
+                weight_init=weight, optimize_for_training=False, device=DEVICE)
+
+        def forward(self, keys, offsets):
+            return self.emb(keys), self.bag(keys, offsets)
+
+    keys = torch.tensor([0, 5, 17, 256, 511], dtype=torch.int64, device=DEVICE)
+    offsets = torch.tensor([0, 2, 5], dtype=torch.int64, device=DEVICE)
+    model = M()
+    expected_emb, expected_bag = model(keys, offsets)
+
+    with tempfile.TemporaryDirectory() as save_dir:
+        export_aot(model, (keys, offsets), save_dir)
+        del model
+        loader, layers = load_aot(save_dir)
+
+        assert len(layers) == 2
+        for layer in layers:
+            assert layer.layer_type == nve_layers.LayerType.HostLayer
+            assert layer.device.type == "cuda"
+            assert layer.storage.get_type() == nve.MemBlockType.Host
+
+        out_emb, out_bag = loader.run([keys, offsets])
+        assert out_emb.device.type == "cuda" and out_bag.device.type == "cuda"
+        assert torch.equal(out_emb, expected_emb)
+        assert torch.equal(out_bag, expected_bag)
+
+        # A second, larger batch: steady-state dispatch after the first run.
+        keys2 = torch.randint(0, num_emb, (1000,), dtype=torch.int64, device=DEVICE)
+        offsets2 = torch.tensor([0, 400, 1000], dtype=torch.int64, device=DEVICE)
+        out_emb2, out_bag2 = loader.run([keys2, offsets2])
+        assert torch.equal(out_emb2.cpu(), weight[keys2.cpu()])
+        expected_bag2 = torch.stack([weight[keys2.cpu()[:400]].sum(0),
+                                     weight[keys2.cpu()[400:]].sum(0)])
+        assert torch.allclose(out_bag2.cpu(), expected_bag2)
 
 
 def test_build_memblock_unsupported_type_raises():
@@ -942,7 +992,10 @@ def test_embed_config_roundtrip():
     num_emb, emb_size, gpu_cache = 256, 8, 512 * 1024
     config = {"kernel_mode": 2, "logging_interval": 100,
               "kernel_mode_value_1": 7, "kernel_mode_value_2": 9, "max_modify_size": 1024,
-              "default_row_index": 3}
+              "default_row_index": 3,
+              # non-empty values are HostLayer/Hierarchical-only (covered by
+              # test_host_cpu.py); empty is legal everywhere and round-trips
+              "default_embedding": []}
 
     # Cover both NVEmbedding and the bag path (which forwards config separately).
     emb = nve_layers.NVEmbedding(

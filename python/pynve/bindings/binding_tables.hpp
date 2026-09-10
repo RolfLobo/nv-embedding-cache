@@ -177,4 +177,4 @@ private:
     nlohmann::json table_config_;
 };
 
-} // namespace nve
+}  // namespace nve

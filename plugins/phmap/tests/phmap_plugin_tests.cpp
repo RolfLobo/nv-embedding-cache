@@ -17,8 +17,6 @@
 
 #include <gtest/gtest.h>
 
-#include <execution_context.hpp>
-#include <json_support.hpp>
 #include <phmap_flat_map_table.hpp>
 
 using namespace nve;

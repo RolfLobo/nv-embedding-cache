@@ -39,7 +39,7 @@ function(nve_configure_torch)
     # Initialize outputs
     set(TORCH_ARCH_STR "" PARENT_SCOPE)
 
-    if(NVE_DISABLE_TORCH_BINDINGS)
+    if (NVE_DISABLE_TORCH_BINDINGS)
         return()
     endif()
 
@@ -52,7 +52,7 @@ function(nve_configure_torch)
         RESULT_VARIABLE _torch_prefix_result
     )
 
-    if(NOT (_torch_prefix_result EQUAL 0 AND _torch_prefix))
+    if (NOT (_torch_prefix_result EQUAL 0 AND _torch_prefix))
         message(WARNING "Could not find torch — disabling torch bindings.\n"
                         "Install PyTorch or set NVE_DISABLE_TORCH_BINDINGS=ON to suppress this warning.")
         set(NVE_DISABLE_TORCH_BINDINGS ON PARENT_SCOPE)
@@ -75,7 +75,7 @@ function(nve_configure_torch)
         OUTPUT_VARIABLE _torch_abi_output
     )
 
-    if(NOT TORCH_STABLE_ABI_OK)
+    if (NOT TORCH_STABLE_ABI_OK)
         message(WARNING "Torch stable ABI check failed — disabling torch bindings.\n"
                         "Set NVE_DISABLE_TORCH_BINDINGS=ON to suppress this warning.\n"
                         "Output: ${_torch_abi_output}")
@@ -86,7 +86,7 @@ function(nve_configure_torch)
     message(STATUS "Torch stable ABI check passed — building libnve-torch-ops.so")
 
     # Propagate CMAKE_PREFIX_PATH so the caller's find_package(Torch REQUIRED) can find torch.
-    if(NOT CMAKE_PREFIX_PATH MATCHES "torch")
+    if (NOT CMAKE_PREFIX_PATH MATCHES "torch")
         set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};${_torch_prefix}" PARENT_SCOPE)
         message(STATUS "Auto-detected torch cmake prefix: ${_torch_prefix}")
     endif()
@@ -96,7 +96,7 @@ function(nve_configure_torch)
     set(_arch_list "")
     foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
         string(LENGTH "${arch}" _arch_len)
-        if(_arch_len EQUAL 2)
+        if (_arch_len EQUAL 2)
             string(SUBSTRING "${arch}" 0 1 _major)
             string(SUBSTRING "${arch}" 1 1 _minor)
         elseif(_arch_len EQUAL 3)

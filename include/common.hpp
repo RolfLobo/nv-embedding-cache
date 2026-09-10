@@ -117,7 +117,8 @@
 #ifdef NVE_THROW_NOT_IMPLEMENTED_
 #error NVE_THROW_NOT_IMPLEMENTED_ was already defined.
 #endif
-#define NVE_THROW_NOT_IMPLEMENTED_() NVE_THROW_("Not implemented yet!")
+#define NVE_THROW_NOT_IMPLEMENTED_() \
+  throw nve::NotImplementedError(__FILE__, __LINE__, "throw", "Not implemented yet!")
 
 // Variants of NVE_CHECK_/NVE_THROW_ for validating caller-supplied arguments. They throw
 // nve::InvalidArgumentError (still an nve::Exception) so API boundaries such as the C API can
@@ -211,19 +212,19 @@ class Exception : public std::exception {
     NVE_ASSERT_(expr_);
   }
 
-  inline const char* file() const noexcept { return file_; }
+  constexpr const char* file() const noexcept { return file_; }
 
-  inline int64_t line() const noexcept { return line_; }
+  constexpr int64_t line() const noexcept { return line_; }
 
-  inline const char* expression() const noexcept { return expr_; }
+  constexpr const char* expression() const noexcept { return expr_; }
 
-  inline const std::string& hint() const noexcept { return hint_; }
+  constexpr const std::string& hint() const noexcept { return hint_; }
 
-  virtual const char* what() const noexcept override {
+  const char* what() const noexcept override {
     return hint_.empty() ? expr_ : hint_.c_str();
   }
 
-  inline const std::string& thread_name() const noexcept { return thread_; }
+  constexpr const std::string& thread_name() const noexcept { return thread_; }
 
   /**
    * Virtual to avoid callers needing to have type information upfront.
@@ -278,7 +279,7 @@ class RuntimeError<bool> : public Exception {
                       const std::string& hint)
       : base_type(file, line, expr, hint) {}
 
-  virtual std::string to_string() const override;
+  std::string to_string() const override;
 };
 
 /**
@@ -293,6 +294,22 @@ class InvalidArgumentError : public Exception {
 
   inline InvalidArgumentError(const char file[], const int line, const char expr[],
                               const std::string& hint)
+      : base_type(file, line, expr, hint) {}
+};
+
+/**
+ * Thrown for a code path that is not implemented (yet). Don't use directly; use the
+ * `NVE_THROW_NOT_IMPLEMENTED_` macro instead. Kept distinct from RuntimeError so API boundaries
+ * such as the C API can report it as NVE_ERROR_NOT_IMPLEMENTED.
+ */
+class NotImplementedError : public Exception {
+ public:
+  using base_type = Exception;
+
+  NotImplementedError() = delete;
+
+  inline NotImplementedError(const char file[], const int line, const char expr[],
+                             const std::string& hint)
       : base_type(file, line, expr, hint) {}
 };
 
@@ -311,23 +328,31 @@ Logger* GetGlobalLogger();
 // Coverity flags the `if constexpr` compare below as a tautology
 // (CONSTANT_EXPRESSION_RESULT) at every NVE_LOG_ERROR_/NVE_LOG_CRITICAL_
 // call site. Under analysis, use a simpler body with no compile-time branch.
+// The level check comes first so filtered messages are never formatted: several call sites sit on
+// lookup/submit hot paths.
 #define NVE_LOG_(_level_, ...)                                            \
   do {                                                                    \
-    nve::GetGlobalLogger()->log(                                          \
-      (_level_),                                                          \
-      to_string('(', __FILE__, ':', __LINE__, ") ", __VA_ARGS__));        \
+    nve::Logger* const _logger_{nve::GetGlobalLogger()};                  \
+    if (_logger_->is_enabled(_level_)) {                                  \
+      _logger_->log(                                                      \
+        (_level_),                                                        \
+        to_string('(', __FILE__, ':', __LINE__, ") ", __VA_ARGS__));      \
+    }                                                                     \
   } while (0)
 #else // __COVERITY__
 #define NVE_LOG_(_level_, ...)                                            \
   do {                                                                    \
-    std::string _msg_;                                                    \
-    if constexpr (static_cast<int64_t>(_level_) <=                        \
-                  static_cast<int64_t>(nve::LogLevel_t::Error)) {         \
-      _msg_ = to_string('(', __FILE__, ':', __LINE__, ") ", __VA_ARGS__); \
-    } else {                                                              \
-      _msg_ = to_string(__VA_ARGS__);                                     \
+    nve::Logger* const _logger_{nve::GetGlobalLogger()};                  \
+    if (_logger_->is_enabled(_level_)) {                                  \
+      std::string _msg_;                                                  \
+      if constexpr (static_cast<int64_t>(_level_) <=                      \
+                    static_cast<int64_t>(nve::LogLevel_t::Error)) {       \
+        _msg_ = to_string('(', __FILE__, ':', __LINE__, ") ", __VA_ARGS__); \
+      } else {                                                            \
+        _msg_ = to_string(__VA_ARGS__);                                   \
+      }                                                                   \
+      _logger_->log((_level_), (_msg_));                                  \
     }                                                                     \
-    nve::GetGlobalLogger()->log((_level_), (_msg_));                      \
   } while (0)
 #endif // __COVERITY__
 

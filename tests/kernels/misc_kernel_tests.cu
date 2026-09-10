@@ -87,22 +87,22 @@ class EmbeddingCacheLookupHitMaskRefTest : public EmbeddingCacheRefTest<T> {
         NVE_DEBUG_PRINTF_("compute lookup with hitmask reference results\n");
 
         uint32_t mask = 0;
-        m_ref_result.resize(this->m_batch * this->m_hotness * this->m_num_elements);
-        m_ref_hitmask.resize(0);
+        ref_result_.resize(this->batch_ * this->hotness_ * this->num_elements_);
+        ref_hitmask_.resize(0);
         int64_t i = 0;
-        for (; i < static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness); i++) {
+        for (; i < static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_); i++) {
             IndexType idx = indices[i];
 
             bool in_cache = std::binary_search(cache_data.begin(), cache_data.end(), idx);
             if (in_cache) {
-               for (uint32_t el = 0; el < this->m_num_elements; el++) {
-                    m_ref_result[i * this->m_num_elements + el] = table[idx * this->m_num_elements + el];
+               for (uint32_t el = 0; el < this->num_elements_; el++) {
+                    ref_result_[i * this->num_elements_ + el] = table[idx * this->num_elements_ + el];
                }
                mask |= 0x80000000;
             }
 
             if (((i + 1) % 32) == 0) {
-                m_ref_hitmask.push_back(mask);
+                ref_hitmask_.push_back(mask);
                 mask = 0;
             } else {
                 mask >>= 1;
@@ -112,49 +112,49 @@ class EmbeddingCacheLookupHitMaskRefTest : public EmbeddingCacheRefTest<T> {
         uint64_t set_bits = i % 32;
         if (set_bits != 0) {
             mask >>= (32-set_bits-1);
-            m_ref_hitmask.push_back(mask);
+            ref_hitmask_.push_back(mask);
         }
     }
 
     void LaunchKernel(const ElemType* /*table*/, 
                       const IndexType* indices,
                       CacheDataType& cache_data) {
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
-        int64_t num_hitmask_elems = (num_indices + 31) / 32;
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
+        int64_t num_hitmask_elems = nve::ceil_div(num_indices, static_cast<int64_t>(32));
 
-        m_result = std::make_shared<TestBuffer<ElemType>>(num_indices *this->m_num_elements * sizeof(ElemType));
-        m_hitmask = std::make_shared<TestBuffer<uint32_t>>(num_hitmask_elems * sizeof(uint32_t));
+        result_ = std::make_shared<TestBuffer<ElemType>>(num_indices *this->num_elements_ * sizeof(ElemType));
+        hitmask_ = std::make_shared<TestBuffer<uint32_t>>(num_hitmask_elems * sizeof(uint32_t));
 
-        std::memset(m_hitmask->ph, 0, num_hitmask_elems * sizeof(uint32_t));
-        m_hitmask->HtoD(this->m_stream);
+        std::memset(hitmask_->ph, 0, num_hitmask_elems * sizeof(uint32_t));
+        hitmask_->HtoD(this->stream_);
 
         NVE_DEBUG_PRINTF_("launch lookup with hitmask kernel\n");
 
         CHECK_CUDA_ERROR((nve::call_cache_query_hit_mask<IndexType, IndexType>(
-            indices, this->m_batch * this->m_hotness,
-            reinterpret_cast<int8_t*>(m_result->pd), m_hitmask->pd, cache_data,
-            this->m_stream, 0, this->m_num_elements * sizeof(ElemType))));                         
+            indices, this->batch_ * this->hotness_,
+            reinterpret_cast<int8_t*>(result_->pd), hitmask_->pd, cache_data,
+            this->stream_, 0, this->num_elements_ * sizeof(ElemType))));
     }
 
     void CheckResult() {
         NVE_DEBUG_PRINTF_("check lookup with hitmask results\n");
-        m_result->DtoH(this->m_stream);
-        m_hitmask->DtoH(this->m_stream);
+        result_->DtoH(this->stream_);
+        hitmask_->DtoH(this->stream_);
 
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
-        EXPECT_TRUE(std::equal(m_ref_hitmask.begin(), m_ref_hitmask.end(), m_hitmask->ph)); 
+        EXPECT_TRUE(std::equal(ref_hitmask_.begin(), ref_hitmask_.end(), hitmask_->ph));
 
         int64_t curr_mask_idx = 0;
         int64_t curr_mask_el = 1;
 
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
         for (int64_t i = 0; i < num_indices; i++) {
-            uint32_t curr_mask = m_ref_hitmask[curr_mask_idx];
+            uint32_t curr_mask = ref_hitmask_[curr_mask_idx];
             if ((curr_mask & curr_mask_el) == 0x1) {
-                EXPECT_TRUE(std::equal(m_result->ph + i * this->m_num_elements,
-                                       m_result->ph + (i + 1) * this->m_num_elements,
-                                       m_ref_result.begin() + i * this->m_num_elements)); 
+                EXPECT_TRUE(std::equal(result_->ph + i * this->num_elements_,
+                                       result_->ph + (i + 1) * this->num_elements_,
+                                       ref_result_.begin() + i * this->num_elements_));
             }
             if (((i + 1) % 32) == 0) {
                 ++curr_mask_idx;
@@ -165,10 +165,10 @@ class EmbeddingCacheLookupHitMaskRefTest : public EmbeddingCacheRefTest<T> {
         }
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_result = nullptr;
-    std::shared_ptr<TestBuffer<uint32_t>> m_hitmask = nullptr;
-    std::vector<ElemType> m_ref_result;
-    std::vector<uint32_t> m_ref_hitmask;
+    std::shared_ptr<TestBuffer<ElemType>> result_ = nullptr;
+    std::shared_ptr<TestBuffer<uint32_t>> hitmask_ = nullptr;
+    std::vector<ElemType> ref_result_;
+    std::vector<uint32_t> ref_hitmask_;
 };
 
 TYPED_TEST_SUITE_P(EmbeddingCacheLookupHitMaskRefTest);
@@ -177,7 +177,7 @@ TYPED_TEST_P(EmbeddingCacheLookupHitMaskRefTest, TestFixedHotnessAgainstRefCpu) 
     for (const auto batch : {17, 2048}) {
         for (const auto hotness : {13, 32}) {
             for (const auto num_elements : {53, 512}) {
-                for(const auto allocOnHost: {false, true}){
+                for (const auto allocOnHost: {false, true}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", batch, hotness, num_elements, allocOnHost?"host":"device");
                     this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost);
                 }
@@ -202,18 +202,18 @@ class ScatterRefTest : public EmbeddingCacheRefTest<T> {
         NVE_DEBUG_PRINTF_("compute scatter reference results\n");
 
         // reference - just do gather of all indices
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
-        int64_t num_hitmask_elems = (num_indices + 63) / 64;
-        m_hitmask = std::make_shared<TestBuffer<uint64_t>>(num_hitmask_elems * sizeof(uint64_t));
-        m_input = std::make_shared<TestBuffer<ElemType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(ElemType));
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
+        int64_t num_hitmask_elems = nve::ceil_div(num_indices, static_cast<int64_t>(64));
+        hitmask_ = std::make_shared<TestBuffer<uint64_t>>(num_hitmask_elems * sizeof(uint64_t));
+        input_ = std::make_shared<TestBuffer<ElemType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(ElemType));
 
         uint64_t mask = 0;
 
         int64_t i = 0;
         for (; i < num_indices; i++) {
             IndexType idx = indices[i];
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
-                m_input->ph[i * this->m_num_elements + el] = table[idx * this->m_num_elements + el];
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
+                input_->ph[i * this->num_elements_ + el] = table[idx * this->num_elements_ + el];
             }
             bool in_cache = std::binary_search(cache_data.begin(), cache_data.end(), idx);
             if (in_cache) {
@@ -221,7 +221,7 @@ class ScatterRefTest : public EmbeddingCacheRefTest<T> {
             }
 
             if (((i + 1) % 64) == 0) {
-                m_hitmask->ph[i / 64] = mask;
+                hitmask_->ph[i / 64] = mask;
                 mask = 0;
             } else {
                 mask >>= 1;
@@ -229,7 +229,7 @@ class ScatterRefTest : public EmbeddingCacheRefTest<T> {
 
         }
         if (( i % 64) != 0) {
-            m_hitmask->ph[i / 64] = mask;
+            hitmask_->ph[i / 64] = mask;
         }
     }
 
@@ -238,43 +238,43 @@ class ScatterRefTest : public EmbeddingCacheRefTest<T> {
                       CacheDataType& /*cache_data*/) {
         NVE_DEBUG_PRINTF_("launch scatter kernel\n");
 
-        m_hitmask->HtoD(this->m_stream);
-        m_input->HtoD(this->m_stream);
-        m_result = std::make_shared<TestBuffer<ElemType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(ElemType));
-        uint64_t num_indices = static_cast<uint64_t>(this->m_batch) * static_cast<uint64_t>(this->m_hotness);
+        hitmask_->HtoD(this->stream_);
+        input_->HtoD(this->stream_);
+        result_ = std::make_shared<TestBuffer<ElemType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(ElemType));
+        uint64_t num_indices = static_cast<uint64_t>(this->batch_) * static_cast<uint64_t>(this->hotness_);
         for (uint64_t i = 0; i < num_indices; i++) {
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
-                m_result->ph[i * this->m_num_elements + el] = ElemType(8);
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
+                result_->ph[i * this->num_elements_ + el] = ElemType(8);
             }
         }
-        m_result->HtoD(this->m_stream);
+        result_->HtoD(this->stream_);
 
-        uint32_t embed_width_in_bytes = static_cast<uint32_t>(this->m_num_elements * sizeof(ElemType));
-        nve::EmbeddingForwardScatter(m_input->pd, m_result->pd, embed_width_in_bytes,
+        uint32_t embed_width_in_bytes = static_cast<uint32_t>(this->num_elements_ * sizeof(ElemType));
+        nve::EmbeddingForwardScatter(input_->pd, result_->pd, embed_width_in_bytes,
                                             embed_width_in_bytes, embed_width_in_bytes,
-                                            reinterpret_cast<uint64_t*>(m_hitmask->pd),
-                                            static_cast<uint32_t>(num_indices), this->m_stream);
+                                            reinterpret_cast<uint64_t*>(hitmask_->pd),
+                                            static_cast<uint32_t>(num_indices), this->stream_);
     }
 
     void CheckResult() {
         NVE_DEBUG_PRINTF_("check scatter results\n");
-        m_result->DtoH(this->m_stream);
+        result_->DtoH(this->stream_);
 
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
         int64_t curr_mask_idx = 0;
         int64_t curr_mask_el = 1;
 
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
         for (int64_t i = 0; i < num_indices; i++) {
-            if ((m_hitmask->ph[curr_mask_idx] & curr_mask_el) == 0) {                
-                EXPECT_TRUE(std::equal(m_result->ph + i * this->m_num_elements,
-                                       m_result->ph + (i + 1) * this->m_num_elements,
-                                       m_input->ph + i * this->m_num_elements));
+            if ((hitmask_->ph[curr_mask_idx] & curr_mask_el) == 0) {
+                EXPECT_TRUE(std::equal(result_->ph + i * this->num_elements_,
+                                       result_->ph + (i + 1) * this->num_elements_,
+                                       input_->ph + i * this->num_elements_));
             } else {
-                EXPECT_FALSE(std::equal(m_result->ph + i * this->m_num_elements,
-                                       m_result->ph + (i + 1) * this->m_num_elements,
-                                       m_input->ph + i * this->m_num_elements)); 
+                EXPECT_FALSE(std::equal(result_->ph + i * this->num_elements_,
+                                       result_->ph + (i + 1) * this->num_elements_,
+                                       input_->ph + i * this->num_elements_));
             }
             if (((i + 1) % 64) == 0) {
                 ++curr_mask_idx;
@@ -285,10 +285,10 @@ class ScatterRefTest : public EmbeddingCacheRefTest<T> {
         }
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_result = nullptr;
-    std::shared_ptr<TestBuffer<ElemType>> m_input = nullptr;
-    std::shared_ptr<TestBuffer<uint64_t>> m_hitmask = nullptr;
-    std::vector<ElemType> m_ref_result;
+    std::shared_ptr<TestBuffer<ElemType>> result_ = nullptr;
+    std::shared_ptr<TestBuffer<ElemType>> input_ = nullptr;
+    std::shared_ptr<TestBuffer<uint64_t>> hitmask_ = nullptr;
+    std::vector<ElemType> ref_result_;
 };
 
 TYPED_TEST_SUITE_P(ScatterRefTest);
@@ -297,7 +297,7 @@ TYPED_TEST_P(ScatterRefTest, TestScatterAgainstRefCpu) {
     for (const auto batch : {17, 2048}) {
         for (const auto hotness : {13, 32}) {
             for (const auto num_elements : {13, 512}) {
-                for(const auto allocOnHost: {true, false}){
+                for (const auto allocOnHost: {true, false}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", batch, hotness, num_elements, allocOnHost?"host":"device");
                     this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost);
                 }
@@ -322,19 +322,19 @@ class UpdateRefTest : public EmbeddingCacheRefTest<T> {
         NVE_DEBUG_PRINTF_("compute update reference results\n");
 
         // reference - just do gather of all indices
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
-        m_input = std::make_shared<TestBuffer<ElemType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(ElemType));
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
+        input_ = std::make_shared<TestBuffer<ElemType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(ElemType));
 
-        m_ref_result.resize(this->m_num_elements * this->m_num_rows);
-        memcpy(&m_ref_result[0], table, this->m_num_elements * this->m_num_rows * sizeof(ElemType));
+        ref_result_.resize(this->num_elements_ * this->num_rows_);
+        memcpy(&ref_result_[0], table, this->num_elements_ * this->num_rows_ * sizeof(ElemType));
 
         // generate inputs to update and update ref
         int64_t i = 0;
         for (; i < num_indices; i++) {
             IndexType idx = indices[i];
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
-                m_input->ph[i * this->m_num_elements + el] = table[idx * this->m_num_elements + el] + ElemType(i);
-                m_ref_result[idx * this->m_num_elements + el] += ElemType(i);
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
+                input_->ph[i * this->num_elements_ + el] = table[idx * this->num_elements_ + el] + ElemType(i);
+                ref_result_[idx * this->num_elements_ + el] += ElemType(i);
             }
         }
     }
@@ -344,13 +344,13 @@ class UpdateRefTest : public EmbeddingCacheRefTest<T> {
                       CacheDataType& /*cache_data*/) {
         NVE_DEBUG_PRINTF_("launch update kernel\n");
 
-        m_input->HtoD(this->m_stream);
+        input_->HtoD(this->stream_);
 
-        uint32_t embed_width_in_bytes = static_cast<uint32_t>(this->m_num_elements * sizeof(ElemType));
-        uint64_t num_indices = static_cast<uint64_t>(this->m_batch) * static_cast<uint64_t>(this->m_hotness);
-        nve::UpdateTable(m_input->pd, indices, const_cast<ElemType*>(table),
+        uint32_t embed_width_in_bytes = static_cast<uint32_t>(this->num_elements_ * sizeof(ElemType));
+        uint64_t num_indices = static_cast<uint64_t>(this->batch_) * static_cast<uint64_t>(this->hotness_);
+        nve::UpdateTable(input_->pd, indices, const_cast<ElemType*>(table),
                          embed_width_in_bytes, embed_width_in_bytes, embed_width_in_bytes,
-                         static_cast<uint32_t>(num_indices), this->m_num_rows, this->m_stream);
+                         static_cast<uint32_t>(num_indices), this->num_rows_, this->stream_);
     }
 
     void CheckResult() {
@@ -359,11 +359,11 @@ class UpdateRefTest : public EmbeddingCacheRefTest<T> {
         ElemType* curr_table = this->syncTable();
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         
-        EXPECT_TRUE(std::equal(m_ref_result.begin(), m_ref_result.end(), curr_table));
+        EXPECT_TRUE(std::equal(ref_result_.begin(), ref_result_.end(), curr_table));
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_input = nullptr;
-    std::vector<ElemType> m_ref_result;
+    std::shared_ptr<TestBuffer<ElemType>> input_ = nullptr;
+    std::vector<ElemType> ref_result_;
 };
 
 TYPED_TEST_SUITE_P(UpdateRefTest);
@@ -372,7 +372,7 @@ TYPED_TEST_SUITE_P(UpdateRefTest);
 TYPED_TEST_P(UpdateRefTest, TestUpdateAgainstRefCpu) {
     for (const auto hotness : {17, 2048}) {
         for (const auto num_elements : {53, 512}) {
-            for(const auto allocOnHost: {true, false}){
+            for (const auto allocOnHost: {true, false}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", 1, hotness, num_elements, allocOnHost?"host":"device");
                     this->LaunchTest(262144, num_elements, 1, hotness, allocOnHost);
                 }
@@ -396,11 +396,11 @@ class UpdateAccumulateRefTest : public EmbeddingCacheRefTest<T> {
         NVE_DEBUG_PRINTF_("compute update accumulate reference results\n");
 
         // reference - just do gather of all indices
-        int64_t num_indices = static_cast<int64_t>(this->m_batch) * static_cast<int64_t>(this->m_hotness);
-        m_input = std::make_shared<TestBuffer<ElemType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(ElemType));
+        int64_t num_indices = static_cast<int64_t>(this->batch_) * static_cast<int64_t>(this->hotness_);
+        input_ = std::make_shared<TestBuffer<ElemType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(ElemType));
 
-        m_ref_result.resize(this->m_num_elements * this->m_num_rows);
-        memcpy(&m_ref_result[0], table, this->m_num_elements * this->m_num_rows * sizeof(ElemType));
+        ref_result_.resize(this->num_elements_ * this->num_rows_);
+        memcpy(&ref_result_[0], table, this->num_elements_ * this->num_rows_ * sizeof(ElemType));
 
         // generate inputs to update and update ref
         std::mt19937 genr(0X753812);
@@ -409,10 +409,10 @@ class UpdateAccumulateRefTest : public EmbeddingCacheRefTest<T> {
 
         for (int64_t i = 0; i < num_indices; i++) {
             IndexType idx = indices[i];
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
                 float val = float(dist_nom(genr)) / float(1 << dist_denom(genr));
-                m_input->ph[i * this->m_num_elements + el] = ElemType(val);
-                m_ref_result[idx * this->m_num_elements + el] += ElemType(val);
+                input_->ph[i * this->num_elements_ + el] = ElemType(val);
+                ref_result_[idx * this->num_elements_ + el] += ElemType(val);
             }
         }
     }
@@ -422,12 +422,12 @@ class UpdateAccumulateRefTest : public EmbeddingCacheRefTest<T> {
                       CacheDataType& /*cache_data*/) {
         NVE_DEBUG_PRINTF_("launch update accumulate kernel\n");
 
-        m_input->HtoD(this->m_stream);
+        input_->HtoD(this->stream_);
 
-        uint64_t num_indices = static_cast<uint64_t>(this->m_batch) * static_cast<uint64_t>(this->m_hotness);
-        nve::UpdateAccumulateTable(m_input->pd, indices, const_cast<ElemType*>(table),
-                                   this->m_num_elements, this->m_num_elements, this->m_num_elements,
-                                   static_cast<uint32_t>(num_indices), this->m_num_rows, this->m_stream);
+        uint64_t num_indices = static_cast<uint64_t>(this->batch_) * static_cast<uint64_t>(this->hotness_);
+        nve::UpdateAccumulateTable(input_->pd, indices, const_cast<ElemType*>(table),
+                                   this->num_elements_, this->num_elements_, this->num_elements_,
+                                   static_cast<uint32_t>(num_indices), this->num_rows_, this->stream_);
     }
 
     void CheckResult() {
@@ -437,11 +437,11 @@ class UpdateAccumulateRefTest : public EmbeddingCacheRefTest<T> {
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         
         const float tolerance = 1e-5f;
-        EXPECT_TRUE(std::equal(m_ref_result.begin(), m_ref_result.end(), curr_table, Near(tolerance)));
+        EXPECT_TRUE(std::equal(ref_result_.begin(), ref_result_.end(), curr_table, Near(tolerance)));
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_input = nullptr;
-    std::vector<ElemType> m_ref_result;
+    std::shared_ptr<TestBuffer<ElemType>> input_ = nullptr;
+    std::vector<ElemType> ref_result_;
 };
 
 TYPED_TEST_SUITE_P(UpdateAccumulateRefTest);
@@ -450,7 +450,7 @@ TYPED_TEST_P(UpdateAccumulateRefTest, TestUpdateAccumulateAgainstRefCpu) {
     for (const auto batch : {171}) {
         for (const auto hotness : {16, 111}) {
             for (const auto num_elements : {53, 512}) {
-                for(const auto allocOnHost: {true, false}){
+                for (const auto allocOnHost: {true, false}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", batch, hotness, num_elements, allocOnHost?"host":"device");
                         this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost);
             }
@@ -599,13 +599,13 @@ class EmbeddingCacheFusedUpdateAccumlateTest : public EmbeddingCacheRefTest<T> {
         NVE_DEBUG_PRINTF_("compute update reference results\n");
 
         // reference - just do gather of all indices
-        IndexType num_keys = this->m_batch * this->m_hotness;
+        IndexType num_keys = this->batch_ * this->hotness_;
 
         // first compute cache content
-        m_ref_cache = this->GetCacheContent();
+        ref_cache_ = this->GetCacheContent();
         
         // second dedup keys
-        m_unique_keys = std::make_shared<TestBuffer<IndexType>>(num_keys * sizeof(IndexType));
+        unique_keys_ = std::make_shared<TestBuffer<IndexType>>(num_keys * sizeof(IndexType));
         // allocate 1 extra element for counts, because we call cub exclusive prefix sum kernel
         // to compute n + 1 outputs, and it reads the last input element even though it is not used
         // in the output
@@ -623,32 +623,32 @@ class EmbeddingCacheFusedUpdateAccumlateTest : public EmbeddingCacheRefTest<T> {
         CHECK_CUDA_ERROR(cudaMallocHost(&tmp_host_mem, tmp_mem_size_host));
         deduper_->set_and_init_buffers(num_keys, tmp_device_mem, tmp_host_mem);
 
-        CHECK_CUDA_ERROR(cudaMallocHost(&m_h_num_runs_out, sizeof(IndexType) * 2));
+        CHECK_CUDA_ERROR(cudaMallocHost(&h_num_runs_out_, sizeof(IndexType) * 2));
 
         deduper_->dedup(reinterpret_cast<const IndexType*>(indices),
-                        num_keys, m_unique_keys->pd, 
+                        num_keys, unique_keys_->pd,
                         counts_out->pd,
                         nullptr, 
-                        m_h_num_runs_out, 
+                        h_num_runs_out_,
                         inverse_buffer->pd, 
                         offsets->pd,
-                        this->m_stream);
+                        this->stream_);
 
-        m_unique_keys->DtoH(this->m_stream);
+        unique_keys_->DtoH(this->stream_);
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-        m_input = std::make_shared<TestBuffer<ElemType>>(*m_h_num_runs_out * this->m_num_elements * sizeof(ElemType));
+        input_ = std::make_shared<TestBuffer<ElemType>>(*h_num_runs_out_ * this->num_elements_ * sizeof(ElemType));
 
-        m_ref_result.resize(this->m_num_elements * this->m_num_rows);
-        memcpy(&m_ref_result[0], table, this->m_num_elements * this->m_num_rows * sizeof(ElemType));
+        ref_result_.resize(this->num_elements_ * this->num_rows_);
+        memcpy(&ref_result_[0], table, this->num_elements_ * this->num_rows_ * sizeof(ElemType));
 
         // generate inputs to update and update ref
-        for (int64_t i = 0; i < *m_h_num_runs_out; i++) {
-            IndexType idx = m_unique_keys->ph[i];
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
-                m_input->ph[i * this->m_num_elements + el] = ElemType(i);
-                m_ref_result[idx * this->m_num_elements + el] += ElemType(i);
-                if (m_ref_cache.count(idx))
-                    m_ref_cache[idx][el] += ElemType(i);
+        for (int64_t i = 0; i < *h_num_runs_out_; i++) {
+            IndexType idx = unique_keys_->ph[i];
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
+                input_->ph[i * this->num_elements_ + el] = ElemType(i);
+                ref_result_[idx * this->num_elements_ + el] += ElemType(i);
+                if (ref_cache_.count(idx))
+                    ref_cache_[idx][el] += ElemType(i);
             }
         }
 
@@ -661,16 +661,16 @@ class EmbeddingCacheFusedUpdateAccumlateTest : public EmbeddingCacheRefTest<T> {
                       CacheDataType& cache_data) {
         NVE_DEBUG_PRINTF_("launch update kernel\n");
 
-        m_input->HtoD(this->m_stream);
+        input_->HtoD(this->stream_);
 
-        uint64_t num_indices = *m_h_num_runs_out;
-        CHECK_CUDA_ERROR((nve::call_update_accumulate_no_sync_fused_with_pipeline<IndexType,IndexType>(reinterpret_cast<int8_t*>(m_input->pd), 
+        uint64_t num_indices = *h_num_runs_out_;
+        CHECK_CUDA_ERROR((nve::call_update_accumulate_no_sync_fused_with_pipeline<IndexType,IndexType>(reinterpret_cast<int8_t*>(input_->pd),
                                    (int8_t*)(table), 
-                                   m_unique_keys->pd, 
+                                   unique_keys_->pd,
                                    static_cast<IndexType>(num_indices),
-                                   this->m_num_elements * sizeof(ElemType),
+                                   this->num_elements_ * sizeof(ElemType),
                                    cache_data,
-                                   this->m_stream)));
+                                   this->stream_)));
     }
 
     void CheckResult() {
@@ -680,25 +680,25 @@ class EmbeddingCacheFusedUpdateAccumlateTest : public EmbeddingCacheRefTest<T> {
         auto test_cache = this->GetCacheContent();
 
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-        for (uint32_t j = 0; j < this->m_num_rows; j ++ ) {
-            for (uint32_t i = 0; i < this->m_num_elements; i++)
+        for (uint32_t j = 0; j < this->num_rows_; j ++ ) {
+            for (uint32_t i = 0; i < this->num_elements_; i++)
             {
-                auto ref_val = m_ref_result[j*this->m_num_elements + i];
-                auto test_val = curr_table[j*this->m_num_elements + i];
+                auto ref_val = ref_result_[j*this->num_elements_ + i];
+                auto test_val = curr_table[j*this->num_elements_ + i];
                 ASSERT_FLOAT_EQ(ref_val, test_val);
             }
         }
 
         // compare cache content
-        ASSERT_EQ(test_cache.size(), m_ref_cache.size());
+        ASSERT_EQ(test_cache.size(), ref_cache_.size());
         for (const auto& ent : test_cache)
         {
             auto key = ent.first;
             auto test_vec = ent.second;
-            auto ref_it = m_ref_cache.find(key);
-            ASSERT_TRUE(ref_it != m_ref_cache.end());
+            auto ref_it = ref_cache_.find(key);
+            ASSERT_TRUE(ref_it != ref_cache_.end());
             auto ref_vec = ref_it->second;
-            for (uint32_t i = 0; i < this->m_num_elements; i++)
+            for (uint32_t i = 0; i < this->num_elements_; i++)
             {
                 auto ref_val = ref_vec[i];
                 auto test_val = test_vec[i];
@@ -709,11 +709,11 @@ class EmbeddingCacheFusedUpdateAccumlateTest : public EmbeddingCacheRefTest<T> {
 
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_input = nullptr;
-    std::vector<ElemType> m_ref_result;
-    std::shared_ptr<TestBuffer<IndexType>> m_unique_keys = nullptr;
-    IndexType* m_h_num_runs_out = nullptr;
-    std::map<IndexType, std::vector<ElemType>> m_ref_cache;
+    std::shared_ptr<TestBuffer<ElemType>> input_ = nullptr;
+    std::vector<ElemType> ref_result_;
+    std::shared_ptr<TestBuffer<IndexType>> unique_keys_ = nullptr;
+    IndexType* h_num_runs_out_ = nullptr;
+    std::map<IndexType, std::vector<ElemType>> ref_cache_;
 };
 
 TYPED_TEST_SUITE_P(EmbeddingCacheFusedUpdateAccumlateTest);
@@ -722,7 +722,7 @@ TYPED_TEST_P(EmbeddingCacheFusedUpdateAccumlateTest, TestFusedAccumulateRefCpu) 
     for (const auto batch : {32*15*8, 12, 348989}) {
         for (const auto hotness : {1}) {
             for (const auto num_elements : {128}) {
-                for(const auto allocOnHost: {true, false}){
+                for (const auto allocOnHost: {true, false}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", batch, hotness, num_elements, allocOnHost?"host":"device");
                     this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost);
                 }
@@ -747,13 +747,13 @@ class EmbeddingCacheLookupSortGatherRefTest : public EmbeddingCacheRefTest<T> {
                            const IndexType* indices,    
                            const std::vector<IndexType>& /*cache_data*/) {
         NVE_DEBUG_PRINTF_("compute lookup reference results\n");
-        m_ref_result.resize(0);
-        ASSERT_TRUE(this->m_hotness == 1);
-        for (uint32_t b = 0; b < this->m_batch; b++) {
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
+        ref_result_.resize(0);
+        ASSERT_TRUE(this->hotness_ == 1);
+        for (uint32_t b = 0; b < this->batch_; b++) {
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
                 ElemType acc = 0;
-                acc = table[indices[b] * this->m_num_elements + el];
-                m_ref_result.push_back(acc);
+                acc = table[indices[b] * this->num_elements_ + el];
+                ref_result_.push_back(acc);
             }
         }
     }
@@ -761,22 +761,22 @@ class EmbeddingCacheLookupSortGatherRefTest : public EmbeddingCacheRefTest<T> {
     void LaunchKernel(const ElemType* table, 
                       const IndexType* indices,
                       CacheDataType& cache_data) {
-        m_result = std::make_shared<TestBuffer<ElemType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(ElemType));
+        result_ = std::make_shared<TestBuffer<ElemType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(ElemType));
         NVE_DEBUG_PRINTF_("launch sort gather lookup kernel\n");
 
         // first calc required aux size
         size_t bytes = 0;
         CHECK_CUDA_ERROR((nve::call_sort_gather<IndexType, IndexType>(
             reinterpret_cast<const int8_t*>(table), 
-            reinterpret_cast<int8_t*>(m_result->pd), 
+            reinterpret_cast<int8_t*>(result_->pd),
             indices, 
             nullptr, 
             bytes,
-            this->m_batch * this->m_hotness, 
-            this->m_num_elements * sizeof(ElemType), 
-            this->m_kernel_param,
+            this->batch_ * this->hotness_,
+            this->num_elements_ * sizeof(ElemType),
+            this->kernel_param_,
             cache_data, 
-            this->m_stream)));
+            this->stream_)));
         ASSERT_TRUE(bytes > 0 && bytes != static_cast<size_t>(-1));
 
         // alloc aux
@@ -786,15 +786,15 @@ class EmbeddingCacheLookupSortGatherRefTest : public EmbeddingCacheRefTest<T> {
         // launch kernel
         CHECK_CUDA_ERROR((nve::call_sort_gather<IndexType, IndexType>(
             reinterpret_cast<const int8_t*>(table), 
-            reinterpret_cast<int8_t*>(m_result->pd), 
+            reinterpret_cast<int8_t*>(result_->pd),
             indices, 
             aux, 
             bytes,
-            this->m_batch * this->m_hotness, 
-            this->m_num_elements * sizeof(ElemType), 
+            this->batch_ * this->hotness_,
+            this->num_elements_ * sizeof(ElemType),
             1024,
             cache_data, 
-            this->m_stream)));
+            this->stream_)));
 
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         //clean up
@@ -803,20 +803,20 @@ class EmbeddingCacheLookupSortGatherRefTest : public EmbeddingCacheRefTest<T> {
 
     void CheckResult() {
         NVE_DEBUG_PRINTF_("check lookup results\n");
-        m_result->DtoH(this->m_stream);
+        result_->DtoH(this->stream_);
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-        for (uint32_t j = 0; j < this->m_hotness * this->m_batch; j ++ ) {
-            for (uint32_t i = 0; i < this->m_num_elements; i++)
+        for (uint32_t j = 0; j < this->hotness_ * this->batch_; j ++ ) {
+            for (uint32_t i = 0; i < this->num_elements_; i++)
             {
-                auto ref_val = m_ref_result[j*this->m_num_elements + i];
-                auto test_val = m_result->ph[j*this->m_num_elements + i];
+                auto ref_val = ref_result_[j*this->num_elements_ + i];
+                auto test_val = result_->ph[j*this->num_elements_ + i];
                 ASSERT_FLOAT_EQ(ref_val, test_val);
             }
         }
     }
 
-    std::shared_ptr<TestBuffer<ElemType>> m_result = nullptr;
-    std::vector<ElemType> m_ref_result;
+    std::shared_ptr<TestBuffer<ElemType>> result_ = nullptr;
+    std::vector<ElemType> ref_result_;
 };
 
 TYPED_TEST_SUITE_P(EmbeddingCacheLookupSortGatherRefTest);
@@ -825,7 +825,7 @@ TYPED_TEST_P(EmbeddingCacheLookupSortGatherRefTest, TestSortGather) {
     for (const auto batch : {4096, 1, 33, 4097, 16*1024, 3*4096+1, 2*4096+1}) {
         for (const auto hotness : {1}) {
             for (const auto num_elements : {128, 1, 31}) {
-                for(const auto allocOnHost: {false}){
+                for (const auto allocOnHost: {false}){
                     for (const auto kernel_param : {1, 17, 32, 4096}) {
                         NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s kernel_param %d\n", batch, hotness, num_elements, allocOnHost?"host":"device", kernel_param);
                         this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost, kernel_param);
@@ -943,12 +943,12 @@ TEST(dedupgrad, dedupgrad)
     using DataType = float;
 
     const size_t embedding_size = 212;
-    const size_t m_num_rows = 1000000;
-    const size_t m_row_size = sizeof(DataType)*embedding_size;
+    const size_t num_rows = 1000000;
+    const size_t row_size = sizeof(DataType)*embedding_size;
     
-    const size_t m_batch = 512;
-    const size_t m_hotness = 4096;
-    const auto num_keys = m_batch * m_hotness;
+    const size_t batch = 512;
+    const size_t hotness = 4096;
+    const auto num_keys = batch * hotness;
     auto keys = std::make_shared<TestBuffer<IndexType>>(num_keys * sizeof(IndexType));
     auto unique_keys = std::make_shared<TestBuffer<IndexType>>(num_keys * sizeof(IndexType));
     // allocate an extra element for loc_map, because it is reused for counters, and the
@@ -957,36 +957,36 @@ TEST(dedupgrad, dedupgrad)
     IndexType* h_num_runs_out;
     auto inverse_buffer = std::make_shared<TestBuffer<IndexType>>(num_keys * sizeof(IndexType));
     auto offsets = std::make_shared<TestBuffer<IndexType>>((num_keys + 1) * sizeof(IndexType));
-    auto grads = std::make_shared<TestBuffer<DataType>>(num_keys * m_row_size);
-    auto unique_grads = std::make_shared<TestBuffer<DataType>>(num_keys * m_row_size);
-    auto ref = std::make_shared<TestBuffer<DataType>>(num_keys * m_row_size);
+    auto grads = std::make_shared<TestBuffer<DataType>>(num_keys * row_size);
+    auto unique_grads = std::make_shared<TestBuffer<DataType>>(num_keys * row_size);
+    auto ref = std::make_shared<TestBuffer<DataType>>(num_keys * row_size);
 
-    cudaStream_t m_stream;
-    CHECK_CUDA_ERROR(cudaStreamCreate(&m_stream));
+    cudaStream_t stream;
+    CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
     
     const float alpha = 1.05f;
-    auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(m_num_rows), m_hotness, 283982);
+    auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(num_rows), hotness, 283982);
     
     // make sure we have keys appearing more than SPLIT_LIMIT times
     // change approx half of batches to contain approx half identical keys
     std::mt19937 genr(0X753812);
     std::bernoulli_distribution distrib(0.5);
-    std::uniform_int_distribution<uint32_t> dist_index(0, m_hotness-1);
+    std::uniform_int_distribution<uint32_t> dist_index(0, hotness-1);
 
-    for (uint32_t b = 0; b < m_batch; b++)
+    for (uint32_t b = 0; b < batch; b++)
     {
         auto sample = sg->getCategoryIndices();
         if (distrib(genr)) {
             auto duplicate_idx = dist_index(genr);
             IndexType key_to_duplicate = sample[duplicate_idx];
-            for (uint32_t h = 0; h < m_hotness; h++) {
+            for (uint32_t h = 0; h < hotness; h++) {
                 if (distrib(genr)) sample[h] = key_to_duplicate;
             }
         }
-        std::copy(sample.begin(), sample.end(), keys->ph + b*m_hotness);
+        std::copy(sample.begin(), sample.end(), keys->ph + b*hotness);
     }
 
-    keys->HtoD(m_stream);
+    keys->HtoD(stream);
     
     constexpr int32_t MAX_RUN_SIZE = 1024;
     std::shared_ptr<nve::Deduper<IndexType, MAX_RUN_SIZE>> deduper_ = std::make_shared<nve::Deduper<IndexType, MAX_RUN_SIZE>>(nve::GetDefaultAllocator());
@@ -1000,17 +1000,17 @@ TEST(dedupgrad, dedupgrad)
 
     CHECK_CUDA_ERROR(cudaMallocHost(&h_num_runs_out, sizeof(IndexType) * 2));
 
-    memset(grads->ph, 0, grads->m_size);
+    memset(grads->ph, 0, grads->size_);
     std::uniform_real_distribution<float> dist_float(-1.0f, 1.0f);
     for (uint32_t i = 0; i < num_keys; i++) {
         for (uint32_t j = 0; j < embedding_size; j++) {
             (grads->ph)[i*embedding_size + j] = static_cast<DataType>(dist_float(genr));
         }
     }
-    grads->HtoD(m_stream);
+    grads->HtoD(stream);
 
-    memset(unique_grads->ph, 0, unique_grads->m_size);
-    unique_grads->HtoD(m_stream);
+    memset(unique_grads->ph, 0, unique_grads->size_);
+    unique_grads->HtoD(stream);
 
     deduper_->dedup(reinterpret_cast<const IndexType*>(keys->pd),
                     num_keys, unique_keys->pd, 
@@ -1019,8 +1019,8 @@ TEST(dedupgrad, dedupgrad)
                     h_num_runs_out, 
                     inverse_buffer->pd, 
                     offsets->pd,
-                    m_stream);
-    CHECK_CUDA_ERROR(cudaStreamSynchronize(m_stream));
+                    stream);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
     
     DedupGradients<IndexType>(reinterpret_cast<const void*>(grads->pd), (void*)unique_grads->pd, 
                     DataType_t::Float32,
@@ -1028,9 +1028,9 @@ TEST(dedupgrad, dedupgrad)
                     (MAX_RUN_SIZE == -1) ? nullptr : loc_map->pd,
                     offsets->pd,
                     inverse_buffer->pd,
-                    m_row_size,
+                    row_size,
                     h_num_runs_out,
-                    m_stream);
+                    stream);
 
     // calculate ref
     std::map<IndexType, DataType*> ref_grads;
@@ -1039,7 +1039,7 @@ TEST(dedupgrad, dedupgrad)
         auto key = keys->ph[i];
         if (ref_grads.count(key) == 0) {
             DataType* p = new DataType[embedding_size];
-            memset(p, 0, m_row_size);
+            memset(p, 0, row_size);
             ref_grads[key] = p;
         }
         auto ref_grad = ref_grads[key];
@@ -1049,11 +1049,11 @@ TEST(dedupgrad, dedupgrad)
     }
 
     // check results
-    unique_grads->DtoH(m_stream);
-    unique_keys->DtoH(m_stream);
-    inverse_buffer->DtoH(m_stream);
-    loc_map->DtoH(m_stream);
-    CHECK_CUDA_ERROR(cudaStreamSynchronize(m_stream));
+    unique_grads->DtoH(stream);
+    unique_keys->DtoH(stream);
+    inverse_buffer->DtoH(stream);
+    loc_map->DtoH(stream);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
     for (IndexType i = 0; i < h_num_runs_out[0]; i++) 
     {

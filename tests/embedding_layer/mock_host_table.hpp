@@ -66,7 +66,6 @@ class MockHostTable final : public HostTable<HostTableConfig> {
       return;
     }
     NVE_CHECK_(ctx != nullptr, "Invalid context");
-    constexpr auto mask_elements = sizeof(bitmask64_t) * 8;
     auto lookup_stream = ctx->get_lookup_stream();
     const void* keys_buf = keys ? keys->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
                                 : nullptr;
@@ -85,8 +84,8 @@ class MockHostTable final : public HostTable<HostTableConfig> {
     const uint64_t stride = static_cast<uint64_t>(value_stride);
     int64_t total_hits = 0;
     for (uint64_t i = 0; i < static_cast<uint64_t>(n); i++) {
-      const uint64_t bit = 1ul << (i % mask_elements);
-      if (hit_mask_buf && (hit_mask_buf[i / mask_elements] & bit)) {
+      const bitmask64_t bit{bitmask64::single(i % bitmask64::num_bits)};
+      if (hit_mask_buf && (hit_mask_buf[i / bitmask64::num_bits] & bit)) {
         continue;  // datavector was already hit before
       }
       auto* dst = reinterpret_cast<uint8_t*>(values_buf) + (i * stride);
@@ -96,7 +95,7 @@ class MockHostTable final : public HostTable<HostTableConfig> {
           total_hits++;
           std::memcpy(dst, it->second.data(), it->second.size());
           if (hit_mask_buf) {
-            hit_mask_buf[i / mask_elements] |= bit;
+            hit_mask_buf[i / bitmask64::num_bits] |= bit;
           }
           if (value_sizes_buf) {
             value_sizes_buf[i] = static_cast<int64_t>(it->second.size());
@@ -110,7 +109,7 @@ class MockHostTable final : public HostTable<HostTableConfig> {
         total_hits++;
         std::memset(dst, 0xDB, stride);
         if (hit_mask_buf) {
-          hit_mask_buf[i / mask_elements] |= bit;
+          hit_mask_buf[i / bitmask64::num_bits] |= bit;
         }
         if (value_sizes_buf) {
           value_sizes_buf[i] = value_stride;

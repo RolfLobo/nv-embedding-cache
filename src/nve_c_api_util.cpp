@@ -33,6 +33,15 @@ nve_status_t nve_version(int32_t* major, int32_t* minor, int32_t* patch) {
   return NVE_SUCCESS;
 }
 
+nve_status_t nve_abi_version(int32_t* major, int32_t* minor) {
+  if (!major || !minor) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "Output pointers must not be NULL");
+  }
+  *major = NVE_C_ABI_VERSION_MAJOR;
+  *minor = NVE_C_ABI_VERSION_MINOR;
+  return NVE_SUCCESS;
+}
+
 /* ============================================================================
  * Config defaults
  * ============================================================================ */

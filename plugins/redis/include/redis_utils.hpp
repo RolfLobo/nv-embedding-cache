@@ -24,7 +24,7 @@ namespace redis {
 namespace reply {
 
 /**
- * A Redis++ parser avoids materializing a string.
+ * A Redis++ parser that avoids materializing a string.
  *
  * WARNING: The pointer becomes invalid once reply has been consumed. Use only if you can
  * immediately consume/parse values like the iterators below.

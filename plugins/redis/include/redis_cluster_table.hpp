@@ -39,7 +39,7 @@ struct RedisClusterTableConfig final : public HostTableConfig {
   using base_type = HostTableConfig;
 
   int64_t max_batch_size{16'384};  // Maximum batch size to use for queries into the column family.
-                                   // Must be a multiple of `64`.
+                                   // Must be a multiple of `bitmask64::num_bits`.
 
   int64_t num_partitions{
       1};  // Either 0 or a power of 2.
@@ -114,7 +114,7 @@ class RedisClusterTable final : public HostTable<RedisClusterTableConfig> {
 
  private:
   template <bool WithValues, bool WithValueSizes>
-  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, char* hit_mask,
+  int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
                 int64_t value_stride, char* values, int64_t* value_sizes) const;
 
  private:

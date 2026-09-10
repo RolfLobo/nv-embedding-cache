@@ -345,7 +345,7 @@ uint64_t CUDADistributedBuffer::collect_devices(std::vector<int>& all_devices) {
   return num_devices;
 }
 
-} // namespace nve
+}  // namespace nve
 
 #else  // NVE_DRIVERLESS_BUILD
 
@@ -360,6 +360,6 @@ CUDADistributedBuffer::CUDADistributedBuffer(uint64_t, std::shared_ptr<Distribut
 
 CUDADistributedBuffer::~CUDADistributedBuffer() {}
 
-} // namespace nve
+}  // namespace nve
 
 #endif  // NVE_DRIVERLESS_BUILD

@@ -118,7 +118,7 @@ void CallPoolingKernelVecTypeSubwarp(
 {
     uint32_t bags_per_warp = 32 / SubwarpWidth;
     uint32_t bags_per_sm = bags_per_warp * 4;
-    dim3 grid_size ((num_bags + bags_per_sm - 1) / bags_per_sm, 1);
+    dim3 grid_size (nve::ceil_div(num_bags, bags_per_sm), 1);
     dim3 block_size (SubwarpWidth, bags_per_sm);
     EmbedPooling<SubwarpWidth, DataType><<<grid_size, block_size, 0, stream>>>(
         src, dst, num_elements, embed_src_stride, embed_dst_stride, hotness, num_bags);

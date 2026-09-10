@@ -88,7 +88,15 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
   std::vector<table_ptr_t> tables_;
   int32_t gpu_device_; // gpu device id or -1
 
+  // Either empty (auto-insert disabled) or one handler per table.
   std::vector<std::shared_ptr<AutoInsertHandler>> auto_insert_handlers_;
+
+  // Handler for table `i`, or null when auto-insert is disabled. Lets modify ops take a
+  // ScopedModifyLock unconditionally.
+  inline const std::shared_ptr<AutoInsertHandler>& handler_at(size_t i) const {
+    static const std::shared_ptr<AutoInsertHandler> none;
+    return auto_insert_handlers_.empty() ? none : auto_insert_handlers_.at(i);
+  }
 };
 
 }  // namespace nve

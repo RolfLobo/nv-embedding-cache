@@ -156,7 +156,7 @@ void call_compute_pooling_gradients(
     const uint32_t SubwarpWidth = 32;
     uint32_t keys_per_warp = 1;
     uint32_t keys_per_sm = keys_per_warp * WARPS_PER_SM;
-    dim3 grid_size (static_cast<uint32_t>((num_unique_keys + keys_per_sm - 1) / keys_per_sm), 1);
+    dim3 grid_size (static_cast<uint32_t>(ceil_div(num_unique_keys, static_cast<IndexType>(keys_per_sm))), 1);
     dim3 block_size (SubwarpWidth, keys_per_sm);
 
     if ((embedding_width % 4) == 0) {
@@ -260,7 +260,7 @@ public:
         if (pooling_type != nve::PoolingType_t::Concatenate) {
             const uint32_t WARPS_PER_SM = 4;
             const uint32_t SubwarpWidth = 32;
-            uint32_t grid_x = (batch + WARPS_PER_SM - 1) / WARPS_PER_SM;
+            uint32_t grid_x = ceil_div(batch, WARPS_PER_SM);
             dim3 grid_size (grid_x, 1);
             dim3 block_size (SubwarpWidth, WARPS_PER_SM);
 

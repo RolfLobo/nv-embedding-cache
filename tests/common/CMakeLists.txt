@@ -46,7 +46,7 @@ add_executable(serialization_test serialization_test.cpp)
 target_link_libraries(serialization_test PUBLIC gtest_main nve-common)
 
 # mpi_buffer_test links MPI directly; skip it in an MPI-less build where the dependency is removed.
-if(NOT NVE_DISABLE_MPI)
+if (NOT NVE_DISABLE_MPI)
   find_package(MPI REQUIRED)
   add_executable(mpi_buffer_test
     mpi_buffer_test.cpp

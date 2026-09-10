@@ -54,12 +54,15 @@ struct EmbedLayerConfig {
     int64_t kernel_mode_value_2 = 0;
     int64_t max_modify_size = 0; // means tables default
     int64_t default_row_index = -1; // Row returned for keys outside the table, negative disables the check
+    std::vector<uint8_t> default_embedding = {}; // Raw row bytes returned for keys missing from the
+                                                 // table (Host/Hierarchical layers). Empty implies
+                                                 // no default (misses undefined).
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EmbedLayerConfig,
     logging_interval, kernel_mode, kernel_mode_value_1, kernel_mode_value_2, max_modify_size,
-    default_row_index)
+    default_row_index, default_embedding)
 
 template<typename IndexT>
 class NVEmbedBinding
@@ -326,7 +329,10 @@ public:
         if (modify_stream_)
         {
             ScopedDevice scope_device(device_id_);
-            NVE_CHECK_(cudaStreamDestroy(modify_stream_));
+            const cudaError_t res = cudaStreamDestroy(modify_stream_);
+            if (!nve::cuda_runtime_unloading(res, "modify stream destroy")) {
+                NVE_CHECK_(res, "cudaStreamDestroy failed");
+            }
         }
     }
 
@@ -466,6 +472,7 @@ public:
             insert_heuristic_thresholds.push_back(0.f); // remote PS is typically updated externally instead of by the layer
         }
         typename layer_type::Config layer_cfg = {"ps_layer", std::make_shared<DefaultInsertHeuristic>(insert_heuristic_thresholds)};
+        layer_cfg.default_embedding = config.default_embedding;
         this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, tables, nullptr /* using default allocator for device 0*/);
     }
 
@@ -598,7 +605,7 @@ private:
         dlm_tensor->dl_tensor.ndim = 2;
         dlm_tensor->dl_tensor.dtype = {kDLFloat, value_size, 1};
         dlm_tensor->dl_tensor.shape = shape;
-        dlm_tensor->dl_tensor.strides = NULL;
+        dlm_tensor->dl_tensor.strides = nullptr;
         dlm_tensor->dl_tensor.byte_offset = 0;
        
         // Set the deleter function
@@ -752,6 +759,7 @@ public:
 
         typename layer_type::Config layer_cfg;
         layer_cfg.layer_name = "host_layer";
+        layer_cfg.default_embedding = config.default_embedding;
         this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, linear_host_tab,
                                                             /*allocator=*/nullptr);
     }
@@ -780,4 +788,4 @@ private:
     std::shared_ptr<MemBlock> mem_block_;
 };
 
-} // namespace nve
+}  // namespace nve

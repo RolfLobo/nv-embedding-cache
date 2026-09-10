@@ -27,7 +27,7 @@ struct RocksDBTableConfig final : public HostTableConfig {
   using base_type = HostTableConfig;
 
   int64_t max_batch_size{16'384};  // Maximum batch size to use for queries into the column family.
-                                   // Must be a multiple of `64`.
+                                   // Must be a multiple of `bitmask64::num_bits`.
 
   std::string column_family{rocksdb::kDefaultColumnFamilyName};
   bool verify_checksums{true};  // Toggle to `false` turn off checksum verifications.
@@ -76,8 +76,8 @@ class RocksDBTable final : public HostTable<RocksDBTableConfig> {
                          buffer_ptr<const void> updates, DataType_t update_dtype) override;
 
  private:
-  template <bool HasValues, bool HasValueSizes>
-  int64_t find_(int64_t n, const char* keys, char* hit_mask,
+  template <bool WithValues, bool WithValueSizes>
+  int64_t find_(int64_t n, const char* keys, bitmask64_t* hit_mask,
                 int64_t value_stride, char* values, int64_t* value_sizes) const;
 
  private:
@@ -94,7 +94,9 @@ struct RocksDBTableFactoryConfig final : public HostTableFactoryConfig {
   bool read_only{false};  // If \p true will open the database in read-only mode. Obviously, all
                           // write operations will fail. But it allows you querying the same RocksDB
                           // database from multiple clients.
-  int64_t num_threads{16};  // Number of threads that the RocksDB instance may use.
+  int64_t num_threads{16};  // Number of threads that the RocksDB instance may use. The threadpool is
+                            // shared process-wide across all RocksDB databases. Conflicting settings
+                            // will result in the last applied setting being used.
 
   void check() const;
 };

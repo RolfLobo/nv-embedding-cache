@@ -125,7 +125,7 @@ void CallGradientDedupKernelVecTypeSubwarp(
     const uint32_t WARPS_PER_SM = 4;
     uint32_t keys_per_warp = 32 / SubwarpWidth;
     uint32_t keys_per_sm = keys_per_warp * WARPS_PER_SM;
-    dim3 grid_size (static_cast<uint32_t>((num_unique_keys + keys_per_sm - 1) / keys_per_sm), 1);
+    dim3 grid_size (static_cast<uint32_t>(nve::ceil_div<uint64_t>(num_unique_keys, keys_per_sm)), 1);
     dim3 block_size (SubwarpWidth, keys_per_sm);
     GradientDedup<SubwarpWidth, DataType, IndexType><<<grid_size, block_size, 0, stream>>>(
         src, dst, unique_keys, inverse_buffer, dst_loc_map, key_offsets,

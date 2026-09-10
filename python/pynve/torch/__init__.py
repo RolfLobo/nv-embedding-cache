@@ -47,5 +47,8 @@ if HAS_TORCH_OPS:
     @torch.library.register_fake("nve_ops::embedding_lookup_with_pooling")
     def _embedding_lookup_with_pooling_fake(
             marker, keys, offsets, weights, pooling_type, embedding_size, dtype):
+        torch._check(offsets.size(0) >= 2,
+                     lambda: "offsets must have at least two entries (num_bags + 1, "
+                             "include_last_offset=True convention)")
         return offsets.new_empty(
             (offsets.size(0) - 1, embedding_size), dtype=_fake_out_dtype(dtype))

@@ -77,11 +77,26 @@ std::vector<cudaStream_t> ExecutionContext::snapshot_aux_streams() {
 }
 
 void ExecutionContext::wait() {
-  if (driver_available_) {
-    NVE_CHECK_(cudaStreamSynchronize(lookup_stream_));
-    NVE_CHECK_(cudaStreamSynchronize(modify_stream_));
-    for (auto stream : snapshot_aux_streams()) {
-      NVE_CHECK_(cudaStreamSynchronize(stream));
+  if (!driver_available_) {
+    return;
+  }
+  // wait() runs in destructor chains at process exit, when the CUDA runtime may
+  // already be unloading: nothing is left to wait for, and a throw here would
+  // terminate() out of the owning layer's destructor.
+  const auto sync = [](cudaStream_t stream) {
+    const cudaError_t res = cudaStreamSynchronize(stream);
+    if (cuda_runtime_unloading(res, "stream sync")) {
+      return false;
+    }
+    NVE_CHECK_(res, "cudaStreamSynchronize failed");
+    return true;
+  };
+  if (!sync(lookup_stream_) || !sync(modify_stream_)) {
+    return;
+  }
+  for (auto stream : snapshot_aux_streams()) {
+    if (!sync(stream)) {
+      return;
     }
   }
 }
@@ -112,7 +127,11 @@ ExecutionContext::~ExecutionContext() {
   // calls would fail anyway — skip them during teardown.
   if (driver_available_) {
     for (auto stream : snapshot_aux_streams()) {
-      NVE_CHECK_(cudaStreamDestroy(stream));
+      const cudaError_t res = cudaStreamDestroy(stream);
+      if (cuda_runtime_unloading(res, "aux stream destroy")) {
+        break;
+      }
+      NVE_CHECK_(res, "cudaStreamDestroy failed");
     }
   }
 }

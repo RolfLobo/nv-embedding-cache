@@ -43,7 +43,7 @@ __global__ void compute_split_counts(const IndexType* __restrict__ key_counts,
 {
     const int key_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (key_id < num_unique_keys) {
-        num_split_chunks[key_id] = (key_counts[key_id] + SPLIT_SIZE - 1) / SPLIT_SIZE;
+        num_split_chunks[key_id] = ceil_div(key_counts[key_id], static_cast<IndexType>(SPLIT_SIZE));
     }
 }
 
@@ -51,7 +51,7 @@ template<typename IndexT, int SPLIT_SIZE = 1024>
 void call_compute_split_counts(const IndexT* key_counts, IndexT* num_split_chunks, uint64_t num_counts, cudaStream_t stream)
 {
     const uint32_t THREADS_PER_SM = 128;
-    dim3 grid_size (static_cast<uint32_t>((num_counts + THREADS_PER_SM - 1) / THREADS_PER_SM), 1);
+    dim3 grid_size (static_cast<uint32_t>(ceil_div<uint64_t>(num_counts, THREADS_PER_SM)), 1);
     dim3 block_size (THREADS_PER_SM, 1);
     compute_split_counts<IndexT, SPLIT_SIZE><<<grid_size, block_size, 0, stream>>>(key_counts, num_split_chunks, num_counts);
     NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error
@@ -89,7 +89,7 @@ void call_compute_location_mapping(const IndexT* chunk_counts,
                                    uint64_t num_counts, cudaStream_t stream)
 {
     const uint32_t WARPS_PER_SM = 4;
-    dim3 grid_size (static_cast<uint32_t>((num_counts + WARPS_PER_SM - 1) / WARPS_PER_SM), 1);
+    dim3 grid_size (static_cast<uint32_t>(ceil_div<uint64_t>(num_counts, WARPS_PER_SM)), 1);
     dim3 block_size (32, WARPS_PER_SM);
     compute_location_mapping<IndexT, SPLIT_SIZE><<<grid_size, block_size, 0, stream>>>(
         chunk_counts, chunk_offsets, key_offsets, output_location_mapping, split_key_offsets, num_counts);
@@ -313,23 +313,23 @@ public:
 private:
     nve::allocator_ptr_t allocator_;
 
-    size_t   temp_storage_bytes_sort_ = 0;
-    size_t   temp_storage_bytes_encode_ = 0;
-    size_t   temp_storage_bytes_ex_sum_ = 0;
+    size_t temp_storage_bytes_sort_ = 0;
+    size_t temp_storage_bytes_encode_ = 0;
+    size_t temp_storage_bytes_ex_sum_ = 0;
 
-    void     *d_temp_storage_sort_ = nullptr;
-    void     *d_temp_storage_encode_ = nullptr;
-    void     *d_temp_storage_ex_sum_ = nullptr;
+    void* d_temp_storage_sort_ = nullptr;
+    void* d_temp_storage_encode_ = nullptr;
+    void* d_temp_storage_ex_sum_ = nullptr;
 
     uint64_t init_num_keys_ = 0; // num_keys the buffers were sized/seeded for in set_and_init_buffers
 
-    IndexT   *d_location_buffer_ = nullptr; // [1, 2, ..., ] helper buffer to build the reverse map
-    IndexT   *h_location_buffer_ = nullptr;
-    IndexT   *d_sorted_buffer_ = nullptr; // holds the sorted output
-    IndexT   *d_num_runs_out_ = nullptr;    // e.g., [ ]
-    IndexT   *d_split_count_buffer_ = nullptr;
-    IndexT   *d_tmp_offset_buffer_ = nullptr;
-    IndexT   *d_split_offset_buffer_ = nullptr;
+    IndexT* d_location_buffer_ = nullptr; // [1, 2, ..., ] helper buffer to build the reverse map
+    IndexT* h_location_buffer_ = nullptr;
+    IndexT* d_sorted_buffer_ = nullptr; // holds the sorted output
+    IndexT* d_num_runs_out_ = nullptr;    // e.g., [ ]
+    IndexT* d_split_count_buffer_ = nullptr;
+    IndexT* d_tmp_offset_buffer_ = nullptr;
+    IndexT* d_split_offset_buffer_ = nullptr;
 };
 
 }  // namespace nve

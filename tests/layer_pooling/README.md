@@ -7,12 +7,15 @@
 Each generated case drives a real layer's `lookup()` with `PoolingParams` and compares the result,
 element-by-element, against the reference reduction of the same data. The matrix is the cartesian
 product of the dimensions below, classified by `Classify()` in
-[`layer_pooling_harness.hpp`](layer_pooling_harness.hpp) into **Enabled** (runs, must pass),
-**Disabled** (a real but currently-unsupported combination — compiled and listed, skipped by
-default), or dropped (degenerate / not a meaningful combination).
+[`layer_pooling_harness.hpp`](layer_pooling_harness.hpp) into **Enabled** (runs, must match the
+reference), **Rejected** (a real but currently-unsupported combination — runs, and the layer must
+refuse it with an `InvalidArgumentError`), or dropped (degenerate / not a meaningful combination).
+
+Rejected cases are *not* skipped: a tracked gap that silently starts returning a wrong result
+instead of throwing is a regression, so the refusal itself is asserted.
 
 `Classify()` is the single source of truth; this document is its prose companion. When support for a
-gap lands, flip the relevant branch in `Classify()` from `Disabled` to `Enabled` and update the
+gap lands, flip the relevant branch in `Classify()` from `Rejected` to `Enabled` and update the
 counts here.
 
 ## Dimensions
@@ -32,39 +35,42 @@ stress: `value_count = 64`, `hotness = 8`, `num_keys = 1024`, `num_rows = 65536`
 
 ## Support matrix (current)
 
-Generated matrix totals: **1048 enabled**, **336 disabled** (1384 generated enabled/disabled
-cases), plus two standalone validation tests covering required output type and metadata-free
-`Concatenate` validation.
+Generated matrix totals: **1160 enabled**, **336 rejection** (1496 generated cases), plus seven
+standalone validation tests (`LayerPoolingValidationTest`) covering required output type, malformed
+`PoolingParams`, metadata-free `Concatenate`, output-row layout, empty CSR bags, and padded output
+strides. 1503 tests in total; none are gtest-disabled.
 The `HierWithoutGPU` cases require the optional PHMap plugin and are skipped when that feature is not
 enabled; building `layer_pooling_test` also builds the plugin when it is available.
 
-| Layer | Enabled | Disabled | What works | Known gaps (disabled) |
+| Layer | Enabled | Rejection | What works | Known gaps (rejection cases) |
 |---|--:|--:|---|---|
 | **GPU** | 152 | 112 | `Float32`/`Float16` input through cuEmbed (output and weight dtype match input); matching-precision quant dequant (`Q*RowwiseF32→Float32`, `Q*RowwiseF16→Float16`) through the gathered-row CUDA path with either float weight dtype; all pooling modes, `Fixed` + `CSR`, and int64 + int32 keys/offsets | • Cross-precision quant output is not implemented by the CUDA dequant kernels. |
 | **LinearUVM** | 168 | 112 | `Float32`/`Float16` (output == input, **any float weight dtype**); quant input dequantized to its scale precision (`Q*RowwiseF32→Float32`, `Q*RowwiseF16→Float16`) with **any float weight dtype**; all pooling modes; `Fixed` + `CSR`; int64 + int32 | • Cross-precision quant output (e.g. `QInt8RowwiseF32 → Float16`) — the GPU dequant/combine kernels emit only the scale's float precision. |
 | **HierWithGPU** | 168 | 112 | Same dtype/pooling support as LinearUVM; the hierarchy has a GPU cache tier followed by a full `LinearHostTable` backing tier | Same cross-precision output gap as LinearUVM. |
-| **Host** | 280 | 0 | All generated cases: all inputs, **any** `Float32`/`Float16` output including cross-precision, **any float weight dtype**, all pooling modes, both sparse markers, both key types | — |
-| **HierWithoutGPU** | 280 | 0 | Same generated-case support as Host via the shared CPU pool/dequant path; a bounded PHMap cache is followed by a full `LinearHostTable` backing tier | — |
+| **Host** | 336 | 0 | All generated cases: all inputs, **any** `Float32`/`Float16` output — including quant cross-precision **and** float→float casts (`Float32`→`Float16` and back), **any float weight dtype**, all pooling modes, both sparse markers, both key types | — |
+| **HierWithoutGPU** | 336 | 0 | Same generated-case support as Host via the shared CPU pool/dequant path; a bounded PHMap cache is followed by a full `LinearHostTable` backing tier | — |
 
-### Disabled groups (gtest instantiation → reason)
+### Rejection groups (gtest instantiation → reason)
 
-| Instantiation | Count | Reason |
-|---|--:|---|
-| `DISABLED_GPU/*` | 112 | Cross-precision quant-output cases |
-| `DISABLED_LinearUVM/*` | 112 | UVM dequant kernels emit only the scale's float precision (no cross-precision output) |
-| `DISABLED_HierWithGPU/*` | 112 | Same as LinearUVM |
+These run under `LayerPoolingRejectionTest.LookupRejectsUnsupportedCombo`, which asserts the layer
+throws `InvalidArgumentError` instead of producing output.
 
-Running the disabled groups (`--gtest_also_run_disabled_tests`) is expected to **fail**: GPU
-cross-precision requests throw clear errors; the UVM/HierWithGPU cross-precision gaps produce a
-value mismatch. They never abort the process.
+| Instantiation | Count | Reason | Error |
+|---|--:|---|---|
+| `Rejected_GPU/*` | 112 | Cross-precision quant-output cases | `Quantized GPU embedding output type must match the quantization metadata precision` |
+| `Rejected_LinearUVM/*` | 112 | UVM dequant kernels emit only the scale's float precision (no cross-precision output) | `Unsupported find_and_pool value/output type combination: ...` |
+| `Rejected_HierWithGPU/*` | 112 | Same as LinearUVM | Same as LinearUVM |
 
 ### Excluded (degenerate) combinations — not generated
 
-These are not capability gaps; they are not meaningful combinations, so they are dropped rather than
-disabled:
+These are not capability gaps; they are not meaningful combinations, so they are dropped rather
+than tracked as rejection cases:
 
-- **Non-quant input with `output != input`** — there is no dequantization for float inputs, so the
-  output dtype always equals the input dtype (no float→float cast dimension).
+- **Non-quant input with `output != input`, on the GPU-backed layers only** — the CUDA
+  pool/dequant kernels have no float→float cast, so `GPU`/`LinearUVM`/`HierWithGPU` always emit the
+  input dtype. The CPU pooling path dispatches its output dtype independently of the input
+  (`cpu_kernel_pooling_dispatch_out`), so `Host`/`HierWithoutGPU` **do** generate these cases
+  (`Float32`→`Float16` and back) and they are enabled.
 - **GPU weighted pooling with `weight_dtype != input_dtype`** — cuEmbed requires matching value and
   weight types, so these cases are dropped as unsupported.
 
@@ -76,18 +82,21 @@ keys vector plus `output_type`; this also verifies the GPU layer's metadata-free
 
 The two orthogonal features under test are **pooling** (pooling mode ≠ `Concatenate`) and **dequant**
 (quantized input dtype). The four combinations, per layer (counts are **enabled** cases that run and
-verify; a parenthetical is **disabled** cases — a tracked gap that does not run):
+verify against the reference; a parenthetical is **rejection** cases — a tracked gap that runs and
+must throw):
 
 | Layer | 1. pooling, no dequant | 2. pooling + dequant | 3. no pooling, no dequant | 4. no pooling + dequant |
 |---|---|---|---|---|
-| **GPU** | ✅ 32 | ✅ 96 (+96 disabled) | ✅ 8 | ✅ 16 (+16 disabled) |
-| **LinearUVM** | ✅ 48 | ✅ 96 (+96 disabled) | ✅ 8 | ✅ 16 (+16 disabled) |
-| **HierWithGPU** | ✅ 48 | ✅ 96 (+96 disabled) | ✅ 8 | ✅ 16 (+16 disabled) |
-| **Host** | ✅ 48 | ✅ 192 | ✅ 8 | ✅ 32 |
-| **HierWithoutGPU** | ✅ 48 | ✅ 192 | ✅ 8 | ✅ 32 |
+| **GPU** | ✅ 32 | ✅ 96 (+96 rejection) | ✅ 8 | ✅ 16 (+16 rejection) |
+| **LinearUVM** | ✅ 48 | ✅ 96 (+96 rejection) | ✅ 8 | ✅ 16 (+16 rejection) |
+| **HierWithGPU** | ✅ 48 | ✅ 96 (+96 rejection) | ✅ 8 | ✅ 16 (+16 rejection) |
+| **Host** | ✅ 96 | ✅ 192 | ✅ 16 | ✅ 32 |
+| **HierWithoutGPU** | ✅ 96 | ✅ 192 | ✅ 16 | ✅ 32 |
 
 - **LinearUVM / HierWithGPU / Host / HierWithoutGPU** cover all four quadrants with enabled tests.
-- **GPU / LinearUVM / HierWithGPU** use the CUDA dequant kernels. Their disabled counts in quadrants
+- **Host / HierWithoutGPU** quadrants 1 and 3 are twice the GPU-backed counts because the CPU path
+  also casts float→float (`Float32`→`Float16` and back), which the CUDA kernels cannot.
+- **GPU / LinearUVM / HierWithGPU** use the CUDA dequant kernels. Their rejection counts in quadrants
   2 and 4 are the **cross-precision** quant cases (e.g. `QInt8RowwiseF32 → Float16`); matching-
   precision dequant is enabled. The GPU layer first gathers complete raw quantized rows, then uses
   the same gathered-row CUDA path as a GPU-backed hierarchy.
@@ -126,12 +135,11 @@ Built into `build_release` (configure once if needed, then):
 ```bash
 cmake --build build_release --target layer_pooling_test -j
 
-# All enabled tests (1048 generated matrix cases + 2 validation tests):
+# Everything (1160 generated matrix cases + 336 rejection cases + 7 validation tests):
 ./build_release/bin/layer_pooling_test
 
-# Enumerate cases (enabled), or all incl. disabled:
+# Enumerate cases:
 ./build_release/bin/layer_pooling_test --gtest_list_tests
-./build_release/bin/layer_pooling_test --gtest_also_run_disabled_tests --gtest_list_tests
 
 # One case:
 ./build_release/bin/layer_pooling_test \
@@ -144,15 +152,15 @@ compute-sanitizer ./build_release/bin/layer_pooling_test --gtest_filter='LinearU
 # Balanced sharding across N processes (no ctest needed):
 GTEST_TOTAL_SHARDS=4 GTEST_SHARD_INDEX=0 ./build_release/bin/layer_pooling_test
 
-# Track the known gaps (expected to fail until the feature lands):
-./build_release/bin/layer_pooling_test --gtest_also_run_disabled_tests --gtest_filter='DISABLED_*'
+# Just the known gaps (each must throw; these pass until the feature lands):
+./build_release/bin/layer_pooling_test --gtest_filter='Rejected_*'
 ```
 
 ## Extending the matrix
 
 1. Add a value to the relevant dimension array in `GenerateCases()`.
-2. Encode its support in `Classify()` (`Enabled` / `Disabled` / drop) and, for a new gap, a line in
-   `DisabledReason()`.
+2. Encode its support in `Classify()` (`Enabled` / `Rejected` / drop) and, for a new gap, a line in
+   `RejectionReason()`.
 3. Update the counts and rows in this document.
 
 Promoting a gap after its underlying implementation lands is a one-line change in `Classify()`.

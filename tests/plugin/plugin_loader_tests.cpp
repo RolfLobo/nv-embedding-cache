@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <bit_ops.hpp>
 #include <buffer_wrapper.hpp>
 #include <cstdint>
 #include <cstring>
@@ -159,7 +160,7 @@ TEST(plugin_loader, external_data_ops_roundtrip) {
                 wrap_const(ctx, "vals", values.data(), values.size() * sizeof(float)));
 
   std::vector<float> out(values.size(), -1.0f);
-  std::vector<uint64_t> mask((n + 63) / 64, 0);
+  std::vector<uint64_t> mask(nve::ceil_div(n, static_cast<int64_t>(64)), 0);
   std::vector<int64_t> sizes(n, 0);
   auto out_buf = std::make_shared<BufferWrapper<void>>(ctx, "out", out.data(),
                                                        out.size() * sizeof(float));
@@ -423,7 +424,7 @@ TEST(plugin_loader, external_worker_task_status_through_barrier) {
   auto ctx = table->create_execution_context(0, 0, nullptr, nullptr);
   constexpr int64_t n = 130;  // three mask words -> three tasks
   std::vector<int64_t> keys(n, 5);
-  std::vector<uint64_t> mask((n + 63) / 64, 0);
+  std::vector<uint64_t> mask(nve::ceil_div(n, static_cast<int64_t>(64)), 0);
   auto keys_buf = wrap_const(ctx, "keys", keys.data(), n * sizeof(int64_t));
   auto mask_buf = std::make_shared<BufferWrapper<bitmask64_t>>(
       ctx, "mask", mask.data(), mask.size() * sizeof(uint64_t));

@@ -22,25 +22,20 @@
 #include <memory>
 #include <vector>
 
+#include <allocator.hpp>
 #include <buffer_wrapper.hpp>
 #include <execution_context.hpp>
+#include <resizeable_buffer.hpp>
 #include <host_table.hpp>
 #include <plugin/plugin_loader.hpp>
 
+#include "cuda_ptr.hpp"
 #include "test_utils.hpp"
 
 using namespace nve;
 using namespace nlohmann::literals;
 
 namespace {
-
-// Own the CUDA allocations so a failing ASSERT (which returns from the test
-// body) cannot leak them. Tests that assert on the free status call the CUDA
-// API directly on .release() instead.
-template <typename T>
-using DevicePtr = std::unique_ptr<T, decltype(&cudaFree)>;
-template <typename T>
-using PinnedPtr = std::unique_ptr<T, decltype(&cudaFreeHost)>;
 
 // A minimal fixture that owns an always-available stl-map host table just to source an
 // ExecutionContext for BufferWrapper construction. BufferWrapper's behavior is independent
@@ -57,7 +52,61 @@ class BufferWrapperTest : public ::testing::Test {
   context_ptr_t ctx_;
 };
 
+// Host-only allocator that fails every allocation after the first `max_allocs` and records the
+// frees, to check how ResizeableBuffer behaves when growing fails.
+class FlakyAllocator final : public Allocator {
+ public:
+  explicit FlakyAllocator(int max_allocs) : max_allocs_(max_allocs) {}
+  cudaError_t device_allocate(void** ptr, size_t sz, int = -1) noexcept override { return allocate(ptr, sz); }
+  cudaError_t device_free(void* ptr, int = -1) noexcept override { return release(ptr); }
+  cudaError_t host_allocate(void** ptr, size_t sz) noexcept override { return allocate(ptr, sz); }
+  cudaError_t host_free(void* ptr) noexcept override { return release(ptr); }
+
+  int allocs{0};
+  std::vector<void*> freed;
+
+ private:
+  cudaError_t allocate(void** ptr, size_t sz) noexcept {
+    if (allocs >= max_allocs_) {
+      return cudaErrorMemoryAllocation;
+    }
+    *ptr = std::malloc(sz);
+    if (*ptr == nullptr) {
+      return cudaErrorMemoryAllocation;
+    }
+    allocs++;
+    return cudaSuccess;
+  }
+  cudaError_t release(void* ptr) noexcept {
+    freed.push_back(ptr);
+    std::free(ptr);
+    return cudaSuccess;
+  }
+  const int max_allocs_;
+};
+
 }  // namespace
+
+// ---- ResizeableBuffer ----
+
+// Growing frees the old buffer before allocating the new one. When that allocation fails, the old
+// pointer must not be freed a second time by the destructor.
+TEST(ResizeableBuffer, FailedGrowthDoesNotDoubleFree) {
+  auto flaky = std::make_shared<FlakyAllocator>(1);
+  allocator_ptr_t allocator = flaky;
+  void* first = nullptr;
+  {
+    ResizeableBuffer buf(allocator, true /*host_alloc*/);
+    first = buf.get_ptr(64);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(buf.get_size(), 64u);
+    EXPECT_THROW(buf.get_ptr(128), std::exception);  // the second allocation fails
+    EXPECT_EQ(buf.get_size(), 0u);
+    EXPECT_EQ(buf.get_ptr(0), nullptr);
+  }
+  ASSERT_EQ(flaky->freed.size(), 1u) << "the old buffer must be freed exactly once";
+  EXPECT_EQ(flaky->freed.front(), first);
+}
 
 // ---- BufferWrapper ----
 
@@ -128,7 +177,7 @@ TEST_F(BufferWrapperTest, ConstructFromPinnedHostBuffer) {
   constexpr size_t n = 8;
   constexpr size_t bytes = n * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMallocHost(&pinned, bytes));
-  PinnedPtr<void> pinned_owner(pinned, cudaFreeHost);
+  HostPtr<void> pinned_owner(pinned);
   auto* p = static_cast<int32_t*>(pinned);
   std::fill(p, p + n, 5);
   {
@@ -145,7 +194,7 @@ TEST_F(BufferWrapperTest, ConstructFromDeviceBuffer) {
   void* dev = nullptr;
   constexpr size_t bytes = 8 * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMalloc(&dev, bytes));
-  DevicePtr<void> dev_owner(dev, cudaFree);
+  DevicePtr<void> dev_owner(dev);
   {
     BufferWrapper<int32_t> wrap(ctx_, "buf", static_cast<int32_t*>(dev), bytes);
     EXPECT_EQ(wrap.get_last_access(), cudaMemoryTypeDevice);
@@ -161,7 +210,7 @@ TEST_F(BufferWrapperTest, ConstructFromManagedBuffer) {
   constexpr size_t n = 8;
   constexpr size_t bytes = n * sizeof(int32_t);
   ASSERT_EQ(cudaSuccess, cudaMallocManaged(&managed, bytes));
-  DevicePtr<void> managed_owner(managed, cudaFree);
+  DevicePtr<void> managed_owner(managed);
   auto* p = static_cast<int32_t*>(managed);
   std::fill(p, p + n, 13);
   {
@@ -182,7 +231,7 @@ TEST_F(BufferWrapperTest, UnregisteredAccessAliasesHostAllocation) {
   // Start from a device buffer so unregistered is a *new* type that needs allocation.
   void* dev = nullptr;
   ASSERT_EQ(cudaSuccess, cudaMalloc(&dev, bytes));
-  DevicePtr<void> dev_owner(dev, cudaFree);
+  DevicePtr<void> dev_owner(dev);
   ASSERT_EQ(cudaSuccess, cudaMemcpy(dev, data.data(), bytes, cudaMemcpyHostToDevice));
   {
     BufferWrapper<int32_t> wrap(ctx_, "buf", static_cast<int32_t*>(dev), bytes);

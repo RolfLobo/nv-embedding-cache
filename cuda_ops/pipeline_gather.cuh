@@ -61,7 +61,7 @@ inline void CallPipelineScatterInner(const FindOutput* out_buff,
 {
     dim3 block_size(32, 4);
     auto indices_per_block = (32 / SubwarpWidth) * block_size.y;
-    dim3 grid_size ((static_cast<uint32_t>(num_indices) + indices_per_block - 1) / indices_per_block, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_indices), indices_per_block), 1);
     // Kernel launch is checked in CallPipelineScatter()
     // coverity[CUDA.ERROR_KERNEL_LAUNCH]
     EmbedPipelineScatter<SubwarpWidth, DataType><<<grid_size, block_size, 0, stream>>>(
@@ -112,7 +112,7 @@ cudaError_t launchGpuGatherKernel(const FindOutput* d_sorted_find_output,
     dim3 gather_block_dims(32, block_y);
     const auto num_keys_per_block_gather = num_keys_per_y*block_y;
     constexpr auto unroll = 8;
-    dim3 gather_grid_dims(static_cast<uint32_t>((num_keys_for_gather + num_keys_per_block_gather - 1)/num_keys_per_block_gather));
+    dim3 gather_grid_dims(static_cast<uint32_t>(ceil_div(num_keys_for_gather, static_cast<uint64_t>(num_keys_per_block_gather))));
     
     if (row_size_in_bytes % 16 == 0)
     {
@@ -217,10 +217,10 @@ void executeCpuGatherPhase(std::shared_ptr<nve::ExecutionContext> ctx,
     }
     constexpr auto vec_size = 1;
     const uint64_t num_threads = ctx->get_thread_pool()->num_workers();
-    uint64_t min_task_size = ((n + num_threads - 1) / num_threads);
-    min_task_size = ((min_task_size + vec_size - 1) / vec_size) * vec_size; // round up to a multiple of vec_size
+    uint64_t min_task_size = ceil_div(n, num_threads);
+    min_task_size = round_up(min_task_size, static_cast<uint64_t>(vec_size)); // round up to a multiple of vec_size
     auto keys_per_task = (params.task_size == 0) ? min_task_size : std::min(params.task_size, min_task_size);
-    uint64_t num_tasks = (n + keys_per_task - 1) / keys_per_task;
+    uint64_t num_tasks = ceil_div(n, keys_per_task);
     const bool bDoScatterInThread = (params.num_aux_streams != 0);
     const auto gather_task = [=, &aux_streams] (const size_t idx) {
         ScopedDevice scope_device(device_id);
@@ -285,7 +285,11 @@ void gather_flow_pipeline(std::shared_ptr<nve::ExecutionContext> ctx,
               int device_id,
               GatherKernelPipelineParams params)
 {
-    auto cache_data = cache_ptr->get_cache_data(lookup_handle); 
+    if (n == 0) {
+      return;
+    }
+
+    auto cache_data = cache_ptr->get_cache_data(lookup_handle);
     auto aux_streams = ctx->get_aux_streams("gather_kernel_aux_streams", std::max(params.num_aux_streams, 1lu));
     
     //////////////////////////////////////////////////////////////////////////////////////////////
@@ -311,14 +315,21 @@ void gather_flow_pipeline(std::shared_ptr<nve::ExecutionContext> ctx,
 
     std::vector<cudaEvent_t> events;
 
-    d_sort_key_buf = (SortKeyType*)ctx->get_buffer("d_gather_kernel_sort_key_buf", sortKeyBytes, false);
-    d_sort_key_sorted_buf = (SortKeyType*)ctx->get_buffer("d_gather_kernel_sorted_key_buf", sortKeySortedBytes, false);
-    d_find_output = (FindOutput*)ctx->get_buffer("d_gather_kernel_find_output", find_bytes, false);
-    d_sorted_find_output = (FindOutput*)ctx->get_buffer("d_gather_kernel_sorted_find_output", findSortedBytes, false);
-    h_sorted_find_output = (FindOutput*)ctx->get_buffer("h_gather_kernel_sorted_find_output", findSortedBytes, true);
-    d_cub_aux_buf = (int8_t*)ctx->get_buffer("d_gather_kernel_cub_aux_buf", cub_aux_bytes, false);
+    d_sort_key_buf = (SortKeyType*)ctx->get_buffer(
+        "d_gather_kernel_sort_key_buf", sortKeyBytes, false /*host_alloc*/);
+    d_sort_key_sorted_buf = (SortKeyType*)ctx->get_buffer(
+        "d_gather_kernel_sorted_key_buf", sortKeySortedBytes, false /*host_alloc*/);
+    d_find_output = (FindOutput*)ctx->get_buffer(
+        "d_gather_kernel_find_output", find_bytes, false /*host_alloc*/);
+    d_sorted_find_output = (FindOutput*)ctx->get_buffer(
+        "d_gather_kernel_sorted_find_output", findSortedBytes, false /*host_alloc*/);
+    h_sorted_find_output = (FindOutput*)ctx->get_buffer(
+        "h_gather_kernel_sorted_find_output", findSortedBytes, true /*host_alloc*/);
+    d_cub_aux_buf = (int8_t*)ctx->get_buffer(
+        "d_gather_kernel_cub_aux_buf", cub_aux_bytes, false /*host_alloc*/);
     
-    h_values = (int8_t*)ctx->get_buffer("h_values", n * row_size_in_bytes, true);
+    h_values = (int8_t*)ctx->get_buffer(
+        "h_values", n * row_size_in_bytes, true /*host_alloc*/);
     
     cudaEvent_t event_misses;
     cudaEvent_t event_sort;
@@ -338,54 +349,58 @@ void gather_flow_pipeline(std::shared_ptr<nve::ExecutionContext> ctx,
     // find phase (calculate misses)
     int64_t prev_misses = 0;
     int64_t curr_misses = 0;
-    cudaMemcpyAsync(&prev_misses, cache_data.misses, sizeof(int64_t), cudaMemcpyDefault, stream);
-    constexpr auto num_keys_per_block = 32*2;
+    NVE_CHECK_(cudaMemcpyAsync(&prev_misses, cache_data.misses, sizeof(int64_t), cudaMemcpyDefault, stream));
+    constexpr uint64_t num_keys_per_block = 32*2;
     dim3 blockDims(32, 2);
-    dim3 gridDims(static_cast<uint32_t>((n + num_keys_per_block - 1)/num_keys_per_block));
-    cache_ptr->start_custom_flow();
-    find<IndexT, TagT, 2, SortKeyType><<<gridDims, blockDims, 0, stream>>>(uvm_table_ptr,
-                            reinterpret_cast<int8_t*>(d_values),
-                            d_sort_key_buf,
-                            d_find_output,
-                            d_keys,
-                            n,
-                            cache_data);
-    NVE_CHECK_(cudaGetLastError());
-    NVE_CHECK_(cudaMemcpyAsync(&curr_misses, cache_data.misses, sizeof(int64_t), cudaMemcpyDefault, stream));
-    NVE_CHECK_(cudaEventRecord(event_misses, stream));
+    dim3 gridDims(static_cast<uint32_t>(ceil_div(n, num_keys_per_block)));
+    int64_t misses = 0;
+    {
+        // Kernels launched here must be atomic with respect to invalidate and commit; the
+        // scope closes the flow even if one of the NVE_CHECK_ calls below throws.
+        typename nve::EmbedCacheBase<IndexT>::ScopedCustomFlow flow(*cache_ptr);
+        find<IndexT, TagT, 2, SortKeyType><<<gridDims, blockDims, 0, stream>>>(uvm_table_ptr,
+                                reinterpret_cast<int8_t*>(d_values),
+                                d_sort_key_buf,
+                                d_find_output,
+                                d_keys,
+                                n,
+                                cache_data);
+        NVE_CHECK_(cudaGetLastError());
+        NVE_CHECK_(cudaMemcpyAsync(&curr_misses, cache_data.misses, sizeof(int64_t), cudaMemcpyDefault, stream));
+        NVE_CHECK_(cudaEventRecord(event_misses, stream));
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    // sort phase
-    NVE_CHECK_(cub::DeviceRadixSort::SortPairs(d_cub_aux_buf, cub_aux_bytes,
-            d_sort_key_buf, d_sort_key_sorted_buf, d_find_output, d_sorted_find_output, n, 0, sizeof(SortKeyType)*8, stream));
+        //////////////////////////////////////////////////////////////////////////////////////////////
+        // sort phase
+        NVE_CHECK_(cub::DeviceRadixSort::SortPairs(d_cub_aux_buf, cub_aux_bytes,
+                d_sort_key_buf, d_sort_key_sorted_buf, d_find_output, d_sorted_find_output, n, 0, sizeof(SortKeyType)*8, stream));
 
-    NVE_CHECK_(cudaEventRecord(event_sort, stream));
+        NVE_CHECK_(cudaEventRecord(event_sort, stream));
     
     
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    // get misses from find phase
-    NVE_CHECK_(cudaEventSynchronize(event_misses));
-    int64_t misses = curr_misses - prev_misses;
+        //////////////////////////////////////////////////////////////////////////////////////////////
+        // get misses from find phase
+        NVE_CHECK_(cudaEventSynchronize(event_misses));
+        misses = curr_misses - prev_misses;
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    // copy sorted values to host
-    // might not need this stream
+        //////////////////////////////////////////////////////////////////////////////////////////////
+        // copy sorted values to host
+        // might not need this stream
     
-    NVE_CHECK_(cudaMemcpyAsync(h_sorted_find_output, d_sorted_find_output, misses * sizeof(FindOutput), cudaMemcpyDefault, stream));
-    NVE_CHECK_(cudaEventRecord(event_copy_find_output, stream));
+        NVE_CHECK_(cudaMemcpyAsync(h_sorted_find_output, d_sorted_find_output, misses * sizeof(FindOutput), cudaMemcpyDefault, stream));
+        NVE_CHECK_(cudaEventRecord(event_copy_find_output, stream));
     
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    // gpu gather phase in parrllel with cpu gather phase
-    auto gather_stream = aux_streams[0];
-    auto num_keys_for_gather = n - misses;
-    if (num_keys_for_gather > 0) {
-        auto constexpr num_keys_per_y = 128;
-        NVE_CHECK_(cudaStreamWaitEvent(gather_stream, event_sort, 0));
-        NVE_CHECK_(launchGpuGatherKernel<IndexT>(d_sorted_find_output + misses, num_keys_for_gather, row_size_in_bytes, num_keys_per_y, gather_stream));
-        NVE_CHECK_(cudaEventRecord(event_gpu_gather_done, gather_stream));
-        NVE_CHECK_(cudaStreamWaitEvent(stream, event_gpu_gather_done, 0));
+        //////////////////////////////////////////////////////////////////////////////////////////////
+        // gpu gather phase in parrllel with cpu gather phase
+        auto gather_stream = aux_streams[0];
+        auto num_keys_for_gather = n - misses;
+        if (num_keys_for_gather > 0) {
+            auto constexpr num_keys_per_y = 128;
+            NVE_CHECK_(cudaStreamWaitEvent(gather_stream, event_sort, 0));
+            NVE_CHECK_(launchGpuGatherKernel<IndexT>(d_sorted_find_output + misses, num_keys_for_gather, row_size_in_bytes, num_keys_per_y, gather_stream));
+            NVE_CHECK_(cudaEventRecord(event_gpu_gather_done, gather_stream));
+            NVE_CHECK_(cudaStreamWaitEvent(stream, event_gpu_gather_done, 0));
+        }
     }
-    cache_ptr->end_custom_flow();
     
     //////////////////////////////////////////////////////////////////////////////////////////////
     // cpu gather phase

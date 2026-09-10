@@ -3,6 +3,8 @@
 The NV Embedding Cache SDK provides PyTorch-like wrappers for easy integration with Python code.
 The wrappers NVEmbedding and NVEmbeddingBag aim to mimic the PyTorch modules [torch.nn.Embedding](https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html) and [torch.nn.EmbeddingBag](https://pytorch.org/docs/stable/generated/torch.nn.EmbeddingBag.html) respectively.
 
+Note: `NVEmbeddingBag` offsets always follow torch's `include_last_offset=True` convention — `num_bags + 1` entries, starting at 0 and ending with a trailing sentinel equal to `len(input)`. torch-default offsets (no sentinel) are rejected.
+
 ## Installation 
 
 ```console
@@ -73,6 +75,8 @@ embedding = nve_layers.NVEmbedding(
 
 `max_modify_size` limits the number of insert/update/accumulate entries handled in one modify operation. Leaving it unset uses the table default.
 
+`default_embedding` (a 1-D tensor of `embedding_size` elements in the layer's dtype) sets the vector returned for keys missing from the table on HostLayer/Hierarchical. It defaults to zeros (note torch.nn.Embedding raises for out-of-range keys instead); pass an empty list (`[]`) to disable the miss fill entirely, leaving missed rows undefined. Other layer types reject a non-empty value.
+
 ## Using a Parameter Server
 To use the parameter server API, users are expected to implement the Table Interface defined in [table.hpp](../include/table.hpp) and provide a Python binding to it. See the [custom remote plugin](../samples/common/custom_remote_plugin/src/custom_remote_table.cpp) and [custom remote PS export sample](../samples/pytorch/export_sample/custom_remote_ps_export.py) for examples.
 
@@ -140,8 +144,9 @@ embedding = nve_layers.NVEmbedding(
 
 **Constraints:**
 - `optimize_for_training=False` is required; HostLayer does not support gradient computation.
-- In Python, only `NVEmbedding` supports `HostLayer`; `NVEmbeddingBag` rejects `LayerType.HostLayer`.
+- Both `NVEmbedding` and `NVEmbeddingBag` support `HostLayer`; pooled lookups (`sum`/`mean`, optionally weighted via `per_sample_weights`) run on CPU threads.
 - If providing a custom `storage` memblock, it must be host-accessible: `HostMemBlock`, `ManagedMemBlock`, a `UserMemBlock` wrapping a pinned tensor, or a host-side `LinearMemBlock` (device_id=-1). `NVL` and `MPI` memblocks are rejected.
+- Keys outside the table return the `default_embedding` config value — zeros unless configured (torch.nn.Embedding raises instead).
 
 ## Multi Device
 NV Embedding Cache takes PyTorch's approach to multi-device usage. Users should specify the device where the layer resides. Users should ensure all input tensors are on the same device as the layer (or accessible from the layer's device) when calling forward.

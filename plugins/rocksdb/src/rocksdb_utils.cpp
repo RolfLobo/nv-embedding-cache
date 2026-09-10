@@ -49,15 +49,13 @@ std::string RuntimeError<rocksdb::Status>::to_string() const {
 namespace plugin {
 
 RocksDBContext::RocksDBContext(const std::string& path, const bool read_only, const int64_t num_threads)
-  : path{path} {
+  : path{path}, read_only{read_only} {
   NVE_LOG_INFO_("Connecting to RocksDB database '", path, "'.");
 
   // Enumerate existing column families.
   rocksdb::Options opts;
   opts.create_if_missing = true;
   opts.manual_wal_flush = true;
-  opts.OptimizeForPointLookup(8);
-  opts.OptimizeLevelStyleCompaction();
   NVE_CHECK_(num_threads <= 4096);
   opts.IncreaseParallelism(static_cast<int>(num_threads));
 
@@ -99,7 +97,11 @@ RocksDBContext::~RocksDBContext() {
     NVE_CHECK_(db->DestroyColumnFamilyHandle(cf));
   }
   col_families.clear();
-  NVE_CHECK_(db->SyncWAL());
+
+  if (!read_only) {
+    NVE_CHECK_(db->FlushWAL(false));
+    NVE_CHECK_(db->SyncWAL());
+  }
   NVE_CHECK_(db->Close());
   db.reset();
 

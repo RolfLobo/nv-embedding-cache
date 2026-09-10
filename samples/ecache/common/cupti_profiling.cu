@@ -147,12 +147,12 @@ bool CuptiProfiler::start_session(const std::vector<std::string>& metrics, uint3
     metric_names_ = metrics;
     if (metric_names_.size())
     {
-        if(!NV::Metric::Config::GetConfigImage(chip_name_, metric_names_, config_image_, counterAvailabilityImage.data()))
+        if (!NV::Metric::Config::GetConfigImage(chip_name_, metric_names_, config_image_, counterAvailabilityImage.data()))
         {
             std::cout << "Failed to create configImage" << std::endl;
             return false;
         }
-        if(!NV::Metric::Config::GetCounterDataPrefixImage(chip_name_, metric_names_, counter_data_image_prefix_))
+        if (!NV::Metric::Config::GetCounterDataPrefixImage(chip_name_, metric_names_, counter_data_image_prefix_))
         {
             std::cout << "Failed to create counterDataImagePrefix" << std::endl;
             return false;
@@ -164,14 +164,14 @@ bool CuptiProfiler::start_session(const std::vector<std::string>& metrics, uint3
         return false;
     }
 
-    if(!create_counter_data_image(counter_data_image_, counter_data_scratch_buffer_, counter_data_image_prefix_, maxRanges))
+    if (!create_counter_data_image(counter_data_image_, counter_data_scratch_buffer_, counter_data_image_prefix_, maxRanges))
     {
         std::cout << "Failed to create counterDataImage" << std::endl;
         return false;
     }
 
     CUpti_Profiler_BeginSession_Params beginSessionParams = {CUpti_Profiler_BeginSession_Params_STRUCT_SIZE};
-    beginSessionParams.ctx = NULL;
+    beginSessionParams.ctx = nullptr;
     beginSessionParams.counterDataImageSize = counter_data_image_.size();
     beginSessionParams.pCounterDataImage = &counter_data_image_[0];
     beginSessionParams.counterDataScratchBufferSize = counter_data_scratch_buffer_.size();

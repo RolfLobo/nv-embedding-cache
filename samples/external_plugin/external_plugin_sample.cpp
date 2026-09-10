@@ -24,6 +24,7 @@
 
 #include <nve_c_api.h>
 
+#include <bit_ops.hpp>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -95,7 +96,7 @@ int main() {
                              values.data()));
   CHECK_NVE(nve_table_reset_lookup_counter(table, ctx));
   std::vector<float> found(kNumKeys * kRowFloats, -1.0f);
-  std::vector<uint64_t> hit_mask((kNumKeys + 63) / 64, 0);
+  std::vector<uint64_t> hit_mask(nve::ceil_div(kNumKeys, static_cast<int64_t>(64)), 0);
   CHECK_NVE(nve_table_find(table, ctx, kNumKeys, keys.data(), hit_mask.data(), kRowBytes,
                            found.data(), NULL));
   for (size_t i = 0; i < keys.size(); ++i) {
@@ -107,7 +108,7 @@ int main() {
   CHECK(counter == kNumKeys); /* external table counts hits */
 
   /* count-only find: NULL values is an exists check */
-  std::vector<uint64_t> exists_mask((kNumKeys + 63) / 64, 0);
+  std::vector<uint64_t> exists_mask(nve::ceil_div(kNumKeys, static_cast<int64_t>(64)), 0);
   std::vector<int64_t> miss_keys = {1, 2, 3};
   CHECK_NVE(nve_table_find(table, ctx, 3, miss_keys.data(), exists_mask.data(), 0, NULL, NULL));
   CHECK(exists_mask[0] == 0);
@@ -148,7 +149,7 @@ int main() {
   CHECK_NVE(nve_layer_insert(layer, layer_ctx, kNumKeys, keys.data(), kRowBytes, kRowBytes,
                              values.data(), 0));
   std::vector<float> output(kNumKeys * kRowFloats, -1.0f);
-  std::vector<uint64_t> layer_mask((kNumKeys + 63) / 64, 0);
+  std::vector<uint64_t> layer_mask(nve::ceil_div(kNumKeys, static_cast<int64_t>(64)), 0);
   CHECK_NVE(nve_layer_lookup(layer, layer_ctx, kNumKeys, keys.data(), output.data(), kRowBytes,
                              layer_mask.data(), NULL));
   CHECK_NVE(nve_context_wait(layer_ctx));

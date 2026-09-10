@@ -263,4 +263,4 @@ INSTANTIATE_TEST_SUITE_P(
     GatherFlowPipelineTest_INT64,
     testing::ValuesIn(gen_cases(cases_n, cases_row_size_in_bytes, cases_task_size, cases_num_streams, cases_kernel_mode_type, cases_num_keys_to_insert, cases_threshold)));
 
-} // namespace nve /*
+}  // namespace nve /*

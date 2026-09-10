@@ -157,8 +157,7 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   // gather straight into the user output. gather_stride is the raw stored row stride for pooling.
   const int64_t gather_stride = do_pool ? row_size : output_stride;
 
-  auto constexpr hitmask_elem_bits = sizeof(bitmask64_t) * 8;
-  const auto hitmask_elements = (num_keys + hitmask_elem_bits - 1) / hitmask_elem_bits;
+  const auto hitmask_elements = to_uint(ceil_div(num_keys, bitmask64::num_bits));
   const auto hitmask_buffer_size = hitmask_elements * sizeof(bitmask64_t);
   const auto output_buffer_size = num_keys * output_stride;
   const auto gather_buffer_size = num_keys * gather_stride;
@@ -182,7 +181,8 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
   // allocate hitmask buffer if needed
   const auto first_device = (*tables_.begin())->get_device_id();
   if (output_hitmask == nullptr) {
-    auto hitmask_buf = reinterpret_cast<bitmask64_t*>(ctx->get_buffer("hitmask", hitmask_buffer_size, first_device < 0));
+    auto hitmask_buf = reinterpret_cast<bitmask64_t*>(
+        ctx->get_buffer("hitmask", hitmask_buffer_size, first_device < 0 /*host_alloc*/));
     hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", hitmask_buf, hitmask_buffer_size);
   } else {
     hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", output_hitmask, hitmask_buffer_size);
@@ -229,7 +229,9 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
       table_hits.at(i) = left_keys - table_hits.at(i);
     }
     const auto hits = table_hits.at(i);
-    table_hitrates[i] = static_cast<float>(hits) / static_cast<float>(left_keys);
+    // A tier left with no candidate keys missed nothing: report 1.0 rather than 0/0 = NaN, which
+    // would reach the insert heuristic and poison StatisticalInsertHeuristic's statistics.
+    table_hitrates[i] = (left_keys > 0) ? static_cast<float>(hits) / static_cast<float>(left_keys) : 1.0f;
     left_keys -= hits;
   }
   // Update hitrates
@@ -251,8 +253,8 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
     // Fill default embedding rows for keys missing from all tables, in parallel via the context's thread pool.
     auto thread_pool = layer_ctx->get_thread_pool();
     const int64_t num_workers = thread_pool->num_workers();
-    const int64_t keys_per_task = std::max<int64_t>(1, (num_keys + num_workers - 1) / num_workers);
-    const int64_t num_tasks = (num_keys + keys_per_task - 1) / keys_per_task;
+    const int64_t keys_per_task = std::max<int64_t>(1, ceil_div(num_keys, num_workers));
+    const int64_t num_tasks = ceil_div(num_keys, keys_per_task);
     const size_t default_row_size = static_cast<size_t>(row_size);
     const uint8_t* default_emb = config_.default_embedding.data();
     auto* output_bytes = static_cast<uint8_t*>(output_buf);
@@ -261,9 +263,9 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
       const int64_t start_key = idx * keys_per_task;
       const int64_t end_key = std::min<int64_t>(start_key + keys_per_task, num_keys);
       for (int64_t k = start_key; k < end_key; k++) {
-        const auto elem = hit_mask_buf[k / hitmask_elem_bits];
-        const auto bit = (elem >> (k % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
-        if (bit == 0) {
+        const bitmask64_t elem{hit_mask_buf[k / bitmask64::num_bits]};
+        const bool bit{bitmask64::get(elem, k % bitmask64::num_bits)};
+        if (!bit) {
           std::memcpy(output_bytes + k * gather_stride, default_emb, default_row_size);
         }
       }
@@ -334,7 +336,6 @@ void HierarchicalEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64
       );
     }
   }
-
 }
 
 template <typename KeyType>
@@ -398,13 +399,8 @@ void HierarchicalEmbeddingLayer<KeyType>::update(context_ptr_t& ctx, const int64
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
     auto values_bw = std::make_shared<BufferWrapper<const void>>(ctx, "values", values, values_buffer_size);
 
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->lock_modify();
-    }
+    ScopedModifyLock modify_lock{handler_at(i)};
     table->update(table_ctx, num_keys, std::move(keys_bw), value_stride, value_size, std::move(values_bw));
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->unlock_modify();
-    }
   }
 }
 
@@ -435,13 +431,8 @@ void HierarchicalEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const i
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
     auto values_bw = std::make_shared<BufferWrapper<const void>>(ctx, "values", values, values_buffer_size);
 
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->lock_modify();
-    }
+    ScopedModifyLock modify_lock{handler_at(i)};
     table->update_accumulate(table_ctx, num_keys, std::move(keys_bw), value_stride, value_size, std::move(values_bw), value_type);
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->unlock_modify();
-    }
   }
 }
 
@@ -455,13 +446,8 @@ void HierarchicalEmbeddingLayer<KeyType>::clear(context_ptr_t& ctx) {
     auto table_ctx = layer_ctx->table_contexts_.at(i);
     NVE_CHECK_(table_ctx != nullptr, "Invalid table context");
 
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->lock_modify();
-    }
+    ScopedModifyLock modify_lock{handler_at(i)};
     table->clear(table_ctx);
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->unlock_modify();
-    }
   }
 }
 
@@ -469,11 +455,12 @@ template <typename KeyType>
 void HierarchicalEmbeddingLayer<KeyType>::erase(context_ptr_t& ctx, const int64_t num_keys,
                                                 const void* keys, const int64_t table_id) {
   NVE_NVTX_SCOPED_FUNCTION_COL6_();
+  // Validate the target table before the empty-input shortcut, as the other layers do.
+  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   if (num_keys < 1) {
     return;
   }
   NVE_CHECK_(keys != nullptr, "Invalid Keys buffer");
-  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
   NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
   const auto keys_buffer_size = sizeof(KeyType) * num_keys;
@@ -492,13 +479,8 @@ void HierarchicalEmbeddingLayer<KeyType>::erase(context_ptr_t& ctx, const int64_
     auto table_ctx = layer_ctx->table_contexts_.at(i);
     NVE_CHECK_(table_ctx != nullptr, "Invalid table context");
 
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->lock_modify();
-    }
+    ScopedModifyLock modify_lock{handler_at(i)};
     table->erase(table_ctx, num_keys, keys_bw);
-    if (!auto_insert_handlers_.empty()) {
-      auto_insert_handlers_.at(i)->unlock_modify();
-    }
   }
 }
 

@@ -17,7 +17,7 @@ find_package(CUDAToolkit REQUIRED)
 
 # Create separate lib for the cupti sample code so we can disable warnings specifically for it
 # CUPTI dependencies
-if(DEFINED CUPTI_ROOT)
+if (DEFINED CUPTI_ROOT)
     message(STATUS "CUPTI_ROOT defined as " ${CUPTI_ROOT})
     set(CUPTI_INC "${CUPTI_ROOT}/include" "${CUPTI_ROOT}/samples/common" "${CUPTI_ROOT}/samples/extensions/include/c_util/" "${CUPTI_ROOT}/samples/extensions/include/profilerhost_util/")
     set(CUPTI_LIB "${CUPTI_ROOT}/lib64")
@@ -25,7 +25,7 @@ set(CUPTI_SRC "${CUPTI_ROOT}/samples/extensions/src/profilerhost_util/")
 else()
     # Get target compute capability from current platform
     message(STATUS "CUPTI_ROOT not defined, using files from CUDA toolkit")
-    if(CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 12 AND CUDAToolkit_VERSION_MINOR GREATER_EQUAL 5)
+    if (CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 12 AND CUDAToolkit_VERSION_MINOR GREATER_EQUAL 5)
         set(CUPTI_INC "${CUDAToolkit_LIBRARY_ROOT}/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/include" "${CUDAToolkit_INCLUDE_DIR}" "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/samples/common/" "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/samples/extensions/include/c_util/" "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/samples/extensions/include/profilerhost_util/")
         set(CUPTI_LIB "${CUDAToolkit_LIBRARY_ROOT}/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/lib")
     else()

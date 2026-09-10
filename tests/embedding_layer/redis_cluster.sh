@@ -24,22 +24,37 @@ DEFAULT_PORT=6379
 RUNTIME_ROOT=${NVE_REDIS_RUNTIME_DIR:-/dev/shm/nve-redis}
 
 usage() {
-  echo "Usage: $0 [start | start_cluster | start_single [port] | stop]"
+  echo "Usage: $0 [start | start_cluster | start_single [port] | start_masters <count> [base_port] | stop]"
   exit 1
 }
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
   usage
 fi
 
-if [ "$#" -eq 2 ] && [ "$1" != "start_single" ]; then
-  usage
-fi
+case "$1" in
+  start_single) [ "$#" -le 2 ] || usage ;;
+  start_masters) { [ "$#" -ge 2 ] && [ "$#" -le 3 ]; } || usage ;;
+  *) [ "$#" -eq 1 ] || usage ;;
+esac
 
 if [ "$1" = "start_single" ] || [ "$1" = "start" ]; then
   SINGLE_PORT=${2:-$DEFAULT_PORT}
   if ! [[ "$SINGLE_PORT" =~ ^[0-9]+$ ]] || [ "$SINGLE_PORT" -lt 1 ] || [ "$SINGLE_PORT" -gt 65535 ]; then
     printf "${RED}Invalid port '${SINGLE_PORT}'!${NC}\n"
+    exit 1
+  fi
+fi
+
+if [ "$1" = "start_masters" ]; then
+  NUM_MASTERS=$2
+  MASTERS_BASE_PORT=${3:-7000}
+  if ! [[ "$NUM_MASTERS" =~ ^[0-9]+$ ]] || [ "$NUM_MASTERS" -lt 3 ]; then
+    printf "${RED}Invalid master count '${NUM_MASTERS}' (minimum cluster size is 3)!${NC}\n"
+    exit 1
+  fi
+  if ! [[ "$MASTERS_BASE_PORT" =~ ^[0-9]+$ ]] || [ "$MASTERS_BASE_PORT" -lt 1 ] || [ $((MASTERS_BASE_PORT + NUM_MASTERS - 1)) -gt 65535 ]; then
+    printf "${RED}Invalid base port '${MASTERS_BASE_PORT}'!${NC}\n"
     exit 1
   fi
 fi
@@ -210,6 +225,69 @@ case $1 in
   start_single)
     # Single standalone redis-server, useful for non-cluster client tests.
     start_standalone_server "$SINGLE_PORT"
+    printf "${GREEN}[Ready]${NC}\n"
+    ;;
+  start_masters)
+    # Masters-only cluster (no replicas): one redis-server per master, so
+    # command execution scales across cores. Clients seed off the base port and discover the rest.
+    for ((i=0; i<NUM_MASTERS; i++)); do
+      require_port_free $((MASTERS_BASE_PORT + i))
+    done
+
+    printf "${BLUE}[Starting ${NUM_MASTERS} master servers]${NC}\n"
+    prepare_runtime_root
+    LOCAL_IP=$(hostname -I |cut -f1 -d" ")
+    LOCAL_IP=${LOCAL_IP:-127.0.0.1}
+    HOSTS=""
+    for ((i=0; i<NUM_MASTERS; i++)); do
+      port=$((MASTERS_BASE_PORT + i))
+      rm -rf "$RUNTIME_ROOT/$port"
+      mkdir -p "$RUNTIME_ROOT/$port"
+      cd "$RUNTIME_ROOT/$port" || exit 8
+      redis-server \
+      --port $port \
+      --protected-mode no \
+      --cluster-enabled yes \
+      --cluster-config-file nodes.conf \
+      --cluster-node-timeout 5000 \
+      --io-threads 2 \
+      --io-threads-do-reads yes \
+      --save "" \
+      --dbfilename "" \
+      --appendonly no >/dev/null 2>&1 &
+
+      # Wait until server is up
+      if ! wait_for_server $port; then
+        printf "${RED}Failed to bring up server on port $port - aborting!${NC}\n"
+        exit 4
+      fi
+      HOSTS="$HOSTS ${LOCAL_IP}:$port"
+    done
+
+    printf "${BLUE}[Starting cluster]${NC}\n"
+    echo yes | redis-cli --cluster create $HOSTS --cluster-replicas 0 >/dev/null
+
+    # Wait until all masters see each other and the cluster reports OK.
+    SLEEP=0
+    while [ "$(redis-cli -p $MASTERS_BASE_PORT cluster nodes 2>/dev/null | wc -l)" -ne $NUM_MASTERS ] && [ ${SLEEP} != ${MAX_SLEEP} ]; do
+      ((SLEEP+=1))
+      sleep 1
+    done
+    if [ $SLEEP == $MAX_SLEEP ]; then
+      printf "${RED}Failed to create cluster - aborting!${NC}\n"
+      exit 5
+    fi
+
+    SLEEP=0
+    while [ "$(redis-cli -p $MASTERS_BASE_PORT cluster info 2>/dev/null | head -n1 | tr -d '\r')" != "cluster_state:ok" ] && [ ${SLEEP} != ${MAX_SLEEP} ]; do
+      ((SLEEP+=1))
+      sleep 1
+    done
+    if [ $SLEEP == $MAX_SLEEP ]; then
+      printf "${RED}Failed to bring up cluster - aborting!${NC}\n"
+      exit 5
+    fi
+
     printf "${GREEN}[Ready]${NC}\n"
     ;;
   stop)

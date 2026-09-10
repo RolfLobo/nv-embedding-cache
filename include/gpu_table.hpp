@@ -52,7 +52,7 @@ struct GPUTableConfig {
                                             // reolution when empty/null) Can be in GPU or host memory.
   int64_t uvm_num_rows{0};                  // Number of rows in uvm_table. Must be set when uvm_table is used.
   bool count_misses{true};                  // When true, create lookup contexts will collect miss count
-                                            // Counter is needed for Insert Heuristics, disable only when not using it.
+                                            // Counter is needed for Insert Heuristics and some kernel modes.
   int64_t max_modify_size{1 << 20};         // Maximal amount of modify entries allowed in a single op (insert/update/accumulate)
                                             // Using a small amount here can cause modify ops to be less efficient.
   DataType_t value_dtype{

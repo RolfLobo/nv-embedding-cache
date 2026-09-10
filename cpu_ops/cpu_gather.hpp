@@ -38,9 +38,9 @@ int64_t cpu_kernel_gather(thread_pool_ptr_t thread_pool,
               uint64_t num_threads)
 {
     constexpr uint64_t num_bits_in_hit_mask = sizeof(bitmask64_t) * 8;
-    auto keys_per_task = (n + num_threads - 1)/ num_threads;
+    auto keys_per_task{ceil_div(n, num_threads)};
     // Align to 64. Relied by the task below that accesses 64bit mask parts concurrently without synchronizing.
-    keys_per_task = ((keys_per_task + num_bits_in_hit_mask - 1) / num_bits_in_hit_mask)*num_bits_in_hit_mask;
+    keys_per_task = round_up(keys_per_task, num_bits_in_hit_mask);
     std::atomic<int64_t> resolved_hits{0};
 
     const auto gather_task = [=, &resolved_hits] (const size_t idx) {
@@ -53,7 +53,8 @@ int64_t cpu_kernel_gather(thread_pool_ptr_t thread_pool,
                 break;
             }
             const auto mask_idx = base_mask_idx + (i / num_bits_in_hit_mask);
-            const bitmask64_t key_bit = 1ULL << (i % num_bits_in_hit_mask);
+            const bitmask64_t key_bit{bitmask64::single(static_cast<int64_t>(i) % bitmask64::num_bits)};
+
             // A null hit mask means there are no pre-existing hits to skip.
             if ((hit_mask != nullptr) && ((hit_mask[mask_idx] & key_bit) != 0)) {
                 continue;
@@ -64,7 +65,7 @@ int64_t cpu_kernel_gather(thread_pool_ptr_t thread_pool,
             }
             int8_t* src_ptr = uvm_table_ptr + (static_cast<size_t>(key) * row_size_in_bytes);
             int8_t* dst_ptr = reinterpret_cast<int8_t*>(values) + (base_key + i) * value_stride;
-            memcpy(dst_ptr, src_ptr, row_size_in_bytes);
+            std::memcpy(dst_ptr, src_ptr, row_size_in_bytes);
             ++task_hits;
             if (hit_mask != nullptr) {
                 // No synchronization needed, mask words are partitioned between tasks (see above).
@@ -94,4 +95,4 @@ int64_t cpu_kernel_gather_dispatch(thread_pool_ptr_t thread_pool,
                                      uvm_table_ptr, row_size_in_bytes, num_rows, num_threads);
 }
 
-} // namespace nve
+}  // namespace nve

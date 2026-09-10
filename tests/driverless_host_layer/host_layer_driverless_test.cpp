@@ -18,19 +18,25 @@
 // Driverless host-layer smoke test — the C++ analogue of tests/python_binding/test_host_cpu.py.
 //
 // Exercises a HostEmbeddingLayer over a LinearHostTable using plain malloc-backed storage
-// (std::vector, NOT cudaMallocHost) and the default allocator/thread pool. On a driverless host
-// GetDefaultAllocator() falls back to malloc and the execution context skips cudaStreamSynchronize,
-// so this runs end-to-end with no CUDA driver / GPU. Built into its own executable that links only
-// nve-common (driver-free in a NVE_DRIVERLESS_BUILD), so it stays loadable on a driverless machine.
+// (std::vector or HostMemBlock, NOT cudaMallocHost) and the default allocator/thread pool. On a
+// driverless host GetDefaultAllocator() falls back to malloc and the execution context skips
+// cudaStreamSynchronize, so this runs end-to-end with no CUDA driver / GPU. Built into its own
+// executable that links only nve-common (driver-free in a NVE_DRIVERLESS_BUILD), so it stays
+// loadable on a driverless machine.
 
 #include <gtest/gtest.h>
 
 #include "include/common.hpp"
 #include "include/host_embedding_layer.hpp"
 #include "include/linear_host_table.hpp"
+#include "include/memblock.hpp"
 #include "include/nve_types.hpp"
+#include "include/serialization.hpp"
+#include "tests/host_layer_test_utils.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -43,43 +49,39 @@ constexpr int64_t kRowBytes = 16;  // 4 x float32
 constexpr int64_t kNumRows = 256;
 constexpr size_t kElems = static_cast<size_t>(kRowBytes) / sizeof(float);
 
-// Build a HostEmbeddingLayer backed by a caller-owned malloc buffer.
-struct HostLayerFixture {
-  std::vector<float> backing;
-  std::shared_ptr<LinearHostTable<KeyType>> table;
-  std::shared_ptr<HostEmbeddingLayer<KeyType>> layer;
-  context_ptr_t ctx;
+// HostEmbeddingLayer + LinearHostTable over a caller-owned host buffer.
+struct HostLayerHarness : nve_test::HostLayerHandles<KeyType> {
+  HostLayerHarness(void* emb_table, std::vector<uint8_t> default_embedding = {})
+      : nve_test::HostLayerHandles<KeyType>(nve_test::make_host_layer<KeyType>(
+            emb_table, kRowBytes, kNumRows, DataType_t::Float32, /*max_threads=*/8,
+            "driverless_host_layer", std::move(default_embedding))) {}
 
-  HostLayerFixture() : backing(static_cast<size_t>(kNumRows) * kElems) {
-    // Distinct, recognizable per-element values for ground-truth checks.
-    std::iota(backing.begin(), backing.end(), 1000.0f);
-
-    LinearHostTableConfig cfg;
-    cfg.value_dtype = DataType_t::Float32;
-    cfg.max_threads = 8;
-    cfg.max_value_size = kRowBytes;
-    cfg.num_rows = kNumRows;
-    cfg.emb_table = backing.data();
-
-    table = std::make_shared<LinearHostTable<KeyType>>(cfg);
-
-    HostEmbeddingLayer<KeyType>::Config layer_cfg;
-    layer_cfg.layer_name = "driverless_host_layer";
-    layer = std::make_shared<HostEmbeddingLayer<KeyType>>(layer_cfg, table);
-
-    // Null stream + default allocator/thread pool: driverless-safe path.
-    ctx = layer->create_execution_context(/*lookup_stream=*/0, /*modify_stream=*/0,
-                                          /*thread_pool=*/nullptr, /*allocator=*/nullptr);
+  std::vector<float> lookup(const std::vector<KeyType>& keys) {
+    std::vector<float> out(keys.size() * kElems, 0.0f);
+    layer->lookup(ctx, static_cast<int64_t>(keys.size()), keys.data(), out.data(), kRowBytes,
+                  /*hitmask=*/nullptr, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
+    return out;
   }
+};
+
+// Table storage with distinct, recognizable per-element values. Kept in its own base so it is
+// constructed before the harness that points at it.
+struct BackingStorage {
+  std::vector<float> backing;
+  BackingStorage() : backing(static_cast<size_t>(kNumRows) * kElems) {
+    std::iota(backing.begin(), backing.end(), 1000.0f);
+  }
+};
+
+struct HostLayerFixture : BackingStorage, HostLayerHarness {
+  explicit HostLayerFixture(std::vector<uint8_t> default_embedding = {})
+      : BackingStorage(), HostLayerHarness(backing.data(), std::move(default_embedding)) {}
 };
 
 TEST(DriverlessHostLayer, LookupReturnsBackingRows) {
   HostLayerFixture f;
   const std::vector<KeyType> keys{0, 5, 42, 200};
-  std::vector<float> out(keys.size() * kElems, 0.0f);
-
-  f.layer->lookup(f.ctx, static_cast<int64_t>(keys.size()), keys.data(), out.data(),
-                  kRowBytes, /*hitmask=*/nullptr, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
+  const auto out = f.lookup(keys);
 
   for (size_t k = 0; k < keys.size(); ++k) {
     for (size_t e = 0; e < kElems; ++e) {
@@ -98,12 +100,96 @@ TEST(DriverlessHostLayer, UpdateThenLookup) {
   f.layer->update(f.ctx, /*num_keys=*/1, &key, /*value_stride=*/kRowBytes,
                   /*value_size=*/kRowBytes, row.data(), /*table_id=*/0);
 
-  std::vector<float> out(kElems, 0.0f);
-  f.layer->lookup(f.ctx, /*num_keys=*/1, &key, out.data(), kRowBytes,
-                  /*hitmask=*/nullptr, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
-
+  const auto out = f.lookup({key});
   for (size_t e = 0; e < kElems; ++e) {
     EXPECT_FLOAT_EQ(out[e], row[e]) << "elem=" << e;
+  }
+}
+
+TEST(DriverlessHostLayer, AccumulateAddsToBackingRow) {
+  HostLayerFixture f;
+  constexpr KeyType key = 33;
+  const std::vector<float> before = f.lookup({key});
+  const std::vector<float> delta{1.0f, 2.0f, 3.0f, 4.0f};
+
+  f.layer->accumulate(f.ctx, /*num_keys=*/1, &key, kRowBytes, kRowBytes, delta.data(),
+                      DataType_t::Float32, /*table_id=*/0);
+
+  const auto out = f.lookup({key});
+  for (size_t e = 0; e < kElems; ++e) {
+    EXPECT_FLOAT_EQ(out[e], before[e] + delta[e]) << "elem=" << e;
+  }
+}
+
+// CSR pooling (torch include_last_offset convention): 6 keys -> bags {3, 1, 2}.
+TEST(DriverlessHostLayer, PooledLookupCsr) {
+  HostLayerFixture f;
+  const std::vector<KeyType> keys{0, 1, 2, 5, 10, 20};
+  const std::vector<KeyType> offsets{0, 3, 4, 6};
+  const std::vector<float> weights{0.5f, 1.5f, 2.0f, 1.0f, 0.25f, 4.0f};
+  const size_t num_bags = offsets.size() - 1;
+
+  for (const auto pooling : {PoolingType_t::Sum, PoolingType_t::Mean, PoolingType_t::WeightedSum,
+                             PoolingType_t::WeightedMean}) {
+    EmbeddingLayerBase::PoolingParams pp;
+    pp.pooling_type = pooling;
+    pp.sparse_type = SparseType_t::CSR;
+    pp.output_type = DataType_t::Float32;
+    pp.csr_offsets = offsets.data();
+    pp.num_csr_offsets = static_cast<int64_t>(offsets.size());
+    if (is_weighted_pooling(pooling)) {
+      pp.weights = weights.data();
+      pp.weight_type = DataType_t::Float32;
+    }
+
+    std::vector<float> out(num_bags * kElems, 0.0f);
+    f.layer->lookup(f.ctx, static_cast<int64_t>(keys.size()), keys.data(), out.data(), kRowBytes,
+                    /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
+
+    const auto expected = nve_test::reference_pool(f.backing.data(), kElems, keys, offsets, pooling, weights);
+    ASSERT_EQ(out.size(), expected.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+      EXPECT_FLOAT_EQ(out[i], expected[i]) << "pooling=" << static_cast<int>(pooling) << " elem=" << i;
+    }
+  }
+}
+
+// An all-empty-bags batch zeroes every output row instead of throwing (torch.nn.EmbeddingBag
+// semantics); the non-pooled empty lookup is a no-op.
+TEST(DriverlessHostLayer, EmptyLookup) {
+  HostLayerFixture f;
+  f.layer->lookup(f.ctx, 0, /*keys=*/nullptr, /*output=*/nullptr, kRowBytes,
+                  /*hitmask=*/nullptr, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
+
+  const std::vector<KeyType> offsets{0, 0, 0};
+  EmbeddingLayerBase::PoolingParams pp;
+  pp.pooling_type = PoolingType_t::Sum;
+  pp.sparse_type = SparseType_t::CSR;
+  pp.output_type = DataType_t::Float32;
+  pp.csr_offsets = offsets.data();
+  pp.num_csr_offsets = static_cast<int64_t>(offsets.size());
+
+  std::vector<float> out(2 * kElems, -99.0f);
+  f.layer->lookup(f.ctx, 0, /*keys=*/nullptr, out.data(), kRowBytes,
+                  /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
+  for (size_t i = 0; i < out.size(); ++i) {
+    EXPECT_FLOAT_EQ(out[i], 0.0f) << "elem=" << i;
+  }
+}
+
+// Config::default_embedding fills the output rows of missing keys.
+TEST(DriverlessHostLayer, DefaultEmbeddingFillsMisses) {
+  const std::vector<float> default_row{7.0f, 8.0f, 9.0f, 10.0f};
+  std::vector<uint8_t> default_bytes(kRowBytes);
+  std::memcpy(default_bytes.data(), default_row.data(), default_bytes.size());
+  HostLayerFixture f(default_bytes);
+
+  const std::vector<KeyType> keys{-1, 5, kNumRows};
+  const auto out = f.lookup(keys);
+  for (size_t e = 0; e < kElems; ++e) {
+    EXPECT_FLOAT_EQ(out[e], default_row[e]) << "elem=" << e;
+    EXPECT_FLOAT_EQ(out[kElems + e], f.backing[5 * kElems + e]) << "elem=" << e;
+    EXPECT_FLOAT_EQ(out[2 * kElems + e], default_row[e]) << "elem=" << e;
   }
 }
 
@@ -144,6 +230,71 @@ TEST(DriverlessHostLayer, OutOfRangeKeysMissAndMutationsAreIgnored) {
                       kRowBytes, kRowBytes, values.data(), DataType_t::Float32,
                       /*table_id=*/0);
   EXPECT_EQ(f.backing, original);
+}
+
+// In-memory StreamWrapperBase so the .nve round trip needs no filesystem.
+class MemoryStream : public StreamWrapperBase {
+ public:
+  void write(const void* data, size_t size) override {
+    if (pos_ + size > buf_.size()) buf_.resize(pos_ + size);
+    std::memcpy(buf_.data() + pos_, data, size);
+    pos_ += size;
+  }
+  uint64_t seek(uint64_t offset) override { return pos_ = std::min<uint64_t>(offset, buf_.size()); }
+  uint64_t tell() override { return pos_; }
+  void flush() override {}
+  uint64_t read(void* data, size_t size) override {
+    const size_t n = std::min<size_t>(size, buf_.size() - pos_);
+    std::memcpy(data, buf_.data() + pos_, n);
+    pos_ += n;
+    return n;
+  }
+  uint64_t size() override { return buf_.size(); }
+
+ private:
+  std::vector<uint8_t> buf_;
+  uint64_t pos_{0};
+};
+
+// The Python export path: a HostLayer over a malloc-backed HostMemBlock, serialized with
+// TensorFileFormat (weights/*.nve) and loaded into a fresh HostMemBlock-backed layer.
+TEST(DriverlessHostLayer, HostMemBlockSerializationRoundTrip) {
+  auto src_block = std::make_shared<HostMemBlock>(kElems, kNumRows, DataType_t::Float32);
+  ASSERT_EQ(src_block->get_type(), MemBlockType::HOST);
+  ASSERT_EQ(src_block->get_size_in_bytes(), static_cast<size_t>(kNumRows * kRowBytes));
+  auto* src = static_cast<float*>(src_block->get_ptr());
+  std::iota(src, src + static_cast<size_t>(kNumRows) * kElems, 0.0f);
+
+  const auto make_wrapper = [](const std::shared_ptr<HostMemBlock>& block) {
+    TensorWrapper t;
+    t.data = block->get_ptr();
+    t.row = static_cast<uint64_t>(kNumRows);
+    t.col = kElems;
+    t.element_size_in_bytes = sizeof(float);
+    return t;
+  };
+
+  constexpr uint64_t kLayerId = 42;
+  MemoryStream stream;
+  TensorFileFormat fmt;
+  fmt.write_table_file_header(stream);
+  fmt.write_tensor_to_stream(stream, kLayerId, make_wrapper(src_block));
+
+  auto dst_block = std::make_shared<HostMemBlock>(kElems, kNumRows, DataType_t::Float32);
+  TensorWrapper dst = make_wrapper(dst_block);
+  stream.seek(0);
+  fmt.load_tensor_from_stream(stream, kLayerId, dst);
+  EXPECT_EQ(std::memcmp(src_block->get_ptr(), dst_block->get_ptr(), src_block->get_size_in_bytes()), 0);
+
+  HostLayerHarness loaded(dst_block->get_ptr());
+  const std::vector<KeyType> keys{0, 7, kNumRows - 1};
+  const auto out = loaded.lookup(keys);
+  for (size_t k = 0; k < keys.size(); ++k) {
+    for (size_t e = 0; e < kElems; ++e) {
+      EXPECT_FLOAT_EQ(out[k * kElems + e], src[static_cast<size_t>(keys[k]) * kElems + e])
+          << "key=" << keys[k] << " elem=" << e;
+    }
+  }
 }
 
 }  // namespace

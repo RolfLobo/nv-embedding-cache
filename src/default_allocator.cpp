@@ -46,223 +46,260 @@ do {                                    \
 namespace nve {
 
 allocator_ptr_t GetDefaultAllocator() {
-    // Function-local static initialization is thread-safe (C++11): make_shared runs
-    // exactly once even under concurrent first calls (and throws, never returns null,
-    // on allocation failure).
-    static const allocator_ptr_t global_default_allocator =
-        std::make_shared<DefaultAllocator>(DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD);
-    return global_default_allocator;
+  // Function-local static initialization is thread-safe (C++11): make_shared runs
+  // exactly once even under concurrent first calls (and throws, never returns null,
+  // on allocation failure).
+  static const allocator_ptr_t global_default_allocator =
+    std::make_shared<DefaultAllocator>(DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD);
+  return global_default_allocator;
 }
 
-size_t get_largest_hugepage_bits(size_t alloc_size) {
-    const std::filesystem::path hugepage_dir{"/sys/devices/system/node/node0/hugepages"};
+size_t get_largest_hugepage_bits(size_t alloc_size) noexcept {
+  const std::filesystem::path hugepage_dir{"/sys/devices/system/node/node0/hugepages"};
 
-    size_t largest_bits = 0;
+  size_t largest_bits = 0;
 
-    for (auto const& entry : std::filesystem::directory_iterator{hugepage_dir}) {
-        std::string path_str(entry.path().c_str());
-
-        // Get page size in kB
-        std::string start_token("-");
-        std::string end_token("kB");
-        auto start = path_str.find(start_token);
-        auto end = path_str.find(end_token);
-        if ((start == std::string::npos) || (end == std::string::npos)) {
-            continue;
-        }
-        start += start_token.size(); // advance start to remove the start token
-        size_t page_size_kb;
-        std::istringstream(path_str.substr(start, end - start)) >> page_size_kb;
-        NVE_ASSERT_(popcount(page_size_kb) == 1);
-        const size_t page_size = page_size_kb << 10;
-
-        // Check free pages
-        size_t needed_hugepages = ceil_div(alloc_size, page_size);
-        size_t free_hugepages = 0;
-        std::ifstream free_hugepages_stream(std::move(path_str) + "/free_hugepages");
-        if (free_hugepages_stream.is_open()) {
-            free_hugepages_stream >> free_hugepages;
-        }
-
-        if (free_hugepages >= needed_hugepages) {
-            auto page_size_bits = countr_zero(page_size);// convert from 1024kB to 20 etc.
-            largest_bits = std::max(largest_bits, static_cast<size_t>(page_size_bits));
-        }
+  // Called from the noexcept allocator: a missing sysfs directory (common in containers), an
+  // iteration error or a parse failure simply means "no huge pages available".
+  try {
+    std::error_code ec;
+    std::filesystem::directory_iterator dir{hugepage_dir, ec};
+    if (ec) {
+      return 0;
     }
-    return largest_bits;
+    for (auto const& entry : dir) {
+      std::string path_str(entry.path().c_str());
+
+      // Get page size in kB
+      std::string start_token("-");
+      std::string end_token("kB");
+      auto start = path_str.find(start_token);
+      auto end = path_str.find(end_token);
+      if ((start == std::string::npos) || (end == std::string::npos)) {
+        continue;
+      }
+      start += start_token.size(); // advance start to remove the start token
+      size_t page_size_kb = 0;
+      std::istringstream(path_str.substr(start, end - start)) >> page_size_kb;
+      if (popcount(page_size_kb) != 1) {
+        continue; // not a page size we can express as a MAP_HUGE_* shift
+      }
+      const size_t page_size = page_size_kb << 10;
+
+      // Check free pages
+      size_t needed_hugepages = ceil_div(alloc_size, page_size);
+      size_t free_hugepages = 0;
+      std::ifstream free_hugepages_stream(std::move(path_str) + "/free_hugepages");
+      if (free_hugepages_stream.is_open()) {
+        free_hugepages_stream >> free_hugepages;
+      }
+
+      if (free_hugepages >= needed_hugepages) {
+        auto page_size_bits = countr_zero(page_size);// convert from 1024kB to 20 etc.
+        largest_bits = std::max(largest_bits, static_cast<size_t>(page_size_bits));
+      }
+    }
+  } catch (...) {
+    return 0;
+  }
+  return largest_bits;
 }
 
 DefaultAllocator::DefaultAllocator(size_t host_alloc_threshold_bytes) : host_alloc_threshold_(host_alloc_threshold_bytes) {}
 
 cudaError_t DefaultAllocator::device_allocate(void** ptr, size_t sz, int device_id) noexcept {
-    // Figure out if we need to change current device
-    int curr_device;
-    RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
-    const bool swap_device = (device_id >= 0) && (device_id != curr_device);
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
-    }
+  // Figure out if we need to change current device
+  int curr_device;
+  RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
+  const bool swap_device = (device_id >= 0) && (device_id != curr_device);
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
+  }
 
-    // coverity[error_interface]
-    auto res = cudaMalloc(ptr,sz); // not returning on error before changing back to original device
-    // Error will be returned to caller, therefore the coverity error is disabled as intentional
+  // coverity[error_interface]
+  auto res = cudaMalloc(ptr,sz); // not returning on error before changing back to original device
+  // Error will be returned to caller, therefore the coverity error is disabled as intentional
 
-    // Swap back to original device
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
-    }
-    ALLOC_DEBUG_PRINT("[%s] ptr=%p, sz=%ld, device=%d\n", __FUNCTION__, *ptr, sz, device_id);
-    return res;
+  // Swap back to original device
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
+  }
+  ALLOC_DEBUG_PRINT("[%s] ptr=%p, sz=%ld, device=%d\n", __FUNCTION__, *ptr, sz, device_id);
+  return res;
 }
 
 cudaError_t DefaultAllocator::device_free(void* ptr, int device_id) noexcept {
-    ALLOC_DEBUG_PRINT("[%s] ptr=%p, device=%d\n", __FUNCTION__, ptr, device_id);
-    int curr_device;
-    RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
-    const bool swap_device = (device_id >= 0) && (device_id != curr_device);
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
-    }
+  ALLOC_DEBUG_PRINT("[%s] ptr=%p, device=%d\n", __FUNCTION__, ptr, device_id);
+  int curr_device;
+  RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
+  const bool swap_device = (device_id >= 0) && (device_id != curr_device);
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
+  }
 
-    // coverity[error_interface]
-    auto res = cudaFree(ptr); // not returning on error before changing back to original device
-    // Error will be returned to caller, therefore the coverity error is disabled as intentional
+  // coverity[error_interface]
+  auto res = cudaFree(ptr); // not returning on error before changing back to original device
+  // Error will be returned to caller, therefore the coverity error is disabled as intentional
 
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
-    }
-    return res;
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
+  }
+  return res;
 }
 
 cudaError_t DefaultAllocator::device_allocate_async(void** ptr, size_t sz, cudaStream_t stream, int device_id) noexcept {
-    // Figure out if we need to change current device
-    int curr_device;
-    RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
-    const bool swap_device = (device_id >= 0) && (device_id != curr_device);
+  // Figure out if we need to change current device
+  int curr_device;
+  RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
+  const bool swap_device = (device_id >= 0) && (device_id != curr_device);
 
-    // Get memory pool if available
-    cudaMemPool_t mem_pool;
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
-        mem_pool = getMemPool(device_id);
-    } else {
-        mem_pool = getMemPool(curr_device);
-    }
+  // Get memory pool if available
+  cudaMemPool_t mem_pool;
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
+    mem_pool = get_mem_pool(device_id);
+  } else {
+    mem_pool = get_mem_pool(curr_device);
+  }
 
-    // Allocate
-    // coverity[error_interface]
-    cudaError_t res = mem_pool ? cudaMallocFromPoolAsync(ptr, sz, mem_pool, stream) : cudaMalloc(ptr,sz);
-    // not returning on error before changing back to original device
-    // Error will be returned to caller, therefore the coverity error is disabled as intentional
+  // Allocate
+  // coverity[error_interface]
+  cudaError_t res = mem_pool ? cudaMallocFromPoolAsync(ptr, sz, mem_pool, stream) : cudaMalloc(ptr,sz);
+  // not returning on error before changing back to original device
+  // Error will be returned to caller, therefore the coverity error is disabled as intentional
 
-    // Swap back to original device
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
-    }
-    ALLOC_DEBUG_PRINT("[%s] ptr=%p, sz=%ld, stream=%p, device=%d\n", __FUNCTION__, *ptr, sz, stream, device_id);
-    return res;
+  // Swap back to original device
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
+  }
+  ALLOC_DEBUG_PRINT("[%s] ptr=%p, sz=%ld, stream=%p, device=%d\n", __FUNCTION__, *ptr, sz, stream, device_id);
+  return res;
 }
 
 cudaError_t DefaultAllocator::device_free_async(void* ptr, cudaStream_t stream, int device_id) noexcept {
-    ALLOC_DEBUG_PRINT("[%s] ptr=%p, stream=%p, device=%d\n", __FUNCTION__, ptr, stream, device_id);
-    int curr_device;
-    RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
-    const bool swap_device = (device_id >= 0) && (device_id != curr_device);
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
-    }
+  ALLOC_DEBUG_PRINT("[%s] ptr=%p, stream=%p, device=%d\n", __FUNCTION__, ptr, stream, device_id);
+  int curr_device;
+  RETURN_IF_CUDA_ERROR_(cudaGetDevice(&curr_device));
+  const bool swap_device = (device_id >= 0) && (device_id != curr_device);
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(device_id));
+  }
 
-    // coverity[error_interface]
-    auto res = cudaFreeAsync(ptr, stream); // not returning on error before changing back to original device
-    // Error will be returned to caller, therefore the coverity error is disabled as intentional
+  // coverity[error_interface]
+  auto res = cudaFreeAsync(ptr, stream); // not returning on error before changing back to original device
+  // Error will be returned to caller, therefore the coverity error is disabled as intentional
 
-    if (swap_device) {
-        RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
-    }
-    return res;
+  if (swap_device) {
+    RETURN_IF_CUDA_ERROR_(cudaSetDevice(curr_device));
+  }
+  return res;
 }
 
 cudaError_t DefaultAllocator::host_allocate(void** ptr, size_t sz) noexcept {
-    // guard on driver availability
-    if (!driver_available()) {
-        *ptr = std::malloc(sz);
-        return (*ptr == nullptr) ? cudaErrorMemoryAllocation : cudaSuccess;
+  // guard on driver availability
+  if (!driver_available()) {
+    *ptr = std::malloc(sz);
+    return (*ptr == nullptr) ? cudaErrorMemoryAllocation : cudaSuccess;
+  }
+  size_t hugepage_bits = 0;
+  if (sz >= host_alloc_threshold_) {
+    hugepage_bits = get_largest_hugepage_bits(sz);
+    if (hugepage_bits == 0) {
+      NVE_LOG_WARNING_("Not enough huge pages available to allocate, performance will be impacted.");
     }
-    size_t hugepage_bits = 0;
-    if(sz >= host_alloc_threshold_) {
-      hugepage_bits = get_largest_hugepage_bits(sz);
-      if (hugepage_bits == 0) {
-          NVE_LOG_WARNING_("Not enough huge pages available to allocate, performance will be impacted.");
-      }
+  }
+  if (hugepage_bits == 0) {
+    // Allocate using cudaMallocHost
+    auto res = cudaMallocHost(ptr, sz);
+    ALLOC_DEBUG_PRINT("[%s] cudaMallocHost allocation: ptr=%p, sz=%ld\n", __FUNCTION__, *ptr, sz);
+    return res;
+  }
+  else {
+    // Allocate huge pages
+    size_t totalBytes = round_up(sz, size_t(1) << static_cast<size_t>(hugepage_bits));
+    void* mapped = mmap(NULL, totalBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_HUGETLB | (static_cast<int>(hugepage_bits) << MAP_HUGE_SHIFT), -1, 0);
+    if (mapped == MAP_FAILED) {
+      ALLOC_DEBUG_PRINT("[%s] Huge pages allocation failed: sz=%ld\n", __FUNCTION__, sz);
+      *ptr = nullptr;
+      return cudaErrorMemoryAllocation;
     }
-    if(hugepage_bits == 0) {
-      // Allocate using cudaMallocHost
-      auto res = cudaMallocHost(ptr, sz);
-      ALLOC_DEBUG_PRINT("[%s] cudaMallocHost allocation: ptr=%p, sz=%ld\n", __FUNCTION__, *ptr, sz);
+    const cudaError_t res = cudaHostRegister(mapped, totalBytes, cudaHostRegisterDefault);
+    if (res != cudaSuccess) {
+      // Don't leak the mapping and don't record a buffer the caller never receives.
+      munmap(mapped, totalBytes);
+      *ptr = nullptr;
       return res;
     }
-    else {
-      // Allocate huge pages
-      size_t totalBytes = round_up(sz, size_t(1) << static_cast<size_t>(hugepage_bits));
-      *ptr = mmap(NULL, totalBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_HUGETLB | (static_cast<int>(hugepage_bits) << MAP_HUGE_SHIFT), -1, 0);
-      if (*ptr == MAP_FAILED) {
-          ALLOC_DEBUG_PRINT("[%s] Huge pages allocation failed: ptr=%p, sz=%ld\n", __FUNCTION__, *ptr, sz);
-          return cudaErrorMemoryAllocation;
-      }
-      host_mmap_allocations_[*ptr] = totalBytes;
-      ALLOC_DEBUG_PRINT("[%s] Huge pages allocation: ptr=%p, requested=%ld, allocated=%ld\n", __FUNCTION__, *ptr, sz, totalBytes);
-      return cudaHostRegister(*ptr, totalBytes, cudaHostRegisterDefault);
+    {
+      std::lock_guard lock(mutex_);
+      host_mmap_allocations_[mapped] = totalBytes;
     }
+    *ptr = mapped;
+    ALLOC_DEBUG_PRINT("[%s] Huge pages allocation: ptr=%p, requested=%ld, allocated=%ld\n", __FUNCTION__, *ptr, sz, totalBytes);
+    return cudaSuccess;
+  }
 }
 
 cudaError_t DefaultAllocator::host_free(void* ptr) noexcept {
-    // Mirror host_allocate: on a driverless system the buffer came from malloc.
-    if (!driver_available()) {
-        std::free(ptr);
-        return cudaSuccess;
-    }
+  // Mirror host_allocate: on a driverless system the buffer came from malloc.
+  if (!driver_available()) {
+    std::free(ptr);
+    return cudaSuccess;
+  }
+  // Look up (and forget) the mapping under the lock; the CUDA/munmap calls run outside it.
+  size_t mapped_bytes = 0;
+  {
+    std::lock_guard lock(mutex_);
     auto ptr_alloc_data = host_mmap_allocations_.find(ptr);
     if (ptr_alloc_data != host_mmap_allocations_.end()) {
-      auto res = cudaHostUnregister(ptr);
-      if (res != cudaSuccess) {
-          return res;
-      }
-      if (munmap(ptr, ptr_alloc_data->second) != 0) {
-          ALLOC_DEBUG_PRINT("[%s] Failed to free: ptr=%p, sz=%ld\n", __FUNCTION__, ptr, ptr_alloc_data->second);
-          return cudaErrorInvalidValue;
-      }
-      ALLOC_DEBUG_PRINT("[%s] ptr=%p\n", __FUNCTION__, ptr);
+      mapped_bytes = ptr_alloc_data->second;
       host_mmap_allocations_.erase(ptr_alloc_data);
-      return cudaSuccess;
     }
-    else {
-      ALLOC_DEBUG_PRINT("[%s] ptr=%p\n", __FUNCTION__, ptr);
-      return cudaFreeHost(ptr);
+  }
+  if (mapped_bytes > 0) {
+    // Unmap even if unregistering failed: the bookkeeping entry is already gone, so skipping
+    // munmap would leak the mapping with no way for the caller to recover it.
+    const cudaError_t unregister_res = cudaHostUnregister(ptr);
+    const bool unmap_failed = (munmap(ptr, mapped_bytes) != 0);
+    if (unregister_res != cudaSuccess) {
+      return unregister_res;
     }
+    if (unmap_failed) {
+      ALLOC_DEBUG_PRINT("[%s] Failed to free: ptr=%p, sz=%ld\n", __FUNCTION__, ptr, mapped_bytes);
+      return cudaErrorInvalidValue;
+    }
+    ALLOC_DEBUG_PRINT("[%s] ptr=%p\n", __FUNCTION__, ptr);
+    return cudaSuccess;
+  }
+  else {
+    ALLOC_DEBUG_PRINT("[%s] ptr=%p\n", __FUNCTION__, ptr);
+    return cudaFreeHost(ptr);
+  }
 }
 
-cudaMemPool_t DefaultAllocator::getMemPool(int device) noexcept {
-    if (mem_pools_.find(device) == mem_pools_.end()) {
-        mem_pools_[device] = nullptr;
-        int mem_pool_supported;
-        if (cudaDeviceGetAttribute(&mem_pool_supported, cudaDevAttrMemoryPoolsSupported, device)) {
-            // Silently defaulting to no mem pool
-            mem_pool_supported = 0;
-        }
-        if (mem_pool_supported) {
-            cudaMemPool_t mem_pool;
-            size_t free, total;
-            if ( ((cudaDeviceGetDefaultMemPool(&mem_pool, device)) == cudaSuccess) && 
-                 ((cudaMemGetInfo(&free, &total)) == cudaSuccess) ) {
-              uint64_t threshold = total;
-              if (cudaMemPoolSetAttribute(mem_pool, cudaMemPoolAttrReleaseThreshold, &threshold) == cudaSuccess) {
-                mem_pools_[device] = mem_pool;
-              }
-            }
-            // Implciti else - silently defaulting to no mem pool
-        }
+cudaMemPool_t DefaultAllocator::get_mem_pool(int device) noexcept {
+  std::lock_guard lock(mutex_);
+  if (mem_pools_.find(device) == mem_pools_.end()) {
+    mem_pools_[device] = nullptr;
+    int mem_pool_supported;
+    if (cudaDeviceGetAttribute(&mem_pool_supported, cudaDevAttrMemoryPoolsSupported, device)) {
+      // Silently defaulting to no mem pool
+      mem_pool_supported = 0;
     }
-    return mem_pools_.at(device);
+    if (mem_pool_supported) {
+      cudaMemPool_t mem_pool;
+      size_t free, total;
+      if ( ((cudaDeviceGetDefaultMemPool(&mem_pool, device)) == cudaSuccess) &&
+         ((cudaMemGetInfo(&free, &total)) == cudaSuccess) ) {
+        uint64_t threshold = total;
+        if (cudaMemPoolSetAttribute(mem_pool, cudaMemPoolAttrReleaseThreshold, &threshold) == cudaSuccess) {
+        mem_pools_[device] = mem_pool;
+        }
+      }
+      // Implciti else - silently defaulting to no mem pool
+    }
+  }
+  return mem_pools_.at(device);
 }
 
 #undef RETURN_IF_CUDA_ERROR_

@@ -103,7 +103,7 @@ void CallUpdateKernelVecTypeSubwarp(
                               const cudaStream_t stream = 0)
 {
     uint32_t indices_per_warp = 32 / SubwarpWidth;
-    dim3 grid_size ((num_indices + indices_per_warp - 1) / indices_per_warp, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_indices), indices_per_warp), 1);
     dim3 block_size (SubwarpWidth, indices_per_warp);
     UpdateTableKernel<SubwarpWidth, KeyType, DataType><<<grid_size, block_size, 0, stream>>>(
         src, indices, embedding_table, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, num_indices, num_rows);
@@ -192,7 +192,7 @@ void CallUpdateAccumulateKernelSubwarp(
                               const cudaStream_t stream = 0)
 {
     uint32_t indices_per_warp = 32 / SubwarpWidth;
-    dim3 grid_size ((num_indices + indices_per_warp - 1) / indices_per_warp, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_indices), indices_per_warp), 1);
     dim3 block_size (SubwarpWidth, indices_per_warp);
     UpdateAccumulateTableKernel<SubwarpWidth, KeyType, DataType><<<grid_size, block_size, 0, stream>>>(
         src, indices, embedding_table, embed_width, embed_src_stride, embed_dst_stride, num_indices, num_rows);

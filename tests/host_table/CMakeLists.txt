@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(stl_map_table_tests stl_map_table_tests.cpp)
-target_link_libraries(stl_map_table_tests PUBLIC gtest_main nve-common)
-
 add_executable(host_table_general_tests general_tests.cpp)
 target_link_libraries(host_table_general_tests PUBLIC gtest_main nve-common)
 

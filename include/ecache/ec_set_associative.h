@@ -147,12 +147,10 @@ public:
         uint32_t num_entries;
     };
 
-public:
-
     ECError calc_allocation_size(CacheAllocationSize& out_allocation_sz) const
     {
         uint64_t num_sets = calc_num_sets();
-        
+
         if (num_sets == 0)
         {
             return ECERROR_MEMORY_ALLOCATED_TO_CACHE_TOO_SMALL;
@@ -168,20 +166,20 @@ public:
         else {
             sz_device_per_set += sz_entry_per_set;
         }
-        
+
         out_allocation_sz.device_allocation_size = (num_sets * sz_device_per_set) * config_.num_tables + get_extra_device_alloc_size(config_.num_tables, num_sets);
         out_allocation_sz.host_allocation_size = (num_sets * sz_host_per_set ) * config_.num_tables + get_extra_host_alloc_size(config_.num_tables, num_sets);
 
         // if our calculation are correct this shouldn't happen
         assert(out_allocation_sz.device_allocation_size <= config_.cache_sz_in_bytes);
         assert((num_sets * sz_host_per_set) * config_.num_tables <= config_.cache_sz_in_bytes);
-        
+
         return ECERROR_SUCCESS;
     }
 
     EmbedCacheSA(Allocator* allocator, Logger* logger, const CacheConfig& cfg, CACHE_IMPLEMENTATION_TYPE type)
         : EmbedCacheBase<IndexT>(allocator, logger, type), config_(cfg), num_sets_(0), h_pool_(nullptr), d_pool_(nullptr),
-          cache_(nullptr), d_tags_(nullptr), h_tags_(nullptr), custom_flow_lock_(custom_flow_mutex_, std::defer_lock)
+          cache_(nullptr), d_tags_(nullptr), h_tags_(nullptr)
     {
 
     }
@@ -214,7 +212,6 @@ public:
         }
     }
 
-
     ECError lookup_context_destroy(LookupContextHandle& handle) const override
     {
         EmbedCacheSA::CacheData* p = (EmbedCacheSA::CacheData*)handle.handle;
@@ -246,9 +243,9 @@ public:
         {
             LOG_ERROR_AND_RETURN(e);
         }
-        
+
     }
-    
+
     ECError performance_metric_destroy(PerformanceMetric& metric) const override
     {
         try
@@ -326,7 +323,7 @@ public:
         this->allocator_->host_free(h_pool_);
         this->allocator_->device_free(d_pool_);
     }
-    
+
     virtual ECError init() override
     {
         try
@@ -370,7 +367,7 @@ public:
 
             // allocating pointers in memory pools
             // cactch bad alighments
-            if(config_.allocate_data_on_host){
+            if (config_.allocate_data_on_host){
                 // for gpu managed host cache config- allocate data on host. 
                 cache_ = allocate_in_pool(ph, eh - ph, data_size, 16);
             }
@@ -387,7 +384,7 @@ public:
             h_tags_ = (TagT*)allocate_in_pool(ph, eh - ph, tag_size, 16);
 
             std::fill(h_tags_, h_tags_ + num_sets_ * NUM_WAYS * config_.num_tables, config_.sentinel_key);
-            
+
             init_extras_host(config_.num_tables, ph, eh - ph);
             init_extras_device(config_.num_tables, pd, ed - pd);
 
@@ -395,10 +392,10 @@ public:
         }
         catch(const ECException& e)
         {
-            if(h_pool_){
+            if (h_pool_){
                 this->allocator_->host_free(h_pool_);
             }
-            if(d_pool_){
+            if (d_pool_){
                 this->allocator_->device_free(d_pool_);
             }
             LOG_ERROR_AND_RETURN(e);
@@ -471,16 +468,6 @@ public:
         }
     }
 
-    ECError start_custom_flow() override {
-        custom_flow_lock_.lock();
-        return ECERROR_SUCCESS;
-    }
-
-    ECError end_custom_flow() override {
-        custom_flow_lock_.unlock();
-        return ECERROR_SUCCESS;
-    }
-
     ECError lookup_sort_gather(const LookupContextHandle& h_lookup, const IndexT* d_keys, const size_t len,
                                             int8_t* d_values, const int8_t* d_table, int8_t* d_auxiliary_buffer, size_t& auxiliary_buffer_bytes, uint32_t /*curr_table*/, 
                                             size_t stride, int64_t block_size, cudaStream_t stream) override
@@ -500,7 +487,7 @@ public:
                     block_size,
                     data,
                     stream)));
-            
+
             // if aux is null return its required size
             if (d_auxiliary_buffer == nullptr)
             {
@@ -513,10 +500,10 @@ public:
                 {
                     EC_THROW(ECERROR_INVALID_ARGUMENT);
                 }
-                
+
                 if (len > 0)
                 {
-                    CHECK_ERR_AND_THROW(start_custom_flow());
+                    ScopedCustomFlow flow(*this);
                     CACHE_CUDA_ERR_CHK_AND_THROW((call_sort_gather<IndexT, TagT>( d_table, 
                     d_values, 
                     d_keys, 
@@ -527,7 +514,6 @@ public:
                     block_size,
                     data,
                     stream)));
-                    CHECK_ERR_AND_THROW(end_custom_flow());
                 }
 
                 return ECERROR_SUCCESS;
@@ -737,9 +723,23 @@ protected:
     virtual void init_extras_device(uint64_t /*num_tables*/, int8_t* /*pool*/, size_t /*space*/) {}
 
     using ReadWriteLock =  std::shared_mutex;
-    using WriteLock =  std::unique_lock<ReadWriteLock>; 
-    using ReadLock =  std::shared_lock<ReadWriteLock>;  
+    using WriteLock =  std::unique_lock<ReadWriteLock>;
+    using ReadLock =  std::shared_lock<ReadWriteLock>;
+    using ScopedCustomFlow = typename EmbedCacheBase<IndexT>::ScopedCustomFlow;
 
+private:
+    // Shared: concurrent custom flows are fine; invalidate/commit take the WriteLock.
+    ECError start_custom_flow() override {
+        custom_flow_mutex_.lock_shared();
+        return ECERROR_SUCCESS;
+    }
+
+    ECError end_custom_flow() override {
+        custom_flow_mutex_.unlock_shared();
+        return ECERROR_SUCCESS;
+    }
+
+protected:
     CacheConfig config_;
     uint64_t num_sets_;
     int8_t* h_pool_; // host memory pool for cache internal buffers- one free to rule them all
@@ -748,9 +748,8 @@ protected:
     TagT* d_tags_; // device tags
     TagT* h_tags_; // host copy of tags
     ReadWriteLock custom_flow_mutex_; // mutex for custom flow allowing for read write lock
-    ReadLock custom_flow_lock_; // dexplicit reader lock for defered locking via custom flow calls
 
 public:
-    static const uint32_t NUM_WAYS = 8;
+    static constexpr uint32_t NUM_WAYS = 8;
 };
 }

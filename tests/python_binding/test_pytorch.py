@@ -26,9 +26,10 @@ import pynve.torch.nve_layers as nve_layers
 import pynve.nve as nve
 import pynve.torch.nve_ps as nve_ps
 import nvtx
+import pytest
 import threading
 import torch
-from conftest import requires_nvhm
+from conftest import requires_nvhm, make_layer, make_nvhm_ps
 
 def build_key(batch, hotness, alpha, N):
     ret = common.PowerLaw(1, N, alpha, hotness*batch)
@@ -62,14 +63,8 @@ def functional(quiet : bool, data_type : torch.dtype, device : torch.device = to
     # create a regular embedding layer for reference
     emb_layer = torch.nn.Embedding(num_embeddings, embed_size, dtype=data_type, sparse=True, device=device)
 
-    # create the NVHM PS
-    nvhm_ps_init = nve_ps.SimpleInitializer(num_embeddings, embed_size, data_type, emb_layer.weight)
-    nvhm_ps = nve_ps.NVEParameterServer(
-            0, # Setting num_embeddings as 0 to disable eviction policy
-            embed_size,
-            data_type,
-            nvhm_ps_init
-        )
+    # create the NVHM PS seeded from the reference weights
+    nvhm_ps = make_nvhm_ps(emb_layer.weight)
 
     # create nv emb layer wrapping the nvHashMap as PS
     nv_nvhm_ps_emb_layer = nve_layers.NVEmbedding(num_embeddings, embed_size, data_type, nve_layers.LayerType.Hierarchical, gpu_cache_size=cache_size, storage=nvhm_ps, device=device)
@@ -826,6 +821,175 @@ def test_pytorch_user_memblock():
     res = emb_layer(keys)
     torch.cuda.current_stream().synchronize()
     assert (res == 1.0).all(), "Output should be all ones"
+
+
+# ---------------------------------------------------------------------------
+# Miss handling through the layer config:
+#  - `default_embedding` (Hierarchical): the row returned for keys absent from every tier.
+#    Zeros unless configured, a custom row when given, and an empty list opts out.
+#  - `default_row_index` (GPULayer / LinearUVM): the table row that keys outside
+#    [0, num_embeddings) resolve to. Disabled (negative) unless configured.
+# The HostLayer variants of `default_embedding` live in test_host_cpu.py.
+# ---------------------------------------------------------------------------
+
+MISS_NUM_EMBEDDINGS = 64
+MISS_EMBED_SIZE = 4
+MISS_CACHE_SIZE = 4 * 1024 * 1024
+# Keys with no row in any table; also outside [0, MISS_NUM_EMBEDDINGS) for the linear layers.
+MISS_KEYS = (MISS_NUM_EMBEDDINGS + 5, 10 * MISS_NUM_EMBEDDINGS)
+LINEAR_LAYERS = [nve_layers.LayerType.GPULayer, nve_layers.LayerType.LinearUVM]
+
+
+def _miss_keys(*vals):
+    return torch.tensor(vals, dtype=torch.int64, device="cuda")
+
+
+def _miss_weight(dtype=torch.float32):
+    return torch.randn(MISS_NUM_EMBEDDINGS, MISS_EMBED_SIZE, dtype=dtype)
+
+
+def _make_hierarchical(weight, *, host_cache_size=0, config=None, bag_mode=None):
+    return make_layer(MISS_NUM_EMBEDDINGS, MISS_EMBED_SIZE, weight.dtype,
+                      nve_layers.LayerType.Hierarchical, torch.device("cuda"),
+                      storage=make_nvhm_ps(weight), gpu_cache_size=MISS_CACHE_SIZE,
+                      host_cache_size=host_cache_size, bag_mode=bag_mode, config=config)
+
+
+def _make_linear(layer_type, weight, *, config=None, bag_mode=None):
+    gpu_cache_size = MISS_CACHE_SIZE if layer_type == nve_layers.LayerType.LinearUVM else 0
+    return make_layer(MISS_NUM_EMBEDDINGS, MISS_EMBED_SIZE, weight.dtype, layer_type,
+                      torch.device("cuda"), weight_init=weight, gpu_cache_size=gpu_cache_size,
+                      bag_mode=bag_mode, config=config)
+
+
+@requires_nvhm
+@pytest.mark.parametrize("host_cache_size", [0, MISS_CACHE_SIZE], ids=["gpu+ps", "gpu+host+ps"])
+def test_pytorch_hierarchical_misses_return_zeros_by_default(host_cache_size):
+    # With no config at all a key absent from every tier reads back as the zero row.
+    weight = _miss_weight()
+    layer = _make_hierarchical(weight, host_cache_size=host_cache_size)
+    assert layer.config.default_embedding == [0] * (MISS_EMBED_SIZE * 4)
+
+    keys = _miss_keys(7, MISS_KEYS[0], 12, MISS_KEYS[1])
+    zeros = torch.zeros(MISS_EMBED_SIZE)
+    expected = torch.stack([weight[7], zeros, weight[12], zeros])
+    # Two rounds: the first primes the GPU cache from the PS, the second must not have
+    # promoted the default rows into any tier (misses stay misses).
+    for _ in range(2):
+        out = layer(keys)
+        assert torch.equal(out.cpu(), expected)
+
+
+@requires_nvhm
+@pytest.mark.parametrize("host_cache_size", [0, MISS_CACHE_SIZE], ids=["gpu+ps", "gpu+host+ps"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_pytorch_hierarchical_custom_default_embedding(host_cache_size, dtype):
+    # A user supplied row (in the layer dtype) is returned for full-tier misses.
+    weight = _miss_weight(dtype)
+    default = torch.full((MISS_EMBED_SIZE,), -7.0, dtype=dtype)
+    layer = _make_hierarchical(weight, host_cache_size=host_cache_size,
+                               config={"default_embedding": default})
+
+    keys = _miss_keys(MISS_KEYS[0], 3, MISS_KEYS[1])
+    expected = torch.stack([default, weight[3], default])
+    for _ in range(2):
+        out = layer(keys)
+        assert torch.equal(out.cpu(), expected)
+
+
+@requires_nvhm
+def test_pytorch_hierarchical_default_embedding_opt_out():
+    # An explicit empty default disables the miss fill; only hits are defined.
+    weight = _miss_weight()
+    layer = _make_hierarchical(weight, config={"default_embedding": []})
+    assert len(layer.config.default_embedding) == 0
+
+    out = layer(_miss_keys(7, MISS_KEYS[0]))
+    assert torch.equal(out[0].cpu(), weight[7])
+
+
+@requires_nvhm
+def test_pytorch_hierarchical_bag_default_embedding_pooled():
+    # Pooled lookups gather into a scratch buffer; the default row must land there too,
+    # so a missed key contributes the default to its bag.
+    weight = _miss_weight()
+    default = torch.full((MISS_EMBED_SIZE,), 2.0, dtype=torch.float32)
+    bag = _make_hierarchical(weight, bag_mode="sum", config={"default_embedding": default})
+
+    keys = _miss_keys(0, MISS_KEYS[0], 5, 9)
+    offsets = _miss_keys(0, 2, 4)
+    out = bag(keys, offsets)
+    expected = torch.stack([weight[0] + default, weight[5] + weight[9]])
+    assert torch.allclose(out.cpu(), expected)
+
+
+@requires_nvhm
+def test_pytorch_hierarchical_bag_misses_drop_out_by_default():
+    # Zero default: a missed key adds nothing to the bag sum.
+    weight = _miss_weight()
+    bag = _make_hierarchical(weight, bag_mode="sum")
+
+    keys = _miss_keys(0, MISS_KEYS[0], 5, MISS_KEYS[1])
+    offsets = _miss_keys(0, 2, 4)
+    out = bag(keys, offsets)
+    assert torch.allclose(out.cpu(), torch.stack([weight[0], weight[5]]))
+
+
+@requires_nvhm
+def test_pytorch_hierarchical_default_embedding_validation():
+    weight = _miss_weight()
+    with pytest.raises(ValueError, match="default_embedding"):
+        _make_hierarchical(weight, config={"default_embedding": torch.zeros(MISS_EMBED_SIZE + 1)})
+    # Same byte length as MISS_EMBED_SIZE x float32 but the wrong dtype.
+    with pytest.raises(ValueError, match="does not match layer data_type"):
+        _make_hierarchical(weight, config={"default_embedding": torch.zeros(MISS_EMBED_SIZE // 2, dtype=torch.float64)})
+
+
+@pytest.mark.parametrize("layer_type", LINEAR_LAYERS, ids=["gpu", "uvm"])
+def test_pytorch_default_row_index_routes_out_of_range_keys(layer_type):
+    # Keys outside [0, num_embeddings), including negatives, resolve to the configured row.
+    weight = _miss_weight()
+    layer = _make_linear(layer_type, weight, config={"default_row_index": 3})
+    assert layer.config.default_row_index == 3
+
+    keys = _miss_keys(7, MISS_KEYS[0], -3, MISS_KEYS[1])
+    expected = torch.stack([weight[7], weight[3], weight[3], weight[3]])
+    # Second round covers the UVM path once the GPU cache has been populated.
+    for _ in range(2):
+        out = layer(keys)
+        assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("layer_type", LINEAR_LAYERS, ids=["gpu", "uvm"])
+def test_pytorch_default_row_index_disabled_by_default(layer_type):
+    # Negative (the default) skips the range check; in-range lookups are unaffected.
+    weight = _miss_weight()
+    layer = _make_linear(layer_type, weight)
+    assert layer.config.default_row_index == -1
+
+    out = layer(_miss_keys(7, 12))
+    assert torch.equal(out.cpu(), weight[[7, 12]])
+
+
+@pytest.mark.parametrize("layer_type", LINEAR_LAYERS, ids=["gpu", "uvm"])
+def test_pytorch_default_row_index_bag_pooled(layer_type):
+    # The row substitution happens before pooling, so a missed key adds the default row.
+    weight = _miss_weight()
+    bag = _make_linear(layer_type, weight, bag_mode="sum", config={"default_row_index": 3})
+
+    keys = _miss_keys(0, MISS_KEYS[0], 5, 9)
+    offsets = _miss_keys(0, 2, 4)
+    out = bag(keys, offsets)
+    expected = torch.stack([weight[0] + weight[3], weight[5] + weight[9]])
+    assert torch.allclose(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("layer_type", LINEAR_LAYERS, ids=["gpu", "uvm"])
+def test_pytorch_default_row_index_outside_table_rejected(layer_type):
+    weight = _miss_weight()
+    with pytest.raises(RuntimeError, match="Default row index"):
+        _make_linear(layer_type, weight, config={"default_row_index": MISS_NUM_EMBEDDINGS})
+
 
 if __name__ == "__main__":
     #main(sys.argv[1:])

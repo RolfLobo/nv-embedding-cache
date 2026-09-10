@@ -201,10 +201,9 @@ void AutoInsertHandler::collect_keys_and_data(
   // contaminated with garbage values from unresolved slots. Per-call hitmask indices [0, collection_part_size)
   // map to insert_keys_ slots [collected_keys_, collected_keys_ + collection_part_size).
   if (h_hitmask) {
-    constexpr auto hitmask_elem_bits = sizeof(bitmask64_t) * 8;
     for (int64_t j = 0; j < collection_part_size; ++j) {
-      const auto word = h_hitmask[static_cast<uint64_t>(j) / hitmask_elem_bits];
-      const auto bit = (word >> (static_cast<uint64_t>(j) % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
+      const bitmask64_t word{h_hitmask[j / bitmask64::num_bits]};
+      const bool bit{bitmask64::get(word, j % bitmask64::num_bits)};
       if (!bit) {
         std::memcpy(dst_keys + j * key_size_, invalid_key_bytes_.data(), static_cast<size_t>(key_size_));
       }
@@ -393,8 +392,8 @@ void pool_gathered_host(context_ptr_t& ctx,
 
     auto thread_pool = ctx->get_thread_pool();
     const int64_t workers = std::max<int64_t>(1, thread_pool->num_workers());
-    const int64_t rows_per_task = std::max<int64_t>(1, (num_keys + workers - 1) / workers);
-    const int64_t num_tasks = (num_keys + rows_per_task - 1) / rows_per_task;
+    const int64_t rows_per_task = std::max<int64_t>(1, ceil_div(num_keys, workers));
+    const int64_t num_tasks = ceil_div(num_keys, rows_per_task);
     const auto copy_rows = [=](const int64_t task_idx) {
       const int64_t row_start = task_idx * rows_per_task;
       const int64_t row_end = std::min<int64_t>(row_start + rows_per_task, num_keys);
@@ -462,6 +461,20 @@ void pool_gathered_host(context_ptr_t& ctx,
                                              /*copy_content=*/true, lookup_stream);
     num_bags = pool_params.num_csr_offsets - 1;
     NVE_CHECK_(num_bags >= 0, "Invalid CSR offsets");
+    // Enforce the CSR contract before the pooling kernel indexes the gathered rows:
+    // offsets must start at 0, be non-decreasing, and end with a sentinel equal to
+    // num_keys (torch's include_last_offset=True convention). A bad span would
+    // otherwise read outside the num_keys-row gather buffer.
+    NVE_CHECK_ARG_(offsets_host[0] == 0, "CSR offsets must start at 0, got ", offsets_host[0]);
+    for (int64_t bag = 0; bag < num_bags; bag++) {
+      NVE_CHECK_ARG_(offsets_host[bag] <= offsets_host[bag + 1],
+                     "CSR offsets must be non-decreasing: offsets[", bag + 1, "] = ",
+                     offsets_host[bag + 1], " < offsets[", bag, "] = ", offsets_host[bag]);
+    }
+    NVE_CHECK_ARG_(static_cast<int64_t>(offsets_host[num_bags]) == num_keys,
+                   "CSR offsets must end with a trailing sentinel equal to the number of keys "
+                   "(include_last_offset=True convention): got ", offsets_host[num_bags],
+                   ", expected ", num_keys);
   }
 
   const void* weights = nullptr;

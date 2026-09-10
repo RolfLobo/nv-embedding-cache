@@ -61,7 +61,7 @@ void launch_sanitize_keys_kernel(const KeyType* keys,
     NVE_CHECK_(key_in_range(default_row, num_rows), "Default row is outside the table");
 
     constexpr uint32_t block_size = 256;
-    const auto grid_size = static_cast<uint32_t>((num_keys + block_size - 1) / block_size);
+    const auto grid_size = static_cast<uint32_t>(ceil_div(num_keys, static_cast<int64_t>(block_size)));
     sanitize_keys_kernel<KeyType><<<grid_size, block_size, 0, stream>>>(
         keys, out, num_keys, num_rows, default_row);
     NVE_CHECK_(cudaGetLastError()); // Check kernel launch didn't generate an error

@@ -23,8 +23,8 @@
 
 #pragma once
 
+#include <cstring>
 #include <random>
-#include <execution_context.hpp>
 #include <host_table_detail.hpp>
 #include <nvhm_map_table.hpp>
 #include <buffer_wrapper.hpp>
@@ -33,18 +33,21 @@
 namespace nve {
 namespace plugin {
 
-// TODO: Should we enable optimistic prefetch?
-inline constexpr bool use_optimistic_prefetch{false};
+constexpr int64_t max_prefetch_size{8 * cpu_cache_line_size};
 
 template <typename MapType, typename PartitionerType>
 NvhmMapTable<MapType, PartitionerType>::NvhmMapTable(
     const table_id_t id, const NvhmMapTableConfig& config)
-    : base_type(id, config), parts_(static_cast<uint64_t>(config.num_partitions)) {
+    : base_type(id, config), parts_(to_uint(config.num_partitions)) {
   NVE_CHECK_(config.key_size == sizeof(key_type));
+
+  const int64_t max_value_size{config.max_value_size};
+  conf_type conf;
+  conf.set_capacity(config.initial_capacity);
+  conf.set_blob(max_value_size, round_up(max_value_size, config.value_alignment));
+  conf.auto_adjust();
   for (auto& part : parts_) {
-    part.map = map_type(static_cast<uint64_t>(config.initial_capacity),
-                        static_cast<uint64_t>(config.max_value_size),
-                        static_cast<uint64_t>(config.value_alignment));
+    part.map = map_type(conf);
   }
 }
 
@@ -56,7 +59,7 @@ void NvhmMapTable<MapType, PartitionerType>::clear(context_ptr_t& ctx) {
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
 
   const auto f{[&parts](const int64_t task_idx) {
-    Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+    Partition& __restrict part{parts[to_uint(task_idx)]};
     std::lock_guard lock(part.read_write);
 
     part.map.clear();
@@ -66,34 +69,34 @@ void NvhmMapTable<MapType, PartitionerType>::clear(context_ptr_t& ctx) {
 }
 
 template <typename MapType, typename PartitionerType>
-void NvhmMapTable<MapType, PartitionerType>::erase(context_ptr_t& ctx, const int64_t n,
-                                                             buffer_ptr<const void> keys_bw) {
+void NvhmMapTable<MapType, PartitionerType>::erase(
+    context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw) {
   if (n <= 0) return;
-  const auto& __restrict config{config_};
+  auto modify_stream{ctx->get_modify_stream()};
 
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
-                                       ctx->get_modify_stream())
-              : nullptr};
-  const key_type* const __restrict keys{reinterpret_cast<const key_type*>(keys_vptr)};
+  const key_type* keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const key_type*>(p);
+  }
 
   std::vector<Partition>& __restrict parts{parts_};
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
   const int64_t num_parts_mask{num_parts - 1};
 
   const auto f{[n, keys, &parts, num_parts_mask](const int64_t task_idx) {
-    Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+    Partition& __restrict part{parts[to_uint(task_idx)]};
     std::lock_guard lock(part.read_write);
 
-    for (int64_t i{}; i != n; ++i) {
-      const key_type key{keys[i]};
+    for (int64_t ij{}; ij < n; ++ij) {
+      const key_type key{keys[ij]};
       if (partitioner(key, num_parts_mask) != task_idx) continue;
 
       part.map.erase(key);
     }
   }};
 
-  ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
+  ctx->get_thread_pool()->execute_n(0, num_parts, f, config_.workgroups, 1);
 }
 
 template <typename MapType, typename PartitionerType>
@@ -102,69 +105,74 @@ void NvhmMapTable<MapType, PartitionerType>::find(
     buffer_ptr<bitmask64_t> hit_mask_bw, const int64_t value_stride,
     buffer_ptr<void> values_bw, buffer_ptr<int64_t> value_sizes_bw) const {
   if (n <= 0) return;
-  const auto& __restrict config{config_};
+  auto lookup_stream{ctx->get_lookup_stream()};
 
-  auto lookup_stream = ctx->get_lookup_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
-              : nullptr};
-  bitmask64_t* const hit_mask{
-      hit_mask_bw ? hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
-                                               lookup_stream)
-                  : nullptr};
-  void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/,
-                                           lookup_stream)
-                : nullptr};
-  int64_t* const value_sizes{
-      value_sizes_bw ? value_sizes_bw->access_buffer(cudaMemoryTypeUnregistered,
-                                                     false /*copy_content*/, lookup_stream)
-                     : nullptr};
-  const key_type* const keys{reinterpret_cast<const key_type*>(keys_vptr)};
-  bitmask64_t* const hm{reinterpret_cast<bitmask64_t*>(hit_mask)};
-  char* const values{reinterpret_cast<char*>(values_vptr)};
+  const key_type* keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, lookup_stream)};
+    keys = static_cast<const key_type*>(p);
+  }
+  bitmask64_t* hit_mask;
+  if (hit_mask_bw) {
+    hit_mask = hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, lookup_stream);
+  } else {
+    const uint64_t size{to_uint(ceil_div(n, bitmask64::num_bits)) * sizeof(bitmask64_t)};
+    auto p{ctx->get_buffer("hitmask", size, true /*host_alloc*/)};
+    std::memset(p, 0, size);
+    hit_mask = static_cast<bitmask64_t*>(p);
+  }
+  std::byte* values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, false, lookup_stream)};
+    values = static_cast<std::byte*>(p);
+  }
+  int64_t* value_sizes{nullptr};
+  if (value_sizes_bw) {
+    value_sizes = value_sizes_bw->access_buffer(cudaMemoryTypeUnregistered, false, lookup_stream);
+  }
 
-  if (config.prefetch_values) {
-    switch (config.key_fetch_queue_length) {
+  if (config_.prefetch_values) {
+    switch (config_.key_fetch_queue_length) {
       case 0:
-        n = find_<0, true>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<0, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 1:
-        n = find_<1, true>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<1, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 2:
-        n = find_<2, true>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<2, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 4:
-        n = find_<4, true>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<4, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 8:
-        n = find_<8, true>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<8, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       default:
-        NVE_THROW_("`config.key_fetch_queue_length` (", config.key_fetch_queue_length, ") is out of bounds!");
+        NVE_THROW_("`key_fetch_queue_length` (", config_.key_fetch_queue_length, ") is out of bounds!");
     }
   } else {
-    switch (config.key_fetch_queue_length) {
+    switch (config_.key_fetch_queue_length) {
       case 0:
-        n = find_<0, false>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<0, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 1:
-        n = find_<1, false>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<1, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 2:
-        n = find_<2, false>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<2, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 4:
-        n = find_<4, false>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<4, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       case 8:
-        n = find_<8, false>(ctx, n, keys, hm, value_stride, values, value_sizes);
+        n = find_<8, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
         break;
       default:
-        NVE_THROW_("`config.key_fetch_queue_length` (", config.key_fetch_queue_length, ") is out of bounds!");
+        NVE_THROW_("`key_fetch_queue_length` (", config_.key_fetch_queue_length, ") is out of bounds!");
     }
   }
+
   auto counter = this->lookup_counter_storage(ctx);
   NVE_CHECK_(counter != nullptr, "Invalid key counter");
   *counter += n;
@@ -175,63 +183,50 @@ void NvhmMapTable<MapType, PartitionerType>::insert(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
     const int64_t value_stride, const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
-  const auto& __restrict config{config_};
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                : nullptr};
-  const key_type* const __restrict keys{reinterpret_cast<const key_type*>(keys_vptr)};
-  const char* const __restrict values{reinterpret_cast<const char*>(values_vptr)};
+  const key_type* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const key_type*>(p);
+  }
+  const std::byte* __restrict values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    values = static_cast<const std::byte*>(p);
+  }
 
   // TODO: Allow dynamically sized vectors.
-  NVE_CHECK_(value_size >= 0 && value_size <= config.max_value_size);
-  const int64_t overflow_margin{config.overflow_policy.overflow_margin};
-  const int64_t resolution_margin{static_cast<int64_t>(static_cast<double>(overflow_margin) *
-                                                       config.overflow_policy.resolution_margin)};
+  NVE_CHECK_(value_size >= 0 && value_size <= config_.max_value_size);
+  const int64_t overflow_margin{config_.overflow_policy.overflow_margin};
+  const int64_t resolution_margin{config_.overflow_policy.abs_resolution_margin()};
 
   std::vector<Partition>& __restrict parts{parts_};
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
   const int64_t num_parts_mask{num_parts - 1};
 
   const table_id_t table_id{this->id};
-  const auto f{[n, keys, value_stride, value_size, values, table_id, overflow_margin,
-                resolution_margin, &parts, num_parts_mask](const int64_t task_idx) {
-    Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+  const auto f{[n, keys, value_stride, value_size, values, overflow_margin,
+                resolution_margin, &parts, num_parts_mask, table_id](const int64_t task_idx) {
+    Partition& __restrict part{parts[to_uint(task_idx)]};
     std::lock_guard lock(part.read_write);
     map_type& __restrict map{part.map};
 
-    lru_meta_type lru_value;
-    if constexpr (std::is_same_v<meta_type, no_meta_type>) {
-    } else if constexpr (std::is_same_v<meta_type, lru_meta_type>) {
-      lru_value = lru_meta_value();
-    } else if constexpr (std::is_same_v<meta_type, lfu_meta_type>) {
-    } else {
-      static_assert(dependent_false_v<meta_type>, "Overflow handler not implemented.");
-    }
+    const meta_type meta_value{default_meta_value<meta_type>()};
 
     int64_t part_size{static_cast<int64_t>(map.size())};
-    for (int64_t i{}; i != n; ++i) {
-      const key_type key{keys[i]};
+    for (int64_t ij{}; ij < n; ++ij) {
+      const key_type key{keys[ij]};
       if (partitioner(key, num_parts_mask) != task_idx) continue;
 
-      int64_t new_part_size{part_size};
-      const write_pos_type pos{map.upsert(key, new_part_size)};
-      map.set_raw_values_at(pos, &values[i * value_stride], static_cast<uint64_t>(value_size));
+      const auto [pos, op]{map.insert(key)};
+      map.set_blob_at(pos, &values[ij * value_stride], value_size);
 
-      if (new_part_size == part_size) continue;
-      part_size = new_part_size;
+      if (op == nvhm::insert_op_t::found) continue;
+      ++part_size;
 
-      if constexpr (std::is_same_v<meta_type, no_meta_type>) {
-      } else if constexpr (std::is_same_v<meta_type, lru_meta_type>) {
-        map.value_at(pos) = lru_value;
-      } else if constexpr (std::is_same_v<meta_type, lfu_meta_type>) {
-        map.value_at(pos) = 1;
-      } else {
-        static_assert(dependent_false_v<meta_type>, "Overflow handler not implemented.");
+      if constexpr (!std::is_same_v<meta_type, no_meta_t>) {
+        map.value_at(pos) = meta_value;
       }
 
       // Handle overflows.
@@ -239,49 +234,38 @@ void NvhmMapTable<MapType, PartitionerType>::insert(
       NVE_LOG_VERBOSE_("NV map table ", table_id, " part ", task_idx,
                        " is overflowing. Attempting to resolve...");
 
-      if constexpr (std::is_same_v<meta_type, no_meta_type>) {
+      if constexpr (std::is_same_v<meta_type, no_meta_t>) {
         // Fetch all keys and shuffle them randomly.
-        std::vector<key_type> keys(map.size());
-        auto it{keys.begin()};
-        it = map.keys(it);
-        NVE_CHECK_(it == keys.end());
+        std::vector<key_type> keys(map.keys());
         std::shuffle(keys.begin(), keys.end(), std::default_random_engine{random_seed()});
 
-        // Reclaim slots until the resolution margin is reached.
-        const auto margin_it{keys.end() - resolution_margin};
-        for (it = keys.begin(); it < margin_it; ++it) {
+        // Reclaim slots above the resolution margin.
+        for (auto it{keys.begin() + resolution_margin}; it < keys.end(); ++it) {
           map.erase(*it);
         }
       } else {
-        // Fetch all keys and sort them by the ASCENDING by the associated meta-values.
-        std::vector<std::pair<key_type, meta_type>> keys_metas(map.size());
-        auto it{keys_metas.begin()};
-        it = map.keys_and_values(it);
-        NVE_CHECK_(it == keys_metas.end());
+        // Fetch all keys and sort them by the DESCENDING by the associated meta-values.
+        std::vector<std::pair<key_type, meta_type>> keys_metas(map.keys_and_values());
         std::sort(keys_metas.begin(), keys_metas.end(),
-                  [](const auto& a, const auto& b) { return a.second < b.second; });
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
 
-        // Reclaim slots until the resolution margin is reached.
-        const auto margin_it{keys_metas.end() - resolution_margin};
-        for (it = keys_metas.begin(); it < margin_it; ++it) {
+        // Reclaim slots above the resolution margin.
+        for (auto it{keys_metas.begin() + resolution_margin}; it < keys_metas.end(); ++it) {
           map.erase(it->first);
         }
 
-        if constexpr (std::is_same_v<meta_type, lru_meta_type>) {
-        } else if constexpr (std::is_same_v<meta_type, lfu_meta_type>) {
-          // Realign remaining frequency values to avoid entering a steady state.
-          map.transform_values([](meta_type& meta) { meta >>= 1; });
-        } else {
-          static_assert(dependent_false_v<meta_type>, "Overflow handler not implemented.");
+        // Realign remaining frequency values to avoid entering a steady state.
+        if constexpr (std::is_same_v<meta_type, lfu_meta_t>) {
+          map.for_each_value([](meta_type& meta_value) { meta_value >>= 1; });
         }
       }
 
-      // Update part_size after erasing
+      // Update part_size after erasing.
       part_size = static_cast<int64_t>(map.size());
     }
   }};
 
-  ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
+  ctx->get_thread_pool()->execute_n(0, num_parts, f, config_.workgroups, 1);
 }
 
 template <typename MapType, typename PartitionerType>
@@ -294,7 +278,7 @@ int64_t NvhmMapTable<MapType, PartitionerType>::size(context_ptr_t& ctx,
   const auto f{[&parts, &total_n](const int64_t task_idx) {
     int64_t n;
     {
-      const Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+      const Partition& __restrict part{parts[to_uint(task_idx)]};
       std::shared_lock lock(part.read_write);
 
       n = static_cast<int64_t>(part.map.size());
@@ -311,41 +295,42 @@ void NvhmMapTable<MapType, PartitionerType>::update(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
     const int64_t value_stride, const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
-  const auto& __restrict config{config_};
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                : nullptr};
-  const key_type* const __restrict keys{reinterpret_cast<const key_type*>(keys_vptr)};
-  const char* const __restrict values{reinterpret_cast<const char*>(values_vptr)};
+  const key_type* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const key_type*>(p);
+  }
+  const std::byte* __restrict values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    values = static_cast<const std::byte*>(p);
+  }
 
-  NVE_CHECK_(value_size >= 0 && value_size <= config.max_value_size);
+  NVE_CHECK_(value_size >= 0 && value_size <= config_.max_value_size);
 
   std::vector<Partition>& __restrict parts{parts_};
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
   const int64_t num_parts_mask{num_parts - 1};
 
   const auto f{[n, keys, value_stride, value_size, values, &parts, num_parts_mask](const int64_t task_idx) {
-    Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+    Partition& __restrict part{parts[to_uint(task_idx)]};
     std::lock_guard lock(part.read_write);
     map_type& __restrict map{part.map};
 
-    for (int64_t i{}; i != n; ++i) {
-      const key_type key{keys[i]};
+    for (int64_t ij{}; ij < n; ++ij) {
+      const key_type key{keys[ij]};
       if (partitioner(key, num_parts_mask) != task_idx) continue;
 
       const write_pos_type pos{map.update(key)};
       if (pos == nvhm::npos) continue;
 
-      map.set_raw_values_at(pos, &values[i * value_stride], static_cast<uint64_t>(value_size));
+      map.set_blob_at(pos, &values[ij * value_stride], value_size);
     }
   }};
 
-  ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
+  ctx->get_thread_pool()->execute_n(0, num_parts, f, config_.workgroups, 1);
 }
 
 template <typename MapType, typename PartitionerType>
@@ -354,253 +339,233 @@ void NvhmMapTable<MapType, PartitionerType>::update_accumulate(
     const int64_t update_stride, const int64_t update_size, buffer_ptr<const void> updates_bw,
     const DataType_t update_dtype) {
   if (n <= 0) return;
-  const auto& __restrict config{config_};
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const updates_vptr{
-      updates_bw ? updates_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                 : nullptr};
-  const key_type* const __restrict keys{reinterpret_cast<const key_type*>(keys_vptr)};
-  const char* const __restrict updates{reinterpret_cast<const char*>(updates_vptr)};
+  const key_type* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const key_type*>(p);
+  }
+  const std::byte* __restrict updates{nullptr};
+  if (updates_bw) {
+    auto p{updates_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    updates = static_cast<const std::byte*>(p);
+  }
 
-  NVE_CHECK_(update_size >= 0 && update_size <= config.max_value_size);
-  const update_kernel_t update_kernel{pick_cpu_update_kernel(config.value_dtype, update_dtype)};
+  const int64_t max_value_size{config_.max_value_size};
+  NVE_CHECK_(update_size >= 0 && update_size % dtype_size(update_dtype) == 0);
+  NVE_CHECK_(update_size / dtype_size(update_dtype) <= max_value_size / config_.value_dtype_size());
+  const update_kernel_t update_kernel{pick_cpu_update_kernel(config_.value_dtype, update_dtype)};
 
   std::vector<Partition>& __restrict parts{parts_};
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
   const int64_t num_parts_mask{num_parts - 1};
 
-  const auto f{[n, keys, update_stride, update_size, updates, &update_kernel, &parts, num_parts_mask](const int64_t task_idx) {
-    Partition& __restrict part{parts[static_cast<uint64_t>(task_idx)]};
+  const auto f{[n, keys, update_stride, update_size, updates, max_value_size, &update_kernel, &parts, num_parts_mask](const int64_t task_idx) {
+    Partition& __restrict part{parts[to_uint(task_idx)]};
     std::lock_guard lock(part.read_write);
     map_type& __restrict map{part.map};
 
-    for (int64_t i{}; i != n; ++i) {
-      const key_type key{keys[i]};
+    for (int64_t ij{}; ij < n; ++ij) {
+      const key_type key{keys[ij]};
       if (partitioner(key, num_parts_mask) != task_idx) continue;
 
       const write_pos_type pos{map.update(key)};
       if (pos == nvhm::npos) continue;
 
-      update_kernel(map.raw_values_at(pos), &updates[i * update_stride], update_size);
+      // TODO: Support variable length vector sizes.
+      const int64_t value_size{max_value_size};
+      std::byte* const blob{map.blob_at(pos)};
+      update_kernel(blob, blob, value_size, &updates[ij * update_stride], update_size);
     }
   }};
 
-  ctx->get_thread_pool()->execute_n(0, num_parts, f, config.workgroups, 1);
+  ctx->get_thread_pool()->execute_n(0, num_parts, f, config_.workgroups, 1);
 }
 
 template <typename MapType, typename PartitionerType>
-template <size_t KeyFetchQueueLength, bool PrefetchValues>
+template <int64_t PrefetchQueueLength, bool PrefetchValues>
 int64_t NvhmMapTable<MapType, PartitionerType>::find_(
   context_ptr_t& ctx, const int64_t n, const key_type* const __restrict keys,
-  bitmask64_t* const __restrict hit_mask, const int64_t value_stride, char* const __restrict values,
+  bitmask64_t* const __restrict hit_mask, const int64_t value_stride, std::byte* const __restrict values,
   int64_t* const __restrict value_sizes) const {
   if (values) {
     if (value_sizes) {
-      return find_<KeyFetchQueueLength, PrefetchValues, true, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
+      return find_<PrefetchQueueLength, PrefetchValues, true, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
     } else {
-      return find_<KeyFetchQueueLength, PrefetchValues, true, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
+      return find_<PrefetchQueueLength, PrefetchValues, true, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
     }
   } else {
     if (value_sizes) {
-      return find_<KeyFetchQueueLength, PrefetchValues, false, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
+      return find_<PrefetchQueueLength, PrefetchValues, false, true>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
     } else {
-      return find_<KeyFetchQueueLength, PrefetchValues, false, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
+      return find_<PrefetchQueueLength, PrefetchValues, false, false>(ctx, n, keys, hit_mask, value_stride, values, value_sizes);
     }
   }
 }
 
 template <typename MapType, typename PartitionerType>
-template <size_t KeyFetchQueueLength, bool PrefetchValues, bool WithValues, bool WithValueSizes>
+template <int64_t PrefetchQueueLength, bool PrefetchValues, bool WithValues, bool WithValueSizes>
 int64_t NvhmMapTable<MapType, PartitionerType>::find_(
     context_ptr_t& ctx, const int64_t n, const key_type* const __restrict keys,
-    bitmask64_t* const __restrict hit_mask, const int64_t value_stride, char* const __restrict values,
+    bitmask64_t* const __restrict hit_mask, const int64_t value_stride, std::byte* const __restrict values,
     int64_t* const __restrict value_sizes) const {
-  const auto& __restrict config{config_};
+  const int64_t num_masks{ceil_div(n, bitmask64::num_bits)};
 
-  const int64_t hm_size{ceil_div(n, bitmask64::num_bits)};
-
-  const int64_t max_value_size{config.max_value_size};
+  const int64_t max_value_size{config_.max_value_size};
   NVE_CHECK_(value_stride >= max_value_size);
-  const int64_t max_find_task_size{config.max_find_task_size};
+  const int64_t max_task_size{config_.max_find_task_size};
 
   const std::vector<Partition>& __restrict parts{parts_};
   const int64_t num_parts{static_cast<int64_t>(parts.size())};
   const int64_t num_parts_mask{num_parts - 1};
 
-  const int64_t num_tasks_per_part{(hm_size + max_find_task_size - 1) / max_find_task_size};
+  const int64_t num_tasks_per_part{ceil_div(num_masks, max_task_size)};
   const int64_t num_tasks{num_parts * num_tasks_per_part};
 
   std::atomic_int64_t total_num_hits{0};
-  const auto f{[n, keys, hit_mask, value_stride, values, value_sizes, hm_size,
-                max_value_size, max_find_task_size, &parts, num_parts, num_parts_mask,
+  const auto f{[n, keys, hit_mask, value_stride, values, value_sizes, num_masks,
+                max_value_size, max_task_size, &parts, num_parts, num_parts_mask,
                 num_tasks_per_part, &total_num_hits](int64_t task_idx) {
     int64_t num_hits{};
 
     const int64_t part_idx{task_idx / num_tasks_per_part};
     task_idx %= num_tasks_per_part;
 
-    int64_t hm_off0{max_find_task_size * task_idx};
-    const int64_t task_size{std::min(max_find_task_size, hm_size - hm_off0)};
-
     // Scatter parts accross input domain.
-    hm_off0 += hm_size * part_idx / num_parts;
+    int64_t i_base{max_task_size * task_idx};
+    const int64_t task_size{std::min(num_masks - i_base, max_task_size)};
+    i_base += num_masks * part_idx / num_parts;
+
     {
-      const Partition& __restrict part{parts[static_cast<uint64_t>(part_idx)]};
+      const Partition& __restrict part{parts[to_uint(part_idx)]};
       std::shared_lock lock(part.read_write);
       const map_type& __restrict map{part.map};
 
-      const char* __restrict prev_src{};
-      char* __restrict prev_dst{};
+      const std::byte* __restrict prev_src{};
+      std::byte* __restrict prev_dst{};
       int64_t prev_value_size{max_value_size};
-      const lru_meta_type lru_time{lru_meta_value()};
+      const meta_type meta_update{default_meta_value<meta_type>()};
 
-      for (int64_t hm_idx{}; hm_idx != task_size; ++hm_idx) {
-        const int64_t hm_off{(hm_off0 + hm_idx) % hm_size};
-        bitmask64_t mask{bitmask64::load(&hit_mask[hm_off])};
-        const int64_t i{hm_off * bitmask64::num_bits};
+      const auto process_next{[&](const int64_t j, const int64_t ij, read_pos_type&& pos) {
+        // TODO: Support variable length vector sizes.
+        const int64_t value_size{max_value_size};
+
+        if constexpr (WithValues) {
+          const std::byte* const __restrict src{map.blob_at(pos)};
+          std::byte* const __restrict dst{&values[ij * value_stride]};
+          if constexpr (PrefetchValues) {
+            l1_prefetch(src, dst, std::min(value_size, max_prefetch_size));
+            if (prev_src) {
+              std::memcpy(prev_dst, prev_src, to_uint(prev_value_size));
+            }
+            prev_src = src;
+            prev_dst = dst;
+            prev_value_size = value_size;
+          } else {
+            std::memcpy(dst, src, to_uint(value_size));
+          }
+        } else {
+          (void)value_stride;
+          (void)values;
+        }
+
+        // This may data-race with multiple threads. But losing some meta-updates is fine during find.
+        if constexpr (!std::is_same_v<meta_type, no_meta_t>) {
+          meta_type& __restrict meta_value{const_cast<meta_type&>(map.value_at(pos))};
+          if constexpr (std::is_same_v<meta_type, lru_meta_t>) {
+            meta_value = meta_update;
+          } else if constexpr (std::is_same_v<meta_type, lfu_meta_t>) {
+            if (meta_value < max_lfu_meta) meta_value += meta_update;
+          }
+        } else {
+          (void)meta_update;
+        }
+
+        if constexpr (WithValueSizes) {
+          value_sizes[ij] = value_size;
+        } else {
+          (void)value_sizes;
+        }
+
+        return bitmask64::single(j);
+      }};
+
+      for (int64_t i_off{}; i_off < task_size; ++i_off) {
+        const int64_t i{(i_base + i_off) % num_masks};
+        const int64_t i0{i * bitmask64::num_bits};
+
+        bitmask64_t mask{bitmask64::atomic_load(&hit_mask[i])};
         num_hits -= bitmask64::count(mask);
 
-        auto it_head{bitmask64::clip(~mask, n - i)};
-        if constexpr (KeyFetchQueueLength) {
-          bitmask64_t it_tail{};
-          const auto process_tail{[&](const int j, const read_pos_type& pos) {
-            const int64_t ij{i + j};
+        auto it{bitmask64::clip(~mask, n - i0)};
+        if constexpr (PrefetchQueueLength) {
+          nvhm::ring_prefetch_queue<key_type, prefetch_hint_type, PrefetchQueueLength> queue;
+          bitmask64_t it_queue{};
 
-            // TODO: Support variable length vector sizes.
-            const int64_t value_size{max_value_size};
-            if constexpr (WithValueSizes) {
-              value_sizes[ij] = value_size;
-            } else {
-              (void)value_sizes;
-            }
-            if constexpr (WithValues) {
-              const char* const __restrict src{map.raw_values_at(pos)};
-              char* const __restrict dst{&values[ij * value_stride]};
-              if constexpr (PrefetchValues) {
-                l1_prefetch(src, dst, std::min(value_size, 8 * cpu_cache_line_size));
-                if (prev_src) {
-                  nvhm::fast_copy(prev_dst, prev_src, static_cast<uint64_t>(prev_value_size));
-                }
-                prev_src = src;
-                prev_dst = dst;
-                prev_value_size = value_size;
-              } else {
-                nvhm::fast_copy(dst, src, static_cast<uint64_t>(value_size));
-              }
-            } else {
-              (void)value_stride;
-              (void)values;
-            }
+          while (it) {
+            const int64_t j{bitmask64::next(it)};
+            const int64_t ij{i0 + j};
+            it = bitmask64::skip(it);
 
-            if constexpr (std::is_same_v<meta_type, no_meta_type>) {
-            } else if constexpr (std::is_same_v<meta_type, lru_meta_type>) {
-              const_cast<lru_meta_type&>(map.value_at(pos)) = lru_time;
-            } else if constexpr (std::is_same_v<meta_type, lfu_meta_type>) {
-              ++const_cast<lfu_meta_type&>(map.value_at(pos));
-            } else {
-              static_assert(dependent_false_v<meta_type>, "Overflow handler not implemented.");
-            }
-            mask |= bitmask64::single(j);
-          }};
-
-          nvhm::experimental::ring_prefetch_queue<key_type, prefetch_type, KeyFetchQueueLength> queue;
-          while (it_head) {
-            const int64_t j{bitmask64::next(it_head)};
-            it_head = bitmask64::skip(it_head);
-            const int64_t ij{i + j};
-
-            const key_type key{keys[ij]};
+            key_type key{keys[ij]};
             if NVE_LIKELY_(partitioner(key, num_parts_mask) != part_idx) continue;
-            it_tail |= bitmask64::single(j);
+            it_queue |= bitmask64::single(j);
 
-            queue.prepare_lookup(map, key, use_optimistic_prefetch);
+            queue.prefill_read(map, std::move(key));
             if (queue.full()) break;
           }
 
-          while (it_head) {
-            const int64_t j{bitmask64::next(it_head)};
-            it_head = bitmask64::skip(it_head);
-            const int64_t ij{i + j};
+          for (; it; it = bitmask64::skip(it)) {
+            int64_t j{bitmask64::next(it)};
+            int64_t ij{i0 + j};
 
-            const key_type key{keys[ij]};
+            key_type key{keys[ij]};
             if NVE_LIKELY_(partitioner(key, num_parts_mask) != part_idx) continue;
-            it_tail |= bitmask64::single(j);
+            it_queue |= bitmask64::single(j);
 
-            const read_pos_type pos{queue.pop_and_lookup(map)};
+            auto [qkey, qhint]{queue.push_read(map, std::move(key))};
+            read_pos_type pos{map.find(std::move(qkey), std::move(qhint))};
             if (pos != nvhm::npos) {
-              process_tail(bitmask64::next(it_tail), pos);
+              j = bitmask64::next(it_queue);
+              ij = i0 + j;
+              mask |= process_next(j, ij, std::move(pos));
             }
-            it_tail = bitmask64::skip(it_tail);
-
-            queue.prepare_lookup(map, key, use_optimistic_prefetch);
+            it_queue = bitmask64::skip(it_queue);
           }
 
-          while (it_tail) {
-            const read_pos_type pos{queue.pop_and_lookup(map)};
+          for (; it_queue; it_queue = bitmask64::skip(it_queue)) {
+            auto [qkey, qhint]{queue.pop()};
+            read_pos_type pos{map.find(std::move(qkey), std::move(qhint))};
             if (pos != nvhm::npos) {
-              process_tail(bitmask64::next(it_tail), pos);
+              const int64_t j{bitmask64::next(it_queue)};
+              const int64_t ij{i0 + j};
+              mask |= process_next(j, ij, std::move(pos));
             }
-            it_tail = bitmask64::skip(it_tail);
           }
+          NVHM_ASSERT_(queue.empty());
         } else {
-          for (; it_head; it_head = bitmask64::skip(it_head)) {
-            const int64_t j{bitmask64::next(it_head)};
-            const int64_t ij{i + j};
+          for (; it; it = bitmask64::skip(it)) {
+            const int64_t j{bitmask64::next(it)};
+            const int64_t ij{i0 + j};
 
-            const key_type key{keys[ij]};
+            key_type key{keys[ij]};
             if NVE_LIKELY_(partitioner(key, num_parts_mask) != part_idx) continue;
 
-            const read_pos_type pos{map.lookup(key)};
-            if (pos == nvhm::npos) continue;
-
-            const int64_t value_size{max_value_size};  // TODO: Support variable length vector sizes.
-            if constexpr (WithValueSizes) {
-              value_sizes[ij] = value_size;
-            } else {
-              (void)value_sizes;
+            read_pos_type pos{map.find(std::move(key))};
+            if (pos != nvhm::npos) {
+              mask |= process_next(j, ij, std::move(pos));
             }
-            if constexpr (WithValues) {
-              const char* const __restrict src{map.raw_values_at(pos)};
-              char* const __restrict dst{&values[ij * value_stride]};
-              if constexpr (PrefetchValues) {
-                l1_prefetch(src, dst, std::min(value_size, 8 * cpu_cache_line_size));
-                if (prev_src) {
-                  nvhm::fast_copy(prev_dst, prev_src, static_cast<uint64_t>(prev_value_size));
-                }
-                prev_src = src;
-                prev_dst = dst;
-                prev_value_size = value_size;
-              } else {
-                nvhm::fast_copy(dst, src, static_cast<uint64_t>(value_size));
-              }
-            } else {
-              (void)value_stride;
-              (void)values;
-            }
-
-            if constexpr (std::is_same_v<meta_type, no_meta_type>) {
-            } else if constexpr (std::is_same_v<meta_type, lru_meta_type>) {
-              const_cast<lru_meta_type&>(map.value_at(pos)) = lru_time;
-            } else if constexpr (std::is_same_v<meta_type, lfu_meta_type>) {
-              ++const_cast<lfu_meta_type&>(map.value_at(pos));
-            } else {
-              static_assert(dependent_false_v<meta_type>, "Overflow handler not implemented.");
-            }
-            mask |= bitmask64::single(j);
           }
         }
 
         num_hits += bitmask64::count(mask);
-        bitmask64::atomic_join(&hit_mask[hm_off], mask);
+        bitmask64::atomic_merge(&hit_mask[i], mask);
       }
 
       if constexpr (WithValues && PrefetchValues) {
         if (prev_src) {
-          nvhm::fast_copy(prev_dst, prev_src, static_cast<uint64_t>(prev_value_size));
+          std::memcpy(prev_dst, prev_src, to_uint(prev_value_size));
         }
       }
     }
@@ -608,7 +573,7 @@ int64_t NvhmMapTable<MapType, PartitionerType>::find_(
     total_num_hits.fetch_add(num_hits, std::memory_order_relaxed);
   }};
 
-  ctx->get_thread_pool()->execute_n(0, num_tasks, f, config.workgroups, num_tasks_per_part);
+  ctx->get_thread_pool()->execute_n(0, num_tasks, f, config_.workgroups, num_tasks_per_part);
   return total_num_hits.load(std::memory_order_relaxed);
 }
 

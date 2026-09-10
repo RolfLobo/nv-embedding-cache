@@ -69,4 +69,4 @@ size_t PyStreamWrapper::read(void* data, size_t size)
     return total_bytes_read;
 }
 
-} // namespace nve
+}  // namespace nve

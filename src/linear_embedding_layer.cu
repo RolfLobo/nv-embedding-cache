@@ -230,7 +230,7 @@ void LinearUVMEmbeddingLayer<KeyType>::insert(context_ptr_t& ctx, const int64_t 
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
   auto values_bw = std::make_shared<BufferWrapper<const void>>(ctx, "values", values, values_buffer_size);
 
-  gpu_table_->insert(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_stride, std::move(values_bw));
+  gpu_table_->insert(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_size, std::move(values_bw));
 }
 
 template <typename KeyType>
@@ -254,13 +254,8 @@ void LinearUVMEmbeddingLayer<KeyType>::update(context_ptr_t& ctx, const int64_t 
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
   auto values_bw = std::make_shared<BufferWrapper<const void>>(ctx, "values", values, values_buffer_size);
 
-  if (auto_insert_handler_) {
-    auto_insert_handler_->lock_modify();
-  }
-  gpu_table_->update(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_stride, std::move(values_bw));
-  if (auto_insert_handler_) {
-    auto_insert_handler_->unlock_modify();
-  }
+  ScopedModifyLock modify_lock{auto_insert_handler_};
+  gpu_table_->update(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_size, std::move(values_bw));
 }
 
 template <typename KeyType>
@@ -284,13 +279,8 @@ void LinearUVMEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const int6
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
   auto values_bw = std::make_shared<BufferWrapper<const void>>(ctx, "values", values, values_buffer_size);
 
-  if (auto_insert_handler_) {
-    auto_insert_handler_->lock_modify();
-  }
-  gpu_table_->update_accumulate(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_stride, std::move(values_bw), value_type);
-  if (auto_insert_handler_) {
-    auto_insert_handler_->unlock_modify();
-  }
+  ScopedModifyLock modify_lock{auto_insert_handler_};
+  gpu_table_->update_accumulate(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw), value_stride, value_size, std::move(values_bw), value_type);
 }
 
 template <typename KeyType>
@@ -300,13 +290,8 @@ void LinearUVMEmbeddingLayer<KeyType>::clear(context_ptr_t& ctx) {
   auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
   NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
 
-  if (auto_insert_handler_) {
-    auto_insert_handler_->lock_modify();
-  }
+  ScopedModifyLock modify_lock{auto_insert_handler_};
   gpu_table_->clear(layer_ctx->table_contexts_.at(0));
-  if (auto_insert_handler_) {
-    auto_insert_handler_->unlock_modify();
-  }
 }
 
 template <typename KeyType>
@@ -325,13 +310,8 @@ void LinearUVMEmbeddingLayer<KeyType>::erase(context_ptr_t& ctx, const int64_t n
   auto keys_buffer_size = sizeof(KeyType) * num_keys;
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, keys_buffer_size);
 
-  if (auto_insert_handler_) {
-    auto_insert_handler_->lock_modify();
-  }
+  ScopedModifyLock modify_lock{auto_insert_handler_};
   gpu_table_->erase(layer_ctx->table_contexts_.at(0), num_keys, std::move(keys_bw));
-  if (auto_insert_handler_) {
-    auto_insert_handler_->unlock_modify();
-  }
 }
 
 template class LinearUVMEmbeddingLayer<int32_t>;

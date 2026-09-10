@@ -94,11 +94,13 @@ nve_status_t nve_table_find(
   if (!table || !table->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "table and ctx must not be NULL");
   }
+  if (n > 0 && !keys) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "keys must not be NULL when n > 0");
+  }
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();
     const auto keys_buffer_size = static_cast<size_t>(n * key_size);
-    constexpr auto hitmask_elem_bits = sizeof(nve::bitmask64_t) * 8;
-    const auto hitmask_elements = (static_cast<size_t>(n) + hitmask_elem_bits - 1) / hitmask_elem_bits;
+    const auto hitmask_elements = static_cast<size_t>(nve::ceil_div(n, nve::bitmask64::num_bits));
     const auto hitmask_buffer_size = static_cast<size_t>(hitmask_elements * sizeof(nve::bitmask64_t));
     const auto values_buffer_size = static_cast<size_t>(n * value_stride);
     const auto value_sizes_buffer_size = static_cast<size_t>(n) * sizeof(int64_t);
@@ -128,6 +130,9 @@ nve_status_t nve_table_insert(
   if (!table || !table->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "table and ctx must not be NULL");
   }
+  if (n > 0 && !keys) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "keys must not be NULL when n > 0");
+  }
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();
     const auto keys_buffer_size = static_cast<size_t>(n * key_size);
@@ -150,6 +155,9 @@ nve_status_t nve_table_update(
     int64_t value_stride, int64_t value_size, const void* values) {
   if (!table || !table->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "table and ctx must not be NULL");
+  }
+  if (n > 0 && !keys) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "keys must not be NULL when n > 0");
   }
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();
@@ -174,6 +182,9 @@ nve_status_t nve_table_update_accumulate(
     nve_data_type_t update_dtype) {
   if (!table || !table->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "table and ctx must not be NULL");
+  }
+  if (n > 0 && !keys) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "keys must not be NULL when n > 0");
   }
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();
@@ -207,6 +218,9 @@ nve_status_t nve_table_erase(
     nve_table_t table, nve_context_t ctx, int64_t n, const void* keys) {
   if (!table || !table->ptr || !ctx || !ctx->ptr) {
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "table and ctx must not be NULL");
+  }
+  if (n > 0 && !keys) {
+    return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, "keys must not be NULL when n > 0");
   }
   NVE_C_TRY
     const auto key_size = table->ptr->get_key_size();

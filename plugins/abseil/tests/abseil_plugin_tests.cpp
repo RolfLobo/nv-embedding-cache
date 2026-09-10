@@ -18,7 +18,6 @@
 #include <gtest/gtest.h>
 
 #include <abseil_flat_map_table.hpp>
-#include <json_support.hpp>
 
 using namespace nve;
 using namespace nve::plugin;

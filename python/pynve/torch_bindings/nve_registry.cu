@@ -100,4 +100,4 @@ void binding_lookup_with_pooling(const std::shared_ptr<NVEmbedBinding<int64_t>>&
                            weights, stream);
 }
 
-} // namespace nve
+}  // namespace nve

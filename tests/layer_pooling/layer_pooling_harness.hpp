@@ -37,8 +37,9 @@
 //
 // The matrix is generated as the cartesian product of the dimensions and filtered by Classify():
 //   Enabled    -> runs and must match the reference
-//   Disabled   -> generated + compiled but routed to a DISABLED_ instantiation (e.g. CUDA
-//                 cross-precision dequant output, which is not yet implemented)
+//   Rejected   -> a tracked capability gap (e.g. CUDA cross-precision dequant output, which is not
+//                 yet implemented): runs and must be refused with an InvalidArgumentError, so a
+//                 regression that silently returns a wrong result is caught
 //   Unsupported-> dropped entirely (never-valid combos)
 // Adding/removing support later is a one-line change in Classify().
 
@@ -68,6 +69,7 @@
 #include <host_table.hpp>
 #include <plugin/plugin_loader.hpp>
 
+#include "cuda_ptr.hpp"
 #include "test_utils.hpp"
 #include <linear_embedding_layer.hpp>
 #include <linear_host_table.hpp>
@@ -103,7 +105,7 @@ struct LayerPoolCase {
   int64_t       num_rows;       // size of the backing table
 };
 
-enum class CaseStatus { Enabled, Disabled, Unsupported };
+enum class CaseStatus { Enabled, Rejected, Unsupported };
 
 // ---------------------------------------------------------------------------
 // Small dtype/stride helpers (no padding -- keeps combine()'s value_count exact)
@@ -142,22 +144,26 @@ inline CaseStatus Classify(const LayerPoolCase& c) {
   if (weighted && c.weight_dtype != DataType_t::Float32 && c.weight_dtype != DataType_t::Float16) {
     return CaseStatus::Unsupported;
   }
-  // Non-quant input is not cast on output (no float->float cast path is tested): output == input.
-  // Quant input is dequantized to the requested float output.
-  if (!quant && c.out_dtype != c.in_dtype) {
+  // Quant input is dequantized to the requested float output. Non-quant input is cast only by the
+  // CPU pooling path, whose output dtype dispatch is independent of the input dtype
+  // (cpu_kernel_pooling_dispatch_out); the CUDA kernels have no float->float cast, so the
+  // GPU-backed layers only ever emit the input dtype and those combinations are dropped.
+  if (!quant && c.out_dtype != c.in_dtype &&
+      c.layer != LayerKind::Host && c.layer != LayerKind::HierWithoutGPU) {
     return CaseStatus::Unsupported;
   }
 
   // Per-layer capability gaps below are real but not (yet) supported. They are kept in the matrix
-  // as Disabled (compiled + listed, skipped by default) so coverage is tracked and self-documenting;
-  // promoting one to Enabled is a one-line change here when the underlying support lands.
+  // as Rejected -- they still run, asserting the layer refuses the request -- so the gap is tracked,
+  // self-documenting, and cannot regress into a silently wrong result. Promoting one to Enabled is
+  // a one-line change here when the underlying support lands.
   switch (c.layer) {
     case LayerKind::GPU:
       // Quantized tables gather raw rows first, then use the shared CUDA dequant/combine path.
       // That path supports both key widths and either float weight type, but emits only the
       // quantization metadata's float precision.
       if (quant) {
-        if (c.out_dtype != quant_rowwise_output_dtype(c.in_dtype)) return CaseStatus::Disabled;
+        if (c.out_dtype != quant_rowwise_output_dtype(c.in_dtype)) return CaseStatus::Rejected;
         return CaseStatus::Enabled;
       }
       // cuEmbed assumes the weight dtype equals the value dtype (always holds for enabled GPU cases,
@@ -170,7 +176,7 @@ inline CaseStatus Classify(const LayerPoolCase& c) {
       // The GPU dequant/combine kernels emit the dequantized result in the scale's float precision,
       // so cross-precision output (fp32 scale -> fp16 output, or vice versa) is not supported here.
       if (quant && c.out_dtype != quant_rowwise_output_dtype(c.in_dtype)) {
-        return CaseStatus::Disabled;
+        return CaseStatus::Rejected;
       }
       return CaseStatus::Enabled;
 
@@ -183,10 +189,10 @@ inline CaseStatus Classify(const LayerPoolCase& c) {
   return CaseStatus::Unsupported;
 }
 
-// Human-readable reason a case is Disabled (for diagnostics and the support-matrix doc). Returns
-// nullptr for cases that are not Disabled.
-inline const char* DisabledReason(const LayerPoolCase& c) {
-  if (Classify(c) != CaseStatus::Disabled) return nullptr;
+// Human-readable reason a case is Rejected (for diagnostics and the support-matrix doc). Returns
+// nullptr for cases that are not Rejected.
+inline const char* RejectionReason(const LayerPoolCase& c) {
+  if (Classify(c) != CaseStatus::Rejected) return nullptr;
   const bool quant = is_quant_rowwise(c.in_dtype);
   if (c.layer == LayerKind::GPU) {
     if (quant) {
@@ -261,12 +267,12 @@ inline std::ostream& operator<<(std::ostream& o, const LayerPoolCase& c) {
 }
 
 // ---------------------------------------------------------------------------
-// Case generation: cartesian product, then split into enabled / disabled.
+// Case generation: cartesian product, then split into enabled / rejected.
 // ---------------------------------------------------------------------------
 
 struct GeneratedCases {
   std::vector<LayerPoolCase> enabled;
-  std::vector<LayerPoolCase> disabled;
+  std::vector<LayerPoolCase> rejected;
 };
 
 inline GeneratedCases GenerateCases() {
@@ -293,7 +299,7 @@ inline GeneratedCases GenerateCases() {
   auto emit = [&](LayerPoolCase c) {
     switch (Classify(c)) {
       case CaseStatus::Enabled:     result.enabled.push_back(c);  break;
-      case CaseStatus::Disabled:    result.disabled.push_back(c); break;
+      case CaseStatus::Rejected:    result.rejected.push_back(c); break;
       case CaseStatus::Unsupported: break;
     }
   };
@@ -410,7 +416,9 @@ class PoolingHarness {
     if (h_table_) NVE_CHECK_(cudaFreeHost(h_table_));
   }
 
-  void Run() {
+  // expect_rejected drives a Rejected case: the combination is a tracked capability gap, so the
+  // layer must refuse the request instead of producing output.
+  void Run(bool expect_rejected = false) {
     ScopedDevice dev(kDeviceId);
     const bool concat = (c_.pooling == PoolingType_t::Concatenate);
 
@@ -468,11 +476,21 @@ class PoolingHarness {
     NVE_CHECK_(cudaMallocHost(&output_raw, out_bytes));
     // RAII guard: ASSERT_* macros issue an early return on failure, which would bypass a manual
     // cudaFreeHost call and leak pinned memory. output_guard will handle free in such cases.
-    std::unique_ptr<int8_t, decltype(&cudaFreeHost)> output_guard(output_raw, cudaFreeHost);
+    HostPtr<int8_t> output_guard(output_raw);
     int8_t* output = output_raw;
     std::memset(output, 0, out_bytes);
 
     std::vector<float> hitrates(static_cast<size_t>(layer_->get_num_tables()), 0.f);
+    if (expect_rejected) {
+      // The request is well-formed; only the dtype combination is unimplemented. It must be
+      // refused up front rather than produce a silently wrong result, so assert the error type
+      // and stop here -- there is no reference output to compare against.
+      EXPECT_THROW(layer_->lookup(ctx_, c_.num_keys, keys.data(), output, out_row_bytes_,
+                                  nullptr /*hitmask*/, &pp, hitrates.data()),
+                   InvalidArgumentError)
+          << "case " << c_ << " (" << RejectionReason(c_) << ")";
+      return;
+    }
     layer_->lookup(ctx_, c_.num_keys, keys.data(), output, out_row_bytes_, nullptr /*hitmask*/,
                    &pp, hitrates.data());
     if (c_.layer != LayerKind::Host && c_.layer != LayerKind::HierWithoutGPU) {
@@ -572,7 +590,7 @@ class PoolingHarness {
     int8_t* output_raw = nullptr;
     const size_t out_bytes = static_cast<size_t>(output_bags * padded_stride);
     NVE_CHECK_(cudaMallocHost(&output_raw, out_bytes));
-    std::unique_ptr<int8_t, decltype(&cudaFreeHost)> output_guard(output_raw, cudaFreeHost);
+    HostPtr<int8_t> output_guard(output_raw);
     std::memset(output_raw, 0, out_bytes);
 
     const bool gpu_backed = c_.layer == LayerKind::GPU || c_.layer == LayerKind::LinearUVM ||
@@ -653,7 +671,7 @@ class PoolingHarness {
     int8_t* output_raw = nullptr;
     const size_t out_bytes = static_cast<size_t>(output_bags * out_row_bytes_);
     NVE_CHECK_(cudaMallocHost(&output_raw, out_bytes));
-    std::unique_ptr<int8_t, decltype(&cudaFreeHost)> output_guard(output_raw, cudaFreeHost);
+    HostPtr<int8_t> output_guard(output_raw);
     std::memset(output_raw, 0x5A, out_bytes);  // poison so zero rows are proven written
 
     layer_->lookup(ctx_, c_.num_keys, keys.data(), output_raw, out_row_bytes_, nullptr /*hitmask*/,
@@ -812,13 +830,13 @@ class PoolingHarness {
 };
 
 // Dispatch on the key width chosen by the case.
-inline void RunCase(const LayerPoolCase& c) {
+inline void RunCase(const LayerPoolCase& c, bool expect_rejected = false) {
   if (c.key_is_int64) {
     PoolingHarness<int64_t> h(c);
-    h.Run();
+    h.Run(expect_rejected);
   } else {
     PoolingHarness<int32_t> h(c);
-    h.Run();
+    h.Run(expect_rejected);
   }
 }
 

@@ -61,6 +61,22 @@ constexpr bool is_success(const cudaError_t& result) noexcept {
   return result == cudaSuccess;
 }
 
+// True iff `result` says the CUDA runtime is being torn down at process exit
+// (cudaErrorCudartUnloading); logs the skipped cleanup step and clears the
+// sticky error so later probes are unaffected. Teardown paths (destructors and
+// the calls they make) use this to skip cleanup instead of throwing after the
+// runtime is gone — the OS reclaims the resources anyway. Lives in the nve
+// namespace so NVE_LOG_INFO_'s unqualified to_string resolves even when the
+// caller (e.g. ScopedDevice) is at global scope.
+inline bool cuda_runtime_unloading(const cudaError_t result, const char* skipped_what) {
+  if (result != cudaErrorCudartUnloading) {
+    return false;
+  }
+  cudaGetLastError();  // clear the sticky error
+  NVE_LOG_INFO_("CUDA runtime is shutting down - skipping ", skipped_what);
+  return true;
+}
+
 /**
  * Thrown if a CUDA runtime API call fails. Don't use this directly. Use the `NVE_THROW_` and
  * `NVE_CHECK_` macros instead.
@@ -76,17 +92,17 @@ class RuntimeError<cudaError_t> : public Exception {
                       const cudaError_t& error, const std::string& hint)
       : base_type(file, line, expr, hint), error_{error} {}
 
-  inline cudaError_t error() const noexcept { return error_; }
+  constexpr cudaError_t error() const noexcept { return error_; }
 
   inline const char* errorName() const noexcept { return cudaGetErrorName(error_); }
 
   inline const char* errorString() const noexcept { return cudaGetErrorString(error_); }
 
-  virtual const char* what() const noexcept override {
+  const char* what() const noexcept override {
     return hint().empty() ? errorString() : hint().c_str();
   }
 
-  virtual std::string to_string() const override {
+  std::string to_string() const override {
     std::ostringstream o;
 
     const char* const what{this->what()};

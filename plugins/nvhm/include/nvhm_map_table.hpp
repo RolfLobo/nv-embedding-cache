@@ -20,7 +20,7 @@
 #include <bit_ops.hpp>
 #include <host_table.hpp>
 #include <nvhashmap/map.hpp>
-#include <nvhashmap/experimental/prefetch.hpp>
+#include <nvhashmap/prefetch.hpp>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -28,24 +28,50 @@
 namespace nve {
 namespace plugin {
 
+constexpr int64_t default_nvhm_kernel_size{
+#if defined(NVE_FEATURE_HT_KERNEL_1)
+  1
+#elif defined(NVE_FEATURE_HT_KERNEL_2)
+  2
+#elif defined(NVE_FEATURE_HT_KERNEL_4)
+  4
+#elif defined(NVE_FEATURE_HT_KERNEL_8)
+  8
+#elif defined(NVE_FEATURE_HT_KERNEL_16)
+  16
+#elif defined(NVE_FEATURE_HT_KERNEL_32)
+  32
+#elif defined(NVE_FEATURE_HT_KERNEL_64)
+  64
+#elif defined(NVE_FEATURE_HT_KERNEL_128)
+  128
+#elif defined(NVE_FEATURE_HT_KERNEL_256)
+  256
+#elif defined(NVE_FEATURE_HT_KERNEL_512)
+  512
+#else
+#error At least one NVE_FEATURE_HT_KERNEL_xxx must be enabled. See CMakeLists.txt!
+#endif
+};
+
 struct NvhmMapTableConfig final : public HostTableConfig {
   using base_type = HostTableConfig;
 
   int64_t num_partitions{1};  // Number of partitions create (Must be a power of 2).
   Partitioner_t partitioner{default_partitioner};  // Partitioner to use.
   std::vector<int64_t> workgroups{0};  // Workgroup to use per partition (thread pool feature). Will wrap around.
-  int64_t max_find_task_size{128};  // Maximum number of masks to parse per "find" task (Must be a power of 2).
+  int64_t max_find_task_size{128};  // Maximum number of masks to parse per "find" task.
 
-  int64_t kernel_size{nvhm::default_kernel_t::size};  // Kernel size to use. Must be in a
-                                                                 // power of 2 between [1, 1024].
-  int64_t initial_capacity{4096};          // Initial capacity of each map. Must be >= 0.
+  int64_t kernel_size{default_nvhm_kernel_size};  // Kernel size to use. Must be a
+                                                  // power of 2 between [1, 512].
+  int64_t initial_capacity{4096};  // Initial capacity of each map. Must be >= 0.
   int64_t value_alignment{16};  // Alignment of stored values in memory (Must be > 0. For
-                                           // performance reasons we require a power of 2).
+                                // performance reasons we require a power of 2).
 
   int64_t key_fetch_queue_length{8};  // Key prefetching mechanism queue length. Must be in [0, 1, 2, 4, 8].
   bool prefetch_values{true};  // Issue software prefetches on values.
 
-  bool minimize_psl{false};  // Shorten probe search length, if certain conditions apply.
+  // TODO: Expose auto_scrub feature. May need some fine tuning.
   bool auto_shrink{false};   // Automatically, shrink map to save memory after massive evictions.
 
   OverflowPolicyConfig overflow_policy;  // Overflow detection / handling parameters.
@@ -62,15 +88,15 @@ class NvhmMapTable final : public HostTable<NvhmMapTableConfig> {
  public:
   using base_type = HostTable<NvhmMapTableConfig>;
   using map_type = MapType;
+  using conf_type = typename map_type::conf_type;
   using key_type = typename map_type::key_type;
-  using meta_type = std::conditional_t<map_type::has_values, typename map_type::value_type, void>;
-  using prefetch_type = typename map_type::prefetch_type;
+  using meta_type = typename map_type::value_type;
+  using prefetch_hint_type = typename map_type::prefetch_hint;
   using read_pos_type = typename map_type::read_pos_type;
   using write_pos_type = typename map_type::write_pos_type;
 
   static constexpr PartitionerType partitioner{};
-  static constexpr bool minimize_psl{map_type::minimize_psl};
-  static constexpr bool auto_shrink{map_type::auto_shrink};
+  static constexpr bool auto_shrink{nvhm::test_flags(map_type::flags, nvhm::flags_t::auto_shrink)};
 
   NVE_PREVENT_COPY_AND_MOVE_(NvhmMapTable);
 
@@ -101,15 +127,17 @@ class NvhmMapTable final : public HostTable<NvhmMapTableConfig> {
                          buffer_ptr<const void> updates, DataType_t update_dtype) override;
 
  private:
-  template <size_t KeyFetchQueueLength, bool PrefetchValues>
+  template <int64_t PrefetchQueueLength, bool PrefetchValues>
   int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
-                int64_t value_stride, char* values, int64_t* value_sizes) const;
+                int64_t value_stride, std::byte* values, int64_t* value_sizes) const;
 
-  template <size_t KeyFetchQueueLength, bool PrefetchValues, bool WithValues, bool WithValueSizes>
+  template <int64_t PrefetchQueueLength, bool PrefetchValues, bool WithValues, bool WithValueSizes>
   int64_t find_(context_ptr_t& ctx, int64_t n, const key_type* keys, bitmask64_t* hit_mask,
-                int64_t value_stride, char* values, int64_t* value_sizes) const;
+                int64_t value_stride, std::byte* values, int64_t* value_sizes) const;
 
  private:
+  using base_type::config_;
+
   struct Partition final {
     NVE_PREVENT_COPY_AND_MOVE_(Partition);
 

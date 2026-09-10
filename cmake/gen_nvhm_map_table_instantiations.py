@@ -17,7 +17,7 @@
 
 The factory dispatch chain in plugins/nvhm/src/nvhm_map_table.cpp (make_nvhm_map_table_1..6)
 instantiates NvhmMapTable across a large combination space (key x meta x kernel x
-minimize_psl x auto_shrink x partitioner). Compiling the whole matrix in that single translation
+auto_shrink x partitioner). Compiling the whole matrix in that single translation
 unit dominates the build time of the nvhm plugin (and the whole build's critical path).
 
 This script enumerates every combination the factory can produce for the enabled NVE feature set
@@ -55,6 +55,9 @@ KEYS = [
 ]
 
 KERNELS = [
+    ("ht_kernel_1", "nvhm::default_kernel1_t"),
+    ("ht_kernel_2", "nvhm::default_kernel2_t"),
+    ("ht_kernel_4", "nvhm::default_kernel4_t"),
     ("ht_kernel_8", "nvhm::default_kernel8_t"),
     ("ht_kernel_16", "nvhm::default_kernel16_t"),
     ("ht_kernel_32", "nvhm::default_kernel32_t"),
@@ -62,7 +65,6 @@ KERNELS = [
     ("ht_kernel_128", "nvhm::default_kernel128_t"),
     ("ht_kernel_256", "nvhm::default_kernel256_t"),
     ("ht_kernel_512", "nvhm::default_kernel512_t"),
-    ("ht_kernel_1024", "nvhm::default_kernel1024_t"),
 ]
 
 # AlwaysZeroPartitioner is unconditional: make_nvhm_map_table_6 uses it whenever
@@ -76,9 +78,9 @@ PARTITIONERS = [
 ]
 
 # Unconditional dimensions: every OverflowHandler_t meta type and both values of the runtime
-# config bools minimize_psl / auto_shrink.
-METAS = ["nve::no_meta_type", "nve::lru_meta_type", "nve::lfu_meta_type"]
-BOOLS = ["false", "true"]
+# config bools auto_shrink.
+METAS = ["nve::no_meta_t", "nve::lru_meta_t", "nve::lfu_meta_t"]
+FLAGS = ["nvhm::flags_t::blobs | nvhm::flags_t::aggressive_prefetch", "nvhm::flags_t::blobs | nvhm::flags_t::aggressive_prefetch | nvhm::flags_t::auto_shrink"]
 
 LICENSE_HEADER = """\
 /*
@@ -109,22 +111,21 @@ def enabled(table, features):
 
 
 def combinations(features):
-    """Yield (key, meta, kernel, minimize_psl, auto_shrink, partitioner) per factory combo."""
+    """Yield (key, meta, kernel, auto_shrink, partitioner) per factory combo."""
     for key in enabled(KEYS, features):
         for meta in METAS:
-            for kernel in enabled(KERNELS, features):
-                for psl in BOOLS:
-                    for shrink in BOOLS:
-                        for part in enabled(PARTITIONERS, features):
-                            yield (key, meta, kernel, psl, shrink, part)
+            for flags in FLAGS:
+                for kernel in enabled(KERNELS, features):
+                    for part in enabled(PARTITIONERS, features):
+                        yield (key, meta, flags, kernel, part)
 
 
 def instantiation(combo):
     """Return one explicit class instantiation definition for a combination."""
-    key, meta, kernel, psl, shrink, part = combo
+    key, meta, flags, kernel, part = combo
     return (
         f"template class nve::plugin::NvhmMapTable<\n"
-        f"    nvhm::map<{key}, {meta}, char, {kernel}, nvhm::default_seq_t, {psl}, {shrink}>,\n"
+        f"    nvhm::map<{key}, {meta}, {flags}, {kernel}, nvhm::default_seq_t>,\n"
         f"    {part}>;"
     )
 

@@ -66,7 +66,7 @@ void CallScatterKernelVecTypeSubwarp(
                               const cudaStream_t stream = 0)
 {
     uint32_t indices_per_warp = 64 / SubwarpWidth;
-    dim3 grid_size ((num_indices + indices_per_warp - 1) / indices_per_warp, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_indices), indices_per_warp), 1);
     dim3 block_size (SubwarpWidth, indices_per_warp);
     EmbedScatter<SubwarpWidth, DataType><<<grid_size, block_size, 0, stream>>>(
         src, dst, embed_width_in_bytes, embed_src_stride_in_bytes, embed_dst_stride_in_bytes, hit_mask, num_indices);

@@ -32,7 +32,7 @@ public:
             auto cmd_with_path = root_path;
             cmd_with_path += std::filesystem::path(cmd);
             if (cmd[0] == '!' ) {
-                // Commands starting with '!' are to be executed as-is with no path manipulation
+                // Commands starting with '!' are executed as-is; the rest are relative to the test binary dir
                 cmd_with_path = cmd.substr(1);
             }
             std::cout << "Running " << cmd_with_path << std::endl;
@@ -52,9 +52,9 @@ INSTANTIATE_TEST_SUITE_P(
     SampleSanity,
     ::testing::Values(
         std::vector<std::string>{
-            "../../samples/import_sample/gen_np_files.py",  // Generate temporary files needed by the sample
-            "import_sample",                                // Run the sample
-            "!rm /tmp/keys.npy /tmp/values.npy"},           // Cleanup temporary files
+            "!" NVE_SAMPLES_SRC_DIR "/import_sample/gen_np_files.py",  // Generate temporary files needed by the sample
+            "import_sample",                                          // Run the sample
+            "!rm /tmp/keys.npy /tmp/values.npy"},                     // Cleanup temporary files
         std::vector<std::string>{"simple_cpp"},
         std::vector<std::string>{"simple_sample"},
         std::vector<std::string>{"layer_sample"},

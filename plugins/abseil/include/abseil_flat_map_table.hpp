@@ -31,7 +31,7 @@ struct AbseilFlatMapTableConfig final : public STLContainerTableConfig {
   using base_type = STLContainerTableConfig;
 
   template <typename KeyType>
-  using map_type = absl::flat_hash_map<KeyType, char*>;
+  using map_type = absl::flat_hash_map<KeyType, std::byte*>;
 
   int64_t initial_capacity{};  // Initial capacity of each map. Must be >= 0.
 

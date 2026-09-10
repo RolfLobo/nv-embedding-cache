@@ -19,6 +19,7 @@
 #include <rocksdb_table.hpp>
 #include <rocksdb_utils.hpp>
 #include <buffer_wrapper.hpp>
+#include <cstring>
 
 namespace nve {
 namespace plugin {
@@ -26,7 +27,7 @@ namespace plugin {
 void RocksDBTableConfig::check() const {
   base_type::check();
 
-  NVE_CHECK_(max_batch_size > 0 && max_batch_size % 64 == 0);
+  NVE_CHECK_(max_batch_size > 0 && max_batch_size % bitmask64::num_bits == 0);
 
   NVE_CHECK_(!column_family.empty());
 }
@@ -52,11 +53,10 @@ void to_json(nlohmann::json& json, const RocksDBTableConfig& conf) {
 }
 
 RocksDBTable::RocksDBTable(const table_id_t id, const RocksDBTableConfig& config,
-                                     rdb_ctx_ptr_t& rdb_ctx,
-                                     rocksdb::ColumnFamilyHandle* const cf)
+                           rdb_ctx_ptr_t& rdb_ctx, rocksdb::ColumnFamilyHandle* const cf)
     : base_type(id, config),
       rdb_ctx_{rdb_ctx},
-      col_families_(static_cast<uint64_t>(config.max_batch_size), cf) {
+      col_families_(to_uint(config.max_batch_size), cf) {
   read_opts_.verify_checksums = config.verify_checksums;
   write_opts_.sync = false;
 }
@@ -67,38 +67,40 @@ void RocksDBTable::clear(context_ptr_t&) {
 
   // Keys are fixed-width binary under the default bytewise comparator, so
   // `key_size + 1` bytes of 0xFF sorts strictly after every possible key.
-  const std::string end_key(static_cast<size_t>(config_.key_size) + 1, '\xFF');
+  const std::string end_key(to_uint(config_.key_size) + 1, '\xFF');
+
   NVE_CHECK_(db->DeleteRange(write_opts_, cf, "", end_key));
+  NVE_CHECK_(db->Flush({}, cf));
+  NVE_CHECK_(db->CompactRange({}, cf, nullptr, nullptr));
 }
 
 void RocksDBTable::erase(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw) {
   if (n <= 0) return;
+  auto modify_stream{ctx->get_modify_stream()};
 
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
-                                       ctx->get_modify_stream())
-              : nullptr};
-  const char* const __restrict keys{reinterpret_cast<const char*>(keys_vptr)};
+  const char* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const char*>(p);
+  }
 
-  const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
-  const rocksdb::WriteOptions& __restrict write_opts{write_opts_};
 
-  const int64_t key_size{config.key_size};
-  const int64_t max_batch_size{std::min(n, config.max_batch_size)};
+  const int64_t key_size{config_.key_size};
+  const int64_t max_batch_size{std::min(n, config_.max_batch_size)};
 
   // TODO: Prone to memory fragmentation. Use a persistent scratch buffer instead?
   rocksdb::WriteBatch batch;
-  rocksdb::Slice k_view{nullptr, static_cast<uint64_t>(key_size)};
+  rocksdb::Slice k_view{nullptr, to_uint(key_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i != n; ++i) {
-    k_view.data_ = &keys[i * key_size];
+  for (int64_t ij{}; ij < n; ++ij) {
+    k_view.data_ = &keys[ij * key_size];
     NVE_CHECK_(batch.Delete(cf, k_view));
     if NVE_LIKELY_(++batch_size < max_batch_size) continue;
 
-    NVE_CHECK_(db->Write(write_opts, &batch));
+    NVE_CHECK_(db->Write(write_opts_, &batch));
     batch.Clear();
     batch_size = {};
   }
@@ -108,42 +110,46 @@ void RocksDBTable::erase(context_ptr_t& ctx, const int64_t n, buffer_ptr<const v
 }
 
 void RocksDBTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys_bw,
-                                  buffer_ptr<bitmask64_t> hit_mask_bw,
-                                  const int64_t value_stride, buffer_ptr<void> values_bw,
-                                  buffer_ptr<int64_t> value_sizes_bw) const {
+                        buffer_ptr<bitmask64_t> hit_mask_bw, const int64_t value_stride,
+                        buffer_ptr<void> values_bw, buffer_ptr<int64_t> value_sizes_bw) const {
   if (n <= 0) return;
+  auto lookup_stream{ctx->get_lookup_stream()};
 
-  auto lookup_stream = ctx->get_lookup_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, lookup_stream)
-              : nullptr};
-  bitmask64_t* const hit_mask{
-      hit_mask_bw ? hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/,
-                                               lookup_stream)
-                  : nullptr};
-  void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, false /*copy_content*/,
-                                           lookup_stream)
-                : nullptr};
-  int64_t* const value_sizes{
-      value_sizes_bw ? value_sizes_bw->access_buffer(cudaMemoryTypeUnregistered,
-                                                     false /*copy_content*/, lookup_stream)
-                     : nullptr};
-  const char* const __restrict keys{reinterpret_cast<const char*>(keys_vptr)};
-  char* const __restrict hm{reinterpret_cast<char*>(hit_mask)};
-  char* const __restrict values{reinterpret_cast<char*>(values_vptr)};
+  const char* keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, lookup_stream)};
+    keys = static_cast<const char*>(p);
+  }
+  bitmask64_t* hit_mask;
+  if (hit_mask_bw) {
+    hit_mask = hit_mask_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, lookup_stream);
+  } else {
+    const uint64_t size{to_uint(ceil_div(n, bitmask64::num_bits)) * sizeof(bitmask64_t)};
+    auto p{ctx->get_buffer("hitmask", size, true /*host_alloc*/)};
+    std::memset(p, 0, size);
+    hit_mask = static_cast<bitmask64_t*>(p);
+  }
+  char* values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, false, lookup_stream)};
+    values = static_cast<char*>(p);
+  }
+  int64_t* value_sizes{nullptr};
+  if (value_sizes_bw) {
+    value_sizes = value_sizes_bw->access_buffer(cudaMemoryTypeUnregistered, false, lookup_stream);
+  }
 
   if (values) {
     if (value_sizes) {
-      n = find_<true, true>(n, keys, hm, value_stride, values, value_sizes);
+      n = find_<true, true>(n, keys, hit_mask, value_stride, values, value_sizes);
     } else {
-      n = find_<true, false>(n, keys, hm, value_stride, values, value_sizes);
+      n = find_<true, false>(n, keys, hit_mask, value_stride, values, value_sizes);
     }
   } else {
     if (value_sizes) {
-      n = find_<false, true>(n, keys, hm, value_stride, values, value_sizes);
+      n = find_<false, true>(n, keys, hit_mask, value_stride, values, value_sizes);
     } else {
-      n = find_<false, false>(n, keys, hm, value_stride, values, value_sizes);
+      n = find_<false, false>(n, keys, hit_mask, value_stride, values, value_sizes);
     }
   }
 
@@ -153,42 +159,42 @@ void RocksDBTable::find(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> ke
 }
 
 void RocksDBTable::insert(context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw,
-                                    const int64_t value_stride, const int64_t value_size,
-                                    buffer_ptr<const void> values_bw) {
+                          const int64_t value_stride, const int64_t value_size,
+                          buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                : nullptr};
-  const char* const __restrict keys{reinterpret_cast<const char*>(keys_vptr)};
-  const char* const __restrict values{reinterpret_cast<const char*>(values_vptr)};
+  const char* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const char*>(p);
+  }
+  const char* __restrict values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    values = static_cast<const char*>(p);
+  }
 
-  const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
-  const rocksdb::WriteOptions& __restrict write_opts{write_opts_};
 
-  const int64_t key_size{config.key_size};
-  const int64_t max_batch_size{std::min(n, config.max_batch_size)};
-  NVE_CHECK_(value_size >= 0 && value_size <= config.max_value_size);
+  const int64_t key_size{config_.key_size};
+  const int64_t max_batch_size{std::min(n, config_.max_batch_size)};
+  NVE_CHECK_(value_size >= 0 && value_size <= config_.max_value_size);
 
   // TODO: Prone to memory fragmentation. Use a persistent scratch buffer instead?
   rocksdb::WriteBatch batch;
-  rocksdb::Slice k_view{nullptr, static_cast<uint64_t>(key_size)};
-  rocksdb::Slice v_view{nullptr, static_cast<uint64_t>(value_size)};
+  rocksdb::Slice k_view{nullptr, to_uint(key_size)};
+  rocksdb::Slice v_view{nullptr, to_uint(value_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i != n; ++i) {
-    k_view.data_ = &keys[i * key_size];
-    v_view.data_ = &values[i * value_stride];
+  for (int64_t ij{}; ij < n; ++ij) {
+    k_view.data_ = &keys[ij * key_size];
+    v_view.data_ = &values[ij * value_stride];
     NVE_CHECK_(batch.Put(cf, k_view, v_view));
     if NVE_LIKELY_(++batch_size < max_batch_size) continue;
 
-    NVE_CHECK_(db->Write(write_opts, &batch));
+    NVE_CHECK_(db->Write(write_opts_, &batch));
     batch.Clear();
     batch_size = {};
   }
@@ -214,51 +220,53 @@ int64_t RocksDBTable::size(context_ptr_t&, const bool exact) const {
 }
 
 void RocksDBTable::update(context_ptr_t& ctx, const int64_t n,
-                                    buffer_ptr<const void> keys_bw, const int64_t value_stride,
-                                    const int64_t value_size, buffer_ptr<const void> values_bw) {
+                          buffer_ptr<const void> keys_bw, const int64_t value_stride,
+                          const int64_t value_size, buffer_ptr<const void> values_bw) {
   if (n <= 0) return;
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const values_vptr{
-      values_bw ? values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                : nullptr};
-  const char* const __restrict keys{reinterpret_cast<const char*>(keys_vptr)};
-  const char* const __restrict values{reinterpret_cast<const char*>(values_vptr)};
+  const char* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const char*>(p);
+  }
+  bitmask64_t* __restrict const hit_mask{[&](){
+    const uint64_t size{to_uint(ceil_div(n, bitmask64::num_bits)) * sizeof(bitmask64_t)};
+    auto p{ctx->get_buffer("hitmask", size, true /*host_alloc*/)};
+    std::memset(p, 0, size);
+    return static_cast<bitmask64_t*>(p);
+  }()};
+  const char* __restrict values{nullptr};
+  if (values_bw) {
+    auto p{values_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    values = static_cast<const char*>(p);
+  }
 
-  // TODO: Prone to memory fragmentation. Also inefficient. Could we do this with MergeOperator's?
-  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), {});
-  char* const __restrict hm{reinterpret_cast<char*>(hit_mask.data())};
-  const int64_t num_hits{find_<false, false>(n, keys, hm, value_stride, nullptr, nullptr)};
-  if (!num_hits) return;
+  if (!find_<false, false>(n, keys, hit_mask, 0, nullptr, nullptr)) return;
 
-  const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
-  const rocksdb::WriteOptions& __restrict write_opts{write_opts_};
 
-  const int64_t key_size{config.key_size};
-  const int64_t max_batch_size{config.max_batch_size};
-  NVE_CHECK_(value_size >= 0 && value_size <= config.max_value_size);
+  const int64_t key_size{config_.key_size};
+  const int64_t max_batch_size{config_.max_batch_size};
+  NVE_CHECK_(value_size >= 0 && value_size <= config_.max_value_size);
 
   // TODO: Prone to memory fragmentation. Use a persistent scratch buffer instead?
   rocksdb::WriteBatch batch;
-  rocksdb::Slice k_view{nullptr, static_cast<uint64_t>(key_size)};
-  rocksdb::Slice v_view{nullptr, static_cast<uint64_t>(value_size)};
+  rocksdb::Slice k_view{nullptr, to_uint(key_size)};
+  rocksdb::Slice v_view{nullptr, to_uint(value_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
-    for (auto it{bitmask64::load(hm, i)}; it; it = bitmask64::skip(it)) {
-      const int64_t ij{i + bitmask64::next(it)};
+  for (int64_t i0{}; i0 < n; i0 += bitmask64::num_bits) {
+    for (auto it{hit_mask[i0 / bitmask64::num_bits]}; it; it = bitmask64::skip(it)) {
+      const int64_t ij{i0 + bitmask64::next(it)};
 
       k_view.data_ = &keys[ij * key_size];
       v_view.data_ = &values[ij * value_stride];
       NVE_CHECK_(batch.Put(cf, k_view, v_view));
       if NVE_LIKELY_(++batch_size < max_batch_size) continue;
 
-      NVE_CHECK_(db->Write(write_opts, &batch));
+      NVE_CHECK_(db->Write(write_opts_, &batch));
       batch.Clear();
       batch_size = {};
     }
@@ -272,130 +280,138 @@ void RocksDBTable::update_accumulate(
     context_ptr_t& ctx, const int64_t n, buffer_ptr<const void> keys_bw, const int64_t update_stride,
     const int64_t update_size, buffer_ptr<const void> updates_bw, const DataType_t update_dtype) {
   if (n <= 0) return;
+  auto modify_stream{ctx->get_modify_stream()};
 
-  auto modify_stream = ctx->get_modify_stream();
-  const void* const keys_vptr{
-      keys_bw ? keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-              : nullptr};
-  const void* const updates_vptr{
-      updates_bw ? updates_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy_content*/, modify_stream)
-                 : nullptr};
-  const char* const __restrict keys{reinterpret_cast<const char*>(keys_vptr)};
-  const char* const __restrict updates{reinterpret_cast<const char*>(updates_vptr)};
+  const char* __restrict keys{nullptr};
+  if (keys_bw) {
+    auto p{keys_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    keys = static_cast<const char*>(p);
+  }
+  bitmask64_t* __restrict const hit_mask{[&](){
+    const uint64_t size{to_uint(ceil_div(n, bitmask64::num_bits)) * sizeof(bitmask64_t)};
+    auto p{ctx->get_buffer("hitmask", size, true /*host_alloc*/)};
+    std::memset(p, 0, size);
+    return static_cast<bitmask64_t*>(p);
+  }()};
+  const char* __restrict updates{nullptr};
+  if (updates_bw) {
+    auto p{updates_bw->access_buffer(cudaMemoryTypeUnregistered, true /*copy*/, modify_stream)};
+    updates = static_cast<const char*>(p);
+  }
 
-  // TODO: Prone to memory fragmentation. Also inefficient. Could we do this with MergeOperator's?
-  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(n, bitmask64::num_bits)), {});
-  char* const __restrict hm{reinterpret_cast<char*>(hit_mask.data())};
-  const int64_t value_stride{config_.max_value_size};
-  std::vector<char> values_vec(static_cast<uint64_t>(n * value_stride));
-  char* const __restrict values{values_vec.data()};
-  std::vector<int64_t> value_sizes_vec(static_cast<uint64_t>(n));
-  int64_t* const __restrict value_sizes{value_sizes_vec.data()};
-  const int64_t num_hits{find_<true, true>(n, keys, hm, value_stride, values, value_sizes)};
-  if (!num_hits) return;
-  
-  const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   rocksdb::ColumnFamilyHandle* const __restrict cf{col_families_.front()};
-  const rocksdb::WriteOptions& __restrict write_opts{write_opts_};
 
-  const int64_t key_size{config.key_size};
-  const int64_t max_batch_size{config.max_batch_size};
-  NVE_CHECK_(update_size >= 0 && update_size <= value_stride);
-  const update_kernel_t update_kernel{pick_cpu_update_kernel(config.value_dtype, update_dtype)};
+  const int64_t key_size{config_.key_size};
+  const int64_t max_batch_size{config_.max_batch_size};
+  const int64_t max_value_size{config_.max_value_size};
+  NVE_CHECK_(update_size >= 0 && update_size % dtype_size(update_dtype) == 0);
+  NVE_CHECK_(update_size / dtype_size(update_dtype) <= max_value_size / config_.value_dtype_size());
+  const update_kernel_t update_kernel{pick_cpu_update_kernel(config_.value_dtype, update_dtype)};
+
+  // TODO: Prone to memory fragmentation. Maybe should avoid running a full `find_`?
+  std::vector<char> values(to_uint(n * max_value_size));
+  std::vector<int64_t> value_sizes(to_uint(n));
+  if (!find_<true, true>(n, keys, hit_mask, max_value_size, values.data(), value_sizes.data())) return;
 
   // TODO: Prone to memory fragmentation. Use a persistent scratch buffer instead?
   rocksdb::WriteBatch batch;
-  rocksdb::Slice k_view{nullptr, static_cast<uint64_t>(key_size)};
+  rocksdb::Slice k_view{nullptr, to_uint(key_size)};
 
   int64_t batch_size{};
-  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
-    for (auto it{bitmask64::load(hm, i)}; it; it = bitmask64::skip(it)) {
-      const int64_t ij{i + bitmask64::next(it)};
-      update_kernel(&values[ij * value_stride], &updates[ij * update_stride], update_size);
+  for (int64_t i0{}; i0 < n; i0 += bitmask64::num_bits) {
+    for (auto it{hit_mask[i0 / bitmask64::num_bits]}; it; it = bitmask64::skip(it)) {
+      const int64_t ij{i0 + bitmask64::next(it)};
+
+      char* value{&values[to_uint(ij * max_value_size)]};
+      const int64_t value_size{value_sizes[to_uint(ij)]};
+      update_kernel(value, value, value_size, &updates[ij * update_stride], update_size);
 
       k_view.data_ = &keys[ij * key_size];
-      const int64_t value_size{std::max(value_sizes[ij], update_size)};
-      NVE_CHECK_(batch.Put(cf, k_view,
-                           {&values[ij * value_stride], static_cast<uint64_t>(value_size)}));
+      NVE_CHECK_(batch.Put(cf, k_view, {value, to_uint(value_size)}));
       if NVE_LIKELY_(++batch_size < max_batch_size) continue;
 
-      NVE_CHECK_(db->Write(write_opts, &batch));
+      NVE_CHECK_(db->Write(write_opts_, &batch));
       batch.Clear();
       batch_size = {};
     }
   }
   if (batch_size) {
-    NVE_CHECK_(db->Write(write_opts, &batch));
+    NVE_CHECK_(db->Write(write_opts_, &batch));
   }
 }
 
-template <bool HasValues, bool HasValueSizes>
-int64_t RocksDBTable::find_(int64_t n, const char* const __restrict keys, char* const __restrict hm,
+template <bool WithValues, bool WithValueSizes>
+int64_t RocksDBTable::find_(int64_t n, const char* const __restrict keys, bitmask64_t* const __restrict hit_mask,
   int64_t value_stride, char* const __restrict values, int64_t* const __restrict value_sizes) const {
-  const auto& __restrict config{config_};
   std::unique_ptr<rocksdb::DB>& __restrict db{rdb_ctx_->db};
   const auto cfs{const_cast<rocksdb::ColumnFamilyHandle**>(col_families_.data())};
-  const rocksdb::ReadOptions& __restrict read_opts{read_opts_};
 
-  const int64_t key_size{config.key_size};
-  const int64_t max_batch_size{std::min(n, config.max_batch_size)};
+  const int64_t key_size{config_.key_size};
+  const int64_t max_batch_size{std::min(n, config_.max_batch_size)};
 
   // TODO: Prone to memory fragmentation. Use a persistent scratch buffer instead?
-  std::vector<rocksdb::Slice> k_views_vec(static_cast<uint64_t>(max_batch_size), {nullptr, static_cast<uint64_t>(key_size)});
-  rocksdb::Slice* const __restrict k_views{k_views_vec.data()};
-  std::vector<rocksdb::PinnableSlice> v_views_vec(static_cast<uint64_t>(max_batch_size));
-  rocksdb::PinnableSlice* const __restrict v_views{v_views_vec.data()};
-  std::vector<rocksdb::Status> statuses_vec(static_cast<uint64_t>(max_batch_size));
-  rocksdb::Status* const __restrict statuses{statuses_vec.data()};
+  std::vector<rocksdb::Slice> k_views(to_uint(max_batch_size), {nullptr, to_uint(key_size)});
+  std::vector<rocksdb::PinnableSlice> v_views(to_uint(max_batch_size));
+  std::vector<rocksdb::Status> statuses(to_uint(max_batch_size));
   int64_t batch_size{};
 
   int64_t num_hits{};
   const auto process_batch{[&]() {
-    db->MultiGet(read_opts, static_cast<uint64_t>(batch_size), cfs,
-                 k_views, v_views, nullptr, statuses);
+    db->MultiGet(read_opts_, to_uint(batch_size), cfs, k_views.data(), v_views.data(), nullptr, statuses.data());
 
     int64_t prev_i{-1};
     bitmask64_t mask{};
 
     for (int64_t k{}; k < batch_size; ++k) {
-      const rocksdb::Status& __restrict status{statuses[k]};
+      const rocksdb::Status& __restrict status{statuses[to_uint(k)]};
       if (status.IsNotFound()) continue;
       NVE_CHECK_(status);
 
       // Reconstruct ij from the key view.
-      const int64_t ij{(k_views[k].data() - keys) / key_size};
-      const int64_t i{ij & ~bitmask64::num_bits_mask};
-      const int64_t j{ij & bitmask64::num_bits_mask};
+      const int64_t ij{(k_views[to_uint(k)].data() - keys) / key_size};
+      const int64_t i{ij / bitmask64::num_bits};
+      const int64_t j{ij % bitmask64::num_bits};
 
       if (i != prev_i) {
         if (prev_i >= 0) {
-          bitmask64::store(hm, prev_i, mask);
+          hit_mask[prev_i] = mask;
         }
         prev_i = i;
-        mask = bitmask64::load(hm, i);
+        mask = hit_mask[i];
       }
+
+      const rocksdb::PinnableSlice& __restrict v_view{v_views[to_uint(k)]};
+      const int64_t value_size{static_cast<int64_t>(v_view.size())};
+
+      if constexpr (WithValues) {
+        NVE_CHECK_(value_size <= value_stride, "The value stored in RocksDB (=", value_size,
+          ") exceeds the value stride (=", value_stride, ").");
+        std::memcpy(&values[ij * value_stride], v_view.data(), to_uint(value_size));
+      } else {
+        NVE_ASSERT_(values == nullptr);
+        (void)values;
+        (void)value_stride;
+      }
+
+      if constexpr (WithValueSizes) {
+        value_sizes[ij] = value_size;
+      } else {
+        NVE_ASSERT_(value_sizes == nullptr);
+        (void)value_sizes;
+      }
+
       mask |= bitmask64::single(j);
       ++num_hits;
-
-      const rocksdb::PinnableSlice& __restrict v_view{v_views[k]};
-      const int64_t value_size{static_cast<int64_t>(v_view.size())};
-      if constexpr (HasValues) {
-        NVE_CHECK_(value_size <= value_stride);
-        std::copy_n(v_view.data(), value_size, &values[ij * value_stride]);
-      }
-      if constexpr (HasValueSizes) {
-        value_sizes[ij] = value_size;
-      }
     }
 
     if (prev_i >= 0) {
-      bitmask64::store(hm, prev_i, mask);
+      hit_mask[prev_i] = mask;
     }
   }};
   
-  for (int64_t i{}; i < n; i += bitmask64::num_bits) {
-    auto it{bitmask64::clip(~bitmask64::load(hm, i), n - i)};
+  for (int64_t i0{}; i0 < n; i0 += bitmask64::num_bits) {
+    auto it{bitmask64::clip(~hit_mask[i0 / bitmask64::num_bits], n - i0)};
 
     // Run query if the batch is about to overflow.
     if (batch_size + bitmask64::count(it) > max_batch_size) {
@@ -404,8 +420,8 @@ int64_t RocksDBTable::find_(int64_t n, const char* const __restrict keys, char* 
     }
 
     for (; it; it = bitmask64::skip(it)) {
-      const int64_t ij{i + bitmask64::next(it)};
-      k_views[batch_size++].data_ = &keys[ij * key_size];
+      const int64_t ij{i0 + bitmask64::next(it)};
+      k_views[to_uint(batch_size++)].data_ = &keys[ij * key_size];
     }
   }
   if (batch_size) {
@@ -457,10 +473,12 @@ host_table_ptr_t RocksDBTableFactory::produce(const table_id_t id,
                                })};
     if (it != ctx->col_families.end()) {
       cf = *it;
+    } else if (ctx->read_only) {
+      NVE_CHECK_(false, "Column family ", config.column_family, " not found. Cannot create new tables in read-only mode.");
     } else {
       NVE_CHECK_(
         ctx->db->CreateColumnFamily(ctx->col_family_opts, config.column_family, &cf));
-        ctx->col_families.emplace_back(cf);
+      ctx->col_families.emplace_back(cf);
     }
   }
 

@@ -22,11 +22,13 @@
 
 #include <gtest/gtest.h>
 
+#include "cuda_ptr.hpp"
 #include "include/buffer_wrapper.hpp"
 #include "include/common.hpp"
 #include "include/host_embedding_layer.hpp"
 #include "include/linear_host_table.hpp"
 #include "include/nve_types.hpp"
+#include "tests/host_layer_test_utils.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -37,15 +39,6 @@
 #include <vector>
 
 namespace nve {
-
-// Own the CUDA resources below so a failing ASSERT (which returns from the
-// enclosing test body) cannot leak them. Tests that assert on the release
-// status call the CUDA API directly on .release() instead.
-template <typename T>
-using DevicePtr = std::unique_ptr<T, decltype(&cudaFree)>;
-template <typename T>
-using PinnedPtr = std::unique_ptr<T, decltype(&cudaFreeHost)>;
-using StreamPtr = std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)>;
 
 struct HostLayerTestParams {
   int64_t row_size_bytes;
@@ -119,30 +112,19 @@ private:
   void Init() {
     const auto& params = GetParam();
 
-    LinearHostTableConfig cfg;
-    cfg.value_dtype = params.value_dtype;
-    cfg.max_threads = 64;
-    cfg.max_value_size = params.row_size_bytes;
-    cfg.num_rows = params.num_rows;
-
     const size_t table_size = static_cast<size_t>(params.row_size_bytes * params.num_rows);
     NVE_CHECK_(cudaMallocHost(&h_table_, table_size));
     const size_t elements = table_size / sizeof(DataType);
     for (size_t i = 0; i < elements; i++) {
       h_table_[i] = static_cast<DataType>(10000 + i);
     }
-    cfg.emb_table = h_table_;
 
-    table_ = std::make_shared<TableType>(cfg);
-
-    typename LayerType::Config layer_cfg;
-    layer_cfg.layer_name = "host_layer_test";
-    layer_ = std::make_shared<LayerType>(layer_cfg, table_);
-
-    // Null stream/allocator/threadpool: the layer delegates context creation to
-    // the host table and defaults to GetDefaultAllocator() / the default thread pool.
-    ctx_ = layer_->create_execution_context(/*lookup_stream=*/0, /*modify_stream=*/0,
-                                            /*thread_pool=*/nullptr, /*allocator=*/nullptr);
+    auto handles = nve_test::make_host_layer<KeyType>(
+        h_table_, params.row_size_bytes, params.num_rows, params.value_dtype,
+        /*max_threads=*/64, "host_layer_test");
+    table_ = std::move(handles.table);
+    layer_ = std::move(handles.layer);
+    ctx_ = std::move(handles.ctx);
   }
 };
 
@@ -199,7 +181,7 @@ void test_lookup_hitmask_multiple_of_64(HostLayerTest<KeyType>* t) {
 
   // Every requested key is in range, so all bits in every word are set.
   for (size_t w = 0; w < mask_words; w++) {
-    EXPECT_EQ(hitmask[w], ~bitmask64_t{0}) << "word " << w << " not all-ones";
+    EXPECT_EQ(hitmask[w], bitmask64::full) << "word " << w << " not all-ones";
   }
   for (size_t k = 0; k < keys.size(); k++) {
     const auto expected = t->read_backing_row(keys[k]);
@@ -256,15 +238,15 @@ void test_lookup_gpu_input(HostLayerTest<KeyType>* t) {
   KeyType* raw_keys = nullptr;
   void* raw_output = nullptr;
   ASSERT_EQ(cudaMalloc(&raw_keys, key_bytes), cudaSuccess);
-  DevicePtr<KeyType> d_keys(raw_keys, cudaFree);
+  DevicePtr<KeyType> d_keys(raw_keys);
   ASSERT_EQ(cudaMalloc(&raw_output, output_bytes), cudaSuccess);
-  DevicePtr<void> d_output(raw_output, cudaFree);
+  DevicePtr<void> d_output(raw_output);
   ASSERT_EQ(cudaMemcpy(d_keys.get(), h_keys.data(), key_bytes, cudaMemcpyHostToDevice),
             cudaSuccess);
 
   cudaStream_t raw_stream = nullptr;
   ASSERT_EQ(cudaStreamCreate(&raw_stream), cudaSuccess);
-  StreamPtr stream(raw_stream, cudaStreamDestroy);
+  StreamPtr stream(raw_stream);
   auto ctx = t->layer_->create_execution_context(stream.get(), stream.get(), nullptr, nullptr);
 
   t->layer_->lookup(ctx, static_cast<int64_t>(h_keys.size()), d_keys.get(), d_output.get(),
@@ -334,59 +316,45 @@ void test_noop_modifications(HostLayerTest<KeyType>* t) {
   EXPECT_NO_THROW(t->layer_->erase(t->ctx_, 1, keys.data(), /*table_id=*/0));
 }
 
+// table_id follows the layer contract: negative means all tables, 0 is the host table, anything
+// else is rejected. Negative ids used to be silently dropped by insert/erase.
+template <typename KeyType>
+void test_table_id_contract(HostLayerTest<KeyType>* t) {
+  const auto& params = t->GetParam();
+  const KeyType key = HostLayerTest<KeyType>::kTestKey;
+  std::vector<KeyType> keys{key};
+  std::vector<float> row(t->data_elements(), 2.5f);
+  std::vector<float> delta(t->data_elements(), 1.0f);
+
+  // negative == all tables: the ops apply to the single host table
+  EXPECT_NO_THROW(t->layer_->update(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                    params.row_size_bytes, row.data(), /*table_id=*/-1));
+  EXPECT_EQ(row, t->read_backing_row(key));
+  EXPECT_NO_THROW(t->layer_->accumulate(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                        params.row_size_bytes, delta.data(), params.value_dtype,
+                                        /*table_id=*/-1));
+  const auto after = t->read_backing_row(key);
+  for (size_t i = 0; i < after.size(); i++) {
+    EXPECT_FLOAT_EQ(row[i] + delta[i], after[i]);
+  }
+  EXPECT_NO_THROW(t->layer_->insert(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                    params.row_size_bytes, row.data(), /*table_id=*/-1));
+  EXPECT_NO_THROW(t->layer_->erase(t->ctx_, 1, keys.data(), /*table_id=*/-1));
+
+  // an id beyond the single table is invalid for every op
+  EXPECT_THROW(t->layer_->update(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                 params.row_size_bytes, row.data(), /*table_id=*/1), nve::Exception);
+  EXPECT_THROW(t->layer_->accumulate(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                     params.row_size_bytes, delta.data(), params.value_dtype,
+                                     /*table_id=*/1), nve::Exception);
+  EXPECT_THROW(t->layer_->insert(t->ctx_, 1, keys.data(), params.row_size_bytes,
+                                 params.row_size_bytes, row.data(), /*table_id=*/1), nve::Exception);
+  EXPECT_THROW(t->layer_->erase(t->ctx_, 1, keys.data(), /*table_id=*/1), nve::Exception);
+}
+
 // ----------------------------- pooling tests ----------------------------------
 
-// Serial CPU reference: pool the backing rows of `keys` into `num_bags` bags as
-// defined by `bag_offsets` (size num_bags+1), matching cpu_kernel_pooling.
-template <typename KeyType>
-std::vector<float> reference_pool(HostLayerTest<KeyType>* t, const std::vector<KeyType>& keys,
-                                  const std::vector<KeyType>& bag_offsets, PoolingType_t pooling,
-                                  const std::vector<float>& weights) {
-  const size_t elements = t->data_elements();
-  const size_t num_bags = bag_offsets.size() - 1;
-  const bool weighted = is_weighted_pooling(pooling);
-  const bool mean = (pooling == PoolingType_t::Mean) || (pooling == PoolingType_t::WeightedMean);
-  std::vector<float> expected(num_bags * elements, 0.0f);
-  for (size_t b = 0; b < num_bags; b++) {
-    const int64_t start = bag_offsets[b];
-    const int64_t end = bag_offsets[b + 1];
-    const int64_t count = end - start;
-    // WeightedMean divides by the sum of weights; Mean by the element count.
-    float inv = 1.0f;
-    if (mean) {
-      float denom = static_cast<float>(count);
-      if (weighted) {
-        denom = 0.0f;
-        for (int64_t k = start; k < end; k++) {
-          denom += weights[static_cast<size_t>(k)];
-        }
-      }
-      inv = (denom != 0.0f) ? 1.0f / denom : 0.0f;
-    }
-    for (size_t e = 0; e < elements; e++) {
-      float acc = 0.0f;
-      for (int64_t k = start; k < end; k++) {
-        float v = t->read_backing_row(keys[static_cast<size_t>(k)])[e];
-        if (weighted) {
-          v *= weights[static_cast<size_t>(k)];
-        }
-        acc += v;
-      }
-      expected[b * elements + e] = acc * inv;
-    }
-  }
-  return expected;
-}
-
-template <typename KeyType>
-std::vector<KeyType> make_keys(std::initializer_list<int64_t> ids) {
-  std::vector<KeyType> keys;
-  keys.reserve(ids.size());
-  for (int64_t id : ids) {
-    keys.push_back(static_cast<KeyType>(id));
-  }
-  return keys;
-}
+using nve_test::make_keys;
 
 // Fixed-hotness pooling: 6 keys, hotness 3 -> 2 bags. Exercises every pooling type.
 template <typename KeyType>
@@ -416,7 +384,8 @@ void test_pooling_fixed(HostLayerTest<KeyType>* t) {
     t->layer_->lookup(t->ctx_, static_cast<int64_t>(keys.size()), keys.data(), out.data(),
                       params.row_size_bytes, /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
 
-    const auto expected = reference_pool(t, keys, bag_offsets, pooling, weights);
+    const auto expected = nve_test::reference_pool(
+        t->h_table_, t->data_elements(), keys, bag_offsets, pooling, weights);
     ASSERT_EQ(out.size(), expected.size());
     for (size_t i = 0; i < out.size(); i++) {
       EXPECT_FLOAT_EQ(out[i], expected[i]) << "pooling " << static_cast<int>(pooling) << " elem " << i;
@@ -453,11 +422,40 @@ void test_pooling_csr(HostLayerTest<KeyType>* t) {
     t->layer_->lookup(t->ctx_, static_cast<int64_t>(keys.size()), keys.data(), out.data(),
                       params.row_size_bytes, /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
 
-    const auto expected = reference_pool(t, keys, offsets, pooling, weights);
+    const auto expected = nve_test::reference_pool(
+        t->h_table_, t->data_elements(), keys, offsets, pooling, weights);
     ASSERT_EQ(out.size(), expected.size());
     for (size_t i = 0; i < out.size(); i++) {
       EXPECT_FLOAT_EQ(out[i], expected[i]) << "pooling " << static_cast<int>(pooling) << " elem " << i;
     }
+  }
+}
+
+// Empty lookup (num_keys == 0) must not throw: a no-op without pooling, and with
+// CSR pooling the (all-empty) bags are zeroed, matching torch.nn.EmbeddingBag.
+template <typename KeyType>
+void test_lookup_empty(HostLayerTest<KeyType>* t) {
+  const auto& params = t->GetParam();
+
+  // No pooling: zero output rows, nothing to write.
+  t->layer_->lookup(t->ctx_, 0, /*keys=*/nullptr, /*output=*/nullptr, params.row_size_bytes,
+                    /*hitmask=*/nullptr, /*pool_params=*/nullptr, /*hitrates=*/nullptr);
+
+  // CSR pooling with two empty bags: both output rows are zeroed.
+  const auto offsets = make_keys<KeyType>({0, 0, 0});
+  const int64_t num_bags = 2;
+  EmbeddingLayerBase::PoolingParams pp;
+  pp.pooling_type = PoolingType_t::Sum;
+  pp.sparse_type = SparseType_t::CSR;
+  pp.output_type = params.value_dtype;
+  pp.csr_offsets = offsets.data();
+  pp.num_csr_offsets = static_cast<int64_t>(offsets.size());
+
+  std::vector<uint8_t> out(static_cast<size_t>(num_bags * params.row_size_bytes), 0xff);
+  t->layer_->lookup(t->ctx_, 0, /*keys=*/nullptr, out.data(), params.row_size_bytes,
+                    /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
+  for (size_t i = 0; i < out.size(); i++) {
+    ASSERT_EQ(out[i], 0) << "byte " << i;
   }
 }
 
@@ -482,7 +480,8 @@ void test_pooling_fp16_output(HostLayerTest<KeyType>* t) {
   t->layer_->lookup(t->ctx_, static_cast<int64_t>(keys.size()), keys.data(), out.data(), out_stride,
                     /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr);
 
-  const auto expected = reference_pool(t, keys, bag_offsets, PoolingType_t::Mean, {});
+  const auto expected = nve_test::reference_pool(
+      t->h_table_, t->data_elements(), keys, bag_offsets, PoolingType_t::Mean, {});
   ASSERT_EQ(out.size(), expected.size());
   for (size_t i = 0; i < out.size(); i++) {
     const float got = __half2float(out[i]);
@@ -535,7 +534,7 @@ void test_quant_pooling(DataType_t qtype) {
 
   int8_t* raw_buf = nullptr;
   ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
-  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
+  HostPtr<int8_t> buf(raw_buf);
 
   // deq[r][e] is the dequantized value the layer should produce for that element.
   std::vector<std::vector<float>> deq(static_cast<size_t>(num_rows),
@@ -777,7 +776,7 @@ void test_pooling_combo(DataType_t in_dtype, DataType_t out_dtype, DataType_t we
 
   int8_t* raw_buf = nullptr;
   ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
-  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
+  HostPtr<int8_t> buf(raw_buf);
 
   // val[r][e] is the effective (dequantized / stored) value the layer should see.
   std::vector<std::vector<float>> val;
@@ -953,7 +952,7 @@ void test_pooling_concat_convert(DataType_t in_dtype, DataType_t out_dtype) {
 
   int8_t* raw_buf = nullptr;
   ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
-  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
+  HostPtr<int8_t> buf(raw_buf);
   std::vector<std::vector<float>> val;
   fill_value_table(in_dtype, num_values, num_rows, buf.get(), row_stride, val);
 
@@ -1046,7 +1045,7 @@ void test_weighted_mean_zero_weight_sum(DataType_t in_dtype) {
 
   int8_t* raw_buf = nullptr;
   ASSERT_EQ(cudaMallocHost(&raw_buf, static_cast<size_t>(row_stride * num_rows)), cudaSuccess);
-  PinnedPtr<int8_t> buf(raw_buf, cudaFreeHost);
+  HostPtr<int8_t> buf(raw_buf);
   std::vector<std::vector<float>> val;
   fill_value_table(in_dtype, num_values, num_rows, buf.get(), row_stride, val);
 
@@ -1132,8 +1131,10 @@ HOST_LAYER_TEST(accumulate, test_accumulate)
 HOST_LAYER_TEST(lookup_gpu_input, test_lookup_gpu_input)
 HOST_LAYER_TEST(default_embedding_no_hitmask, test_default_embedding_no_hitmask)
 HOST_LAYER_TEST(noop_modifications, test_noop_modifications)
+HOST_LAYER_TEST(table_id_contract, test_table_id_contract)
 HOST_LAYER_TEST(pooling_fixed, test_pooling_fixed)
 HOST_LAYER_TEST(pooling_csr, test_pooling_csr)
+HOST_LAYER_TEST(lookup_empty, test_lookup_empty)
 HOST_LAYER_TEST(pooling_fp16_output, test_pooling_fp16_output)
 HOST_LAYER_TEST(pooling_output_stride_too_small, test_pooling_output_stride_too_small)
 

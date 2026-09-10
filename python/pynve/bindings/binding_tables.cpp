@@ -216,4 +216,4 @@ void ParameterServerTable::clear_keys() {
     clear(ctx_);
 }
 
-} // namespace nve
+}  // namespace nve

@@ -17,6 +17,7 @@
 
 #pragma once
 #include "embed_cache.h"
+#include <bit_ops.hpp>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -279,7 +280,7 @@ public:
     {
         try 
         {
-            cudaMemsetAsync(d_hit_mask, 0, (len+7)/8);
+            cudaMemsetAsync(d_hit_mask, 0, ceil_div<size_t>(len, 8));
             return ECERROR_SUCCESS;
         }
         catch (ECException& e)
@@ -384,6 +385,7 @@ public:
         return ECERROR_SUCCESS;
     }
 
+private:
     ECError start_custom_flow() override
     {
         return ECERROR_SUCCESS;
@@ -393,7 +395,7 @@ public:
     {
         return ECERROR_SUCCESS;
     }
-private:
+
     CacheConfig config_;
 };
 }

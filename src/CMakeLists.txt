@@ -24,7 +24,7 @@ set(FAC_GEN_SCRIPT ${PROJECT_SOURCE_DIR}/cmake/gen_find_and_combine_instantiatio
 # ones. Defaults to the constant at the head of the generator script; override here to retune for a
 # very different core count.
 set(FAC_NUM_TUS "" CACHE STRING "Override number of FindAndCombine generated .cu files (blank = script default)")
-if(FAC_NUM_TUS)
+if (FAC_NUM_TUS)
   set(_fac_num_tus_arg --num-tus ${FAC_NUM_TUS})
 endif()
 
@@ -32,7 +32,7 @@ endif()
 execute_process(
   COMMAND ${Python3_EXECUTABLE} ${FAC_GEN_SCRIPT} --out-dir ${FAC_GEN_DIR} ${_fac_num_tus_arg}
   RESULT_VARIABLE _fac_rc)
-if(NOT _fac_rc EQUAL 0)
+if (NOT _fac_rc EQUAL 0)
   message(FATAL_ERROR "FindAndCombine instantiation generation failed (${_fac_rc})")
 endif()
 include(${FAC_GEN_DIR}/find_and_combine_generated.cmake)  # -> FAC_GENERATED_SOURCES
@@ -58,7 +58,7 @@ target_compile_features(nve-common PUBLIC cxx_std_17)
 
 # In a driverless build the driver-API translation units (memblock_nvl.cpp, distributed.cpp)
 # compile to throwing stubs guarded by this define, and CUDA::cuda_driver is dropped below.
-if(NVE_DRIVERLESS_BUILD)
+if (NVE_DRIVERLESS_BUILD)
   target_compile_definitions(nve-common PRIVATE NVE_DRIVERLESS_BUILD)
 endif()
 
@@ -76,7 +76,7 @@ target_link_libraries(nve-common PUBLIC
 )
 
 # MPI Support
-if(NVE_DISABLE_MPI)
+if (NVE_DISABLE_MPI)
   target_compile_definitions(nve-common PRIVATE NVE_DISABLE_MPI)
 else()
   find_package(MPI REQUIRED)
@@ -85,7 +85,7 @@ else()
 endif()
 
 # link to cuda driver only on non driverless build
-if(NOT NVE_DRIVERLESS_BUILD)
+if (NOT NVE_DRIVERLESS_BUILD)
   target_link_libraries(nve-common PUBLIC CUDA::cuda_driver)
 endif()
 

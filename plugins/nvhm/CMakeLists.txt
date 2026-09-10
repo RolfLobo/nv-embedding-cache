@@ -27,7 +27,7 @@ include_directories(
 set(NVHM_GEN_SCRIPT ${PROJECT_SOURCE_DIR}/cmake/gen_nvhm_map_table_instantiations.py)
 set(NVHM_GEN_DIR ${CMAKE_BINARY_DIR}/plugins/nvhm/generated)
 set(NVHM_NUM_TUS "" CACHE STRING "Override number of NvhmMapTable generated .cpp files (blank = script default)")
-if(NVHM_NUM_TUS)
+if (NVHM_NUM_TUS)
   set(_nvhm_num_tus_arg --num-tus ${NVHM_NUM_TUS})
 endif()
 
@@ -35,7 +35,7 @@ execute_process(
   COMMAND ${Python3_EXECUTABLE} ${NVHM_GEN_SCRIPT} --out-dir ${NVHM_GEN_DIR}
           --features "${NVE_FEATURES}" ${_nvhm_num_tus_arg}
   RESULT_VARIABLE _nvhm_rc)
-if(NOT _nvhm_rc EQUAL 0)
+if (NOT _nvhm_rc EQUAL 0)
   message(FATAL_ERROR "NvhmMapTable instantiation generation failed (${_nvhm_rc})")
 endif()
 include(${NVHM_GEN_DIR}/nvhm_map_table_generated.cmake)  # -> NVHM_GENERATED_SOURCES
@@ -54,6 +54,6 @@ file(GLOB nve_plugin_nvhm_src "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 add_library(nve-plugin-nvhm SHARED ${nve_plugin_nvhm_src} ${NVHM_GENERATED_SOURCES})
 target_link_libraries(nve-plugin-nvhm PUBLIC nve-common)
 
-if(NOT NVE_DISABLE_TESTS_AND_SAMPLES)
+if (NOT NVE_DISABLE_TESTS_AND_SAMPLES)
   add_subdirectory(tests)
 endif()

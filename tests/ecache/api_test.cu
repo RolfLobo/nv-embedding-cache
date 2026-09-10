@@ -20,6 +20,8 @@
 #include "embedding_cache_combined.cuh"
 #include "datagen.h"
 #include <algorithm>
+#include <mutex>
+#include <stdexcept>
 #include "../common/check_error.h"
 #include <default_allocator.hpp>
 using namespace nve;
@@ -647,7 +649,7 @@ protected:
         // First populate the cache and make sure the keys are in the cache.
         size_t nSampleIndices = t.sample.numSamples * t.sample.sampleSize;
         size_t nMaxIndicesInCache = m_pCache->get_max_num_embedding_vectors_in_cache();
-        size_t nChunksToInsert = (nMaxIndicesInCache + nSampleIndices - 1) / nSampleIndices;
+        size_t nChunksToInsert = ceil_div(nMaxIndicesInCache, nSampleIndices);
         DefaultECEvent syncEvent(m_streams);
         std::vector<IndexT> hOriginalIdx;
         std::vector<float> originalPriorities(nMaxIndicesInCache, ORIGINAL_PRIORITY);
@@ -729,6 +731,49 @@ TEST(NegativeTests, InitZeroMemory)
     config.num_tables = 1;
     CacheSAHostModify<uint32_t, uint32_t> ec(&allocator, &logger, config);
     EXPECT_EQ(ec.init() , ECERROR_MEMORY_ALLOCATED_TO_CACHE_TOO_SMALL);
+}
+
+// A custom flow holds a shared lock that excludes invalidate and commit. A flow left open - e.g.
+// because a kernel launch threw between start and end - blocks every later modify forever.
+// Exposes the writer side so the test can assert the flow was closed without risking a hang.
+template <typename IndexT>
+class CustomFlowProbe : public CacheSAHostModify<IndexT, IndexT>
+{
+public:
+    using CacheSAHostModify<IndexT, IndexT>::CacheSAHostModify;
+
+    // Non-blocking: true iff no custom flow is currently open.
+    bool writer_can_acquire()
+    {
+        typename EmbedCacheSA<IndexT, IndexT>::WriteLock lock(this->custom_flow_mutex_, std::try_to_lock);
+        return lock.owns_lock();
+    }
+};
+
+TEST(CustomFlow, ClosedWhenScopeExitsViaThrow)
+{
+    DefaultAllocator allocator(DefaultAllocator::DEFAULT_HOST_ALLOC_THRESHOLD);
+    Logger logger;
+
+    typename CacheSAHostModify<uint32_t, uint32_t>::CacheConfig config;
+    config.cache_sz_in_bytes = 128 * 1024;
+    config.embed_width_in_bytes = 128;
+    config.num_tables = 1;
+
+    CustomFlowProbe<uint32_t> cache(&allocator, &logger, config);
+    ASSERT_TRUE(cache.writer_can_acquire()) << "no flow is open yet";
+
+    try
+    {
+        typename EmbedCacheBase<uint32_t>::ScopedCustomFlow flow(cache);
+        EXPECT_FALSE(cache.writer_can_acquire()) << "an open flow must exclude writers";
+        throw std::runtime_error("simulated kernel launch failure");
+    }
+    catch (const std::runtime_error&)
+    {
+    }
+
+    EXPECT_TRUE(cache.writer_can_acquire()) << "custom flow leaked on the throw path";
 }
 
 using Test_UINT32_T_FLOAT = ApiTest<uint32_t, float>;

@@ -96,3 +96,10 @@ inline nve::table_factory_ptr_t plugin_factory(
 #else
 #define SKIP_IF_ROCKSDB_UNAVAILABLE() ((void)0)
 #endif
+
+#ifndef NVE_FEATURE_SPH_PLUGIN
+#define SKIP_IF_SPH_UNAVAILABLE() \
+  GTEST_SKIP() << "sph plugin is not available (NVE_FEATURE_SPH_PLUGIN not defined)"
+#else
+#define SKIP_IF_SPH_UNAVAILABLE() ((void)0)
+#endif

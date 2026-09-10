@@ -21,8 +21,9 @@
 // real layer's lookup() with PoolingParams and compares the result against MockHostTable::combine().
 // Cases are grouped into one INSTANTIATE_TEST_SUITE_P per layer so CI can shard with
 // --gtest_filter (e.g. 'LinearUVM/*') or GTEST_TOTAL_SHARDS/GTEST_SHARD_INDEX. Planned-but-
-// unimplemented cross-precision CUDA dequant output combinations live under DISABLED_
-// instantiations; run them with --gtest_also_run_disabled_tests as support lands.
+// unimplemented cross-precision CUDA dequant output combinations are driven by a second test
+// (LookupRejectsUnsupportedCombo) under the Rejected_ instantiations: they run in CI and assert
+// the layer refuses the request, so the gap cannot regress into a silently wrong result.
 
 #include <gtest/gtest.h>
 
@@ -37,7 +38,7 @@ namespace {
 
 std::vector<LayerPoolCase> CasesFor(LayerKind layer, CaseStatus status) {
   const GeneratedCases g = GenerateCases();
-  const std::vector<LayerPoolCase>& src = (status == CaseStatus::Enabled) ? g.enabled : g.disabled;
+  const std::vector<LayerPoolCase>& src = (status == CaseStatus::Enabled) ? g.enabled : g.rejected;
   std::vector<LayerPoolCase> out;
   for (const auto& c : src) {
     if (c.layer == layer) out.push_back(c);
@@ -46,6 +47,25 @@ std::vector<LayerPoolCase> CasesFor(LayerKind layer, CaseStatus status) {
 }
 
 class LayerPoolingTest : public ::testing::TestWithParam<LayerPoolCase> {};
+
+// Same matrix, but for the combinations the layer is expected to refuse (CaseStatus::Rejected).
+// A separate fixture because INSTANTIATE_TEST_SUITE_P feeds every TEST_P in a suite.
+class LayerPoolingRejectionTest : public ::testing::TestWithParam<LayerPoolCase> {};
+
+// Non-null when the case cannot run in this environment (no CUDA device, or the PHMap plugin the
+// HierWithoutGPU topology needs was not built). Host and HierWithoutGPU run entirely on the CPU
+// pooling path, so they are not gated on a CUDA device beyond the harness's pinned-host allocs.
+const char* UnavailableReason(const LayerPoolCase& c) {
+  if (c.layer != LayerKind::Host && c.layer != LayerKind::HierWithoutGPU && !gpu_available()) {
+    return "No CUDA device available";
+  }
+#ifndef NVE_FEATURE_PHMAP_PLUGIN
+  if (c.layer == LayerKind::HierWithoutGPU) {
+    return "The HierWithoutGPU test topology requires the PHMap plugin";
+  }
+#endif
+  return nullptr;
+}
 
 TEST(LayerPoolingValidationTest, UnknownOutputTypeRejected) {
   EmbeddingLayerBase::PoolingParams pp;
@@ -201,21 +221,24 @@ TEST(LayerPoolingValidationTest, PaddedOutputStridePerLayer) {
 TEST_P(LayerPoolingTest, LookupVsReference) {
   cudaGetLastError();  // Clear any sticky error left by a previous test.
   const LayerPoolCase& c = GetParam();
-  // Host and HierWithoutGPU run entirely on the CPU pooling path (no GPU kernels), so they are not
-  // gated on a CUDA device beyond the harness's pinned-host allocations.
-  if (c.layer != LayerKind::Host && c.layer != LayerKind::HierWithoutGPU && !gpu_available()) {
-    GTEST_SKIP() << "No CUDA device available for " << c;
-  }
-#ifndef NVE_FEATURE_PHMAP_PLUGIN
-  if (c.layer == LayerKind::HierWithoutGPU) {
-    GTEST_SKIP() << "The HierWithoutGPU test topology requires the PHMap plugin";
-  }
-#endif
-  if (const char* reason = DisabledReason(c)) {
-    // Reached only via --gtest_also_run_disabled_tests. Surface the documented capability gap.
-    GTEST_LOG_(INFO) << "Known gap (DISABLED): " << reason;
+  if (const char* reason = UnavailableReason(c)) {
+    GTEST_SKIP() << reason << " for " << c;
   }
   RunCase(c);
+}
+
+// Tracked capability gaps: the request is well-formed and only the dtype combination is
+// unimplemented, so the layer must reject it with an InvalidArgumentError. Promote a group to
+// LayerPoolingTest by flipping its branch in Classify() from Rejected to Enabled when support
+// lands. See README.md for the per-layer reasons.
+TEST_P(LayerPoolingRejectionTest, LookupRejectsUnsupportedCombo) {
+  cudaGetLastError();  // Clear any sticky error left by a previous test.
+  const LayerPoolCase& c = GetParam();
+  if (const char* reason = UnavailableReason(c)) {
+    GTEST_SKIP() << reason << " for " << c;
+  }
+  SCOPED_TRACE(RejectionReason(c));
+  RunCase(c, true /*expect_rejected*/);
 }
 
 // Enabled cases: one instantiation per layer so CI shards by prefix (GPU/*, LinearUVM/*,
@@ -236,18 +259,16 @@ INSTANTIATE_TEST_SUITE_P(HierWithoutGPU, LayerPoolingTest,
                          ::testing::ValuesIn(CasesFor(LayerKind::HierWithoutGPU, CaseStatus::Enabled)),
                          CaseName());
 
-// Known capability gaps: compiled and listed, but disabled (the DISABLED_ prefix on each
-// instantiation disables the whole group) so they do not fail CI. Run with
-// --gtest_also_run_disabled_tests to track them; promote to Enabled in Classify() when support
-// lands. See README.md for the per-layer reasons. (Host has no gaps, so no DISABLED_Host group.)
-INSTANTIATE_TEST_SUITE_P(DISABLED_GPU, LayerPoolingTest,
-                         ::testing::ValuesIn(CasesFor(LayerKind::GPU, CaseStatus::Disabled)),
+// Known capability gaps, one instantiation per layer (the CPU-path layers have none, so there is
+// no Rejected_Host / Rejected_HierWithoutGPU group). These run in CI and must throw.
+INSTANTIATE_TEST_SUITE_P(Rejected_GPU, LayerPoolingRejectionTest,
+                         ::testing::ValuesIn(CasesFor(LayerKind::GPU, CaseStatus::Rejected)),
                          CaseName());
-INSTANTIATE_TEST_SUITE_P(DISABLED_LinearUVM, LayerPoolingTest,
-                         ::testing::ValuesIn(CasesFor(LayerKind::LinearUVM, CaseStatus::Disabled)),
+INSTANTIATE_TEST_SUITE_P(Rejected_LinearUVM, LayerPoolingRejectionTest,
+                         ::testing::ValuesIn(CasesFor(LayerKind::LinearUVM, CaseStatus::Rejected)),
                          CaseName());
-INSTANTIATE_TEST_SUITE_P(DISABLED_HierWithGPU, LayerPoolingTest,
-                         ::testing::ValuesIn(CasesFor(LayerKind::HierWithGPU, CaseStatus::Disabled)),
+INSTANTIATE_TEST_SUITE_P(Rejected_HierWithGPU, LayerPoolingRejectionTest,
+                         ::testing::ValuesIn(CasesFor(LayerKind::HierWithGPU, CaseStatus::Rejected)),
                          CaseName());
 
 }  // namespace

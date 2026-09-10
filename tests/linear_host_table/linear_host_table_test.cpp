@@ -116,8 +116,7 @@ public:
         std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(num_keys, bitmask64::num_bits)), 0);
         constexpr int64_t existing_hit_indices[] = {0, 2, 63, 69};
         for (const int64_t index : existing_hit_indices) {
-            hit_mask[static_cast<size_t>(index / bitmask64::num_bits)] |=
-                bitmask64::single(index % bitmask64::num_bits);
+            hit_mask[to_uint(index / bitmask64::num_bits)] |= bitmask64::single(index % bitmask64::num_bits);
         }
         // Padding bits outside num_keys must not be counted as existing hits.
         hit_mask.back() |= bitmask64::single(bitmask64::num_bits - 1);
@@ -275,7 +274,7 @@ private:
     }
 
     void find(KeyType* h_keys, int64_t num_keys, DataType* h_data, int64_t row_size) {
-        std::vector<bitmask64_t> hit_mask(((static_cast<size_t>(num_keys) + 63) / 64), 0);
+        std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(num_keys, bitmask64::num_bits)), 0);
         auto keys_bw = std::make_shared<BufferWrapper<const void>>(
             ctx_, "keys", h_keys, static_cast<size_t>(num_keys) * sizeof(KeyType));
         auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
@@ -344,4 +343,4 @@ INSTANTIATE_TEST_SUITE_P(
     LHTFixture_INT64_T,
     testing::ValuesIn(test_params));
 
-} // namespace nve 
+}  // namespace nve

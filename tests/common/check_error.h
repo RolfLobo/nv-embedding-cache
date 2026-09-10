@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include "gtest/gtest.h"
 #include "../../include/ecache/embed_cache.h" // for ECERROR_SUCCESS
 #include <cuda_runtime.h> // for cudaSuccess

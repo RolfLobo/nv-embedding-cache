@@ -30,6 +30,7 @@
 #include <string_view>
 #include <table.hpp>
 #include <execution_context.hpp>
+#include <variant>
 #include <vector>
 
 namespace nve {
@@ -209,69 +210,43 @@ void to_json(nlohmann::json& json, const OverflowHandler_t e);
 
 void from_json(const nlohmann::json& j, OverflowHandler_t& e);
 
-using no_meta_type = void;
-using lru_meta_type = std::chrono::system_clock::time_point;
-using lfu_meta_type = int64_t;
+using no_meta_t = std::monostate;
+using lru_meta_t = std::chrono::system_clock::time_point;
+using lfu_meta_t = int32_t;
 
-static_assert(sizeof(lru_meta_type) <= sizeof(int64_t));
-static_assert(sizeof(lfu_meta_type) <= sizeof(int64_t));
+constexpr lfu_meta_t max_lfu_meta{std::numeric_limits<lfu_meta_t>::max()};
 
-inline lru_meta_type lru_meta_value() noexcept {
-  // TODO: Assumes nodes are in sync. Add synchronized network timestamp provider?
-  return std::chrono::system_clock::now();
+// Just a sanity check. If any of this is violated, you need to check the codes that use these types.
+static_assert(sizeof(no_meta_t) == 1 && alignof(no_meta_t) == 1);
+static_assert(sizeof(lru_meta_t) <= sizeof(int64_t) && alignof(lru_meta_t) <= sizeof(int64_t));
+static_assert(sizeof(lfu_meta_t) <= sizeof(int64_t) && alignof(lfu_meta_t) <= sizeof(int64_t));
+
+template <typename Meta>
+inline Meta default_meta_value() noexcept {
+  if constexpr (std::is_same_v<Meta, no_meta_t>) {
+    return {};
+  } else if constexpr (std::is_same_v<Meta, lru_meta_t>) {
+    // TODO: Assumes nodes are in sync. Add synchronized network timestamp provider?
+    return std::chrono::system_clock::now();
+  } else if constexpr (std::is_same_v<Meta, lfu_meta_t>) {
+    return 1;
+  } else {
+    static_assert(dependent_false_v<Meta>, "Overflow handler not implemented.");
+  }
 }
 
-template <typename MetaType>
-constexpr OverflowHandler_t overflow_handler() noexcept {
-  if constexpr (std::is_same_v<MetaType, no_meta_type>) {
+template <typename Meta>
+constexpr OverflowHandler_t overflow_handler_v{[]() {
+  if constexpr (std::is_same_v<Meta, no_meta_t>) {
     return OverflowHandler_t::EvictRandom;
-  } else if constexpr (std::is_same_v<MetaType, lru_meta_type>) {
+  } else if constexpr (std::is_same_v<Meta, lru_meta_t>) {
     return OverflowHandler_t::EvictLRU;
-  } else if constexpr (std::is_same_v<MetaType, lfu_meta_type>) {
+  } else if constexpr (std::is_same_v<Meta, lfu_meta_t>) {
     return OverflowHandler_t::EvictLFU;
   } else {
-    static_assert(dependent_false_v<MetaType>);
+    static_assert(dependent_false_v<Meta>);
   }
-}
-
-constexpr int64_t meta_size(const OverflowHandler_t handler) noexcept {
-  switch (handler) {
-    case OverflowHandler_t::EvictRandom:
-      return 0; /* sizeof(no_meta_type); */
-    case OverflowHandler_t::EvictLRU:
-      return sizeof(lru_meta_type);
-    case OverflowHandler_t::EvictLFU:
-      return sizeof(lfu_meta_type);
-  }
-  NVE_ASSERT_(false);
-  return 0;
-}
-
-constexpr int64_t meta_align(const OverflowHandler_t handler) noexcept {
-  switch (handler) {
-    case OverflowHandler_t::EvictRandom:
-      return 1;
-    case OverflowHandler_t::EvictLRU:
-      return alignof(lru_meta_type);
-    case OverflowHandler_t::EvictLFU:
-      return alignof(lfu_meta_type);
-  }
-  NVE_ASSERT_(false);
-  return 1;
-}
-
-template <typename MetaType>
-constexpr void update_meta_data(void* __restrict const value, const lru_meta_type lru_time) noexcept {
-  if constexpr (std::is_same_v<MetaType, no_meta_type>) {
-    // Do nothing.
-  } else if constexpr (std::is_same_v<MetaType, lru_meta_type>) {
-    *reinterpret_cast<MetaType*>(value) = lru_time;
-  } else if constexpr (std::is_same_v<MetaType, lfu_meta_type>) {
-    ++(*reinterpret_cast<MetaType*>(value));
-  } else {
-    static_assert(dependent_false_v<MetaType>, "Overflow handler not implemented.");
-  }
-}
+}()};
 
 // Largest 64-bit integer that survives `int64_t -> double -> int64_t`.
 constexpr int64_t max_overflow_margin{std::numeric_limits<int64_t>::max() - 1023};
@@ -284,7 +259,31 @@ struct OverflowPolicyConfig {
 
   void check() const;
 
-  constexpr int64_t meta_size() const noexcept { return nve::meta_size(handler); }
+  constexpr int64_t meta_alignment() const noexcept {
+    switch (handler) {
+      case OverflowHandler_t::EvictRandom:
+        return alignof(no_meta_t);
+      case OverflowHandler_t::EvictLRU:
+        return alignof(lru_meta_t);
+      case OverflowHandler_t::EvictLFU:
+        return alignof(lfu_meta_t);
+    }
+    NVE_ASSERT_(false);
+    return 1;
+  }
+  
+  constexpr int64_t meta_size() const noexcept {
+    switch (handler) {
+      case OverflowHandler_t::EvictRandom:
+        return 0;
+      case OverflowHandler_t::EvictLRU:
+        return sizeof(lru_meta_t);
+      case OverflowHandler_t::EvictLFU:
+        return sizeof(lfu_meta_t);
+    }
+    NVE_ASSERT_(false);
+    return 0;
+  }
 
   constexpr int64_t abs_resolution_margin() const noexcept {
     return static_cast<int64_t>(static_cast<double>(overflow_margin) * resolution_margin);
@@ -380,7 +379,7 @@ class HostTableLike : public Table {
     static constexpr char buffer_name[]{"host_table_key_counter"};
 
     NVE_CHECK_(ctx != nullptr, "Invalid context");
-    void* buffer = ctx->get_buffer(buffer_name, sizeof(int64_t), true);
+    void* buffer = ctx->get_buffer(buffer_name, sizeof(int64_t), true /*host_alloc*/);
     NVE_CHECK_(buffer != nullptr, "Failed to get counter buffer");
     return reinterpret_cast<int64_t*>(buffer);
   }

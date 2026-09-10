@@ -548,7 +548,7 @@ private:
                     ? [&]{ auto s = module_path;
                            std::replace(s.begin(), s.end(), '.', '_');
                            return s; }()
-                    : storage_ref;
+                    : std::move(storage_ref);
 
                 if (layer_type == "LinearUVM") {
                     auto l = std::make_shared<LinearUVMEmbedding<int64_t>>(
@@ -557,7 +557,7 @@ private:
                     if (needs_weight_load && !weights_loaded.count(weight_key)) {
                         InputFileStreamWrapper ws(save_dir_ + "/weights/" + weight_key + ".nve");
                         l->load_tensor_from_stream(ws, layer_id);
-                        weights_loaded.insert(weight_key);
+                        weights_loaded.insert(std::move(weight_key));
                     }
                     layer = l;
                 } else if (layer_type == "GPULayer") {
@@ -566,7 +566,7 @@ private:
                     if (needs_weight_load && !weights_loaded.count(weight_key)) {
                         InputFileStreamWrapper ws(save_dir_ + "/weights/" + weight_key + ".nve");
                         l->load_tensor_from_stream(ws, layer_id);
-                        weights_loaded.insert(weight_key);
+                        weights_loaded.insert(std::move(weight_key));
                     }
                     layer = l;
                 } else {
@@ -575,7 +575,7 @@ private:
                     if (needs_weight_load && !weights_loaded.count(weight_key)) {
                         InputFileStreamWrapper ws(save_dir_ + "/weights/" + weight_key + ".nve");
                         l->load_tensor_from_stream(ws, layer_id);
-                        weights_loaded.insert(weight_key);
+                        weights_loaded.insert(std::move(weight_key));
                     }
                     layer = l;
                 }
@@ -610,4 +610,4 @@ private:
     std::map<int64_t, LoadedLayer> layers_;
 };
 
-} // namespace nve
+}  // namespace nve

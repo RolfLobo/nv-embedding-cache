@@ -195,7 +195,7 @@ TEST(NumaThreadPool, ParallelSubmit) {
         std::this_thread::yield();
       }
 
-      tp->submit_n(0, num_tasks, task, &res[static_cast<uint64_t>(num_tasks * i)]);
+      tp->submit_n(0, num_tasks, task, &res[to_uint(num_tasks * i)]);
       ready.fetch_add(1, std::memory_order_relaxed);
     });
   }
@@ -287,7 +287,7 @@ TEST(NumaThreadPool, ExecuteInWaves) {
         0, wave_size,
         [i, &tmp](const int64_t j) {
           std::this_thread::sleep_for(0.1s);
-          tmp[static_cast<size_t>(j)] += j;
+          tmp[to_uint(j)] += j;
           NVE_LOG_INFO_("Workload processed: ", i, '-', j);
         },
         i % tp->num_workgroups());

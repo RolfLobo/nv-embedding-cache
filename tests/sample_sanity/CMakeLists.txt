@@ -15,3 +15,5 @@
 
 add_executable(sample_sanity_test sample_sanity_test.cpp)
 target_link_libraries(sample_sanity_test PUBLIC gtest_main)
+# Scripts that live in the source tree are located via this path, so out-of-tree builds work
+target_compile_definitions(sample_sanity_test PRIVATE NVE_SAMPLES_SRC_DIR="${PROJECT_SOURCE_DIR}/samples")

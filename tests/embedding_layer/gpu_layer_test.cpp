@@ -20,6 +20,7 @@
 #include <buffer_wrapper.hpp>
 #include <gpu_embedding_layer.hpp>
 #include <key_utils.hpp>
+#include "cuda_ptr.hpp"
 #include "emb_layer_utils.hpp"
 #include <thread>
 #include <cuda_support.hpp>
@@ -49,23 +50,23 @@ class GPULayerLookupTest {
   static constexpr int DEVICE_ID = 0;
 
   GPULayerLookupTest(int64_t row_size, int64_t gpu_table_size, DataType_t data_type, size_t seed = 31337)
-    : m_row_size(row_size), m_rows(gpu_table_size / row_size) {
+    : row_size_(row_size), rows_(gpu_table_size / row_size) {
     // init linear table
     {
-      NVE_CHECK_(cudaMalloc(&m_gpu_table, static_cast<size_t>(m_row_size * m_rows)));
-      NVE_CHECK_(cudaMallocHost(&m_host_table, static_cast<size_t>(m_row_size * m_rows)));
-      NVE_CHECK_(m_row_size % dtype_size(data_type) == 0); // cannot use ASSERT_EQ in c'tor
+      NVE_CHECK_(cudaMalloc(&gpu_table_, static_cast<size_t>(row_size_ * rows_)));
+      NVE_CHECK_(cudaMallocHost(&host_table_, static_cast<size_t>(row_size_ * rows_)));
+      NVE_CHECK_(row_size_ % dtype_size(data_type) == 0); // cannot use ASSERT_EQ in c'tor
 
       // Init table values with multiple threads to save on test time
       std::vector<std::shared_ptr<std::thread>> input_gen_threads;
 
       constexpr int64_t num_threads = 32;
       for (int64_t t=0 ; t<num_threads ; t++) {
-        auto start_row = t * m_rows / num_threads;
-        auto end_row = std::min<int64_t>((t + 1) * m_rows / num_threads, m_rows);
+        auto start_row = t * rows_ / num_threads;
+        auto end_row = std::min<int64_t>((t + 1) * rows_ / num_threads, rows_);
 
         input_gen_threads.push_back(std::make_shared<std::thread>(
-          InitTableRows, m_host_table, m_row_size, start_row, end_row, data_type, seed + static_cast<size_t>(t)
+          InitTableRows, host_table_, row_size_, start_row, end_row, data_type, seed + static_cast<size_t>(t)
         ));
       }
       for (auto& t : input_gen_threads) {
@@ -74,30 +75,30 @@ class GPULayerLookupTest {
 
       HostTableConfig mock_cfg;
       mock_cfg.value_dtype = data_type;
-      mock_cfg.max_value_size = static_cast<int64_t>(m_row_size);
-      m_ref_tab = std::make_shared<MockHostTable<IndexT>>(mock_cfg, true /*functional_ref*/, m_host_table);
+      mock_cfg.max_value_size = static_cast<int64_t>(row_size_);
+      ref_tab_ = std::make_shared<MockHostTable<IndexT>>(mock_cfg, true /*functional_ref*/, host_table_);
     }
 
     // init layer
     {
-      NVE_CHECK_(cudaMemcpy(m_gpu_table, m_host_table, static_cast<size_t>(m_row_size * m_rows), cudaMemcpyHostToDevice));
+      NVE_CHECK_(cudaMemcpy(gpu_table_, host_table_, static_cast<size_t>(row_size_ * rows_), cudaMemcpyHostToDevice));
       GPUEmbeddingLayerConfig embedding_table_cfg;
       embedding_table_cfg.device_id = DEVICE_ID;
-      embedding_table_cfg.num_embeddings = static_cast<int64_t>(m_rows);
+      embedding_table_cfg.num_embeddings = static_cast<int64_t>(rows_);
       embedding_table_cfg.embedding_width_in_bytes = static_cast<int64_t>(row_size);
-      embedding_table_cfg.embedding_table = m_gpu_table;
+      embedding_table_cfg.embedding_table = gpu_table_;
       embedding_table_cfg.value_dtype = data_type;
-      m_layer = std::make_shared<GPUEmbeddingLayer<IndexT>>(embedding_table_cfg);
+      layer_ = std::make_shared<GPUEmbeddingLayer<IndexT>>(embedding_table_cfg);
     }
     // init context
-    m_ctx = m_layer->create_execution_context(0, 0, nullptr, nullptr);
+    ctx_ = layer_->create_execution_context(0, 0, nullptr, nullptr);
   }
 
   GPULayerLookupTest(GPUTestCase tc) : GPULayerLookupTest<IndexT>(tc.row_size, tc.gpu_table_size, tc.data_type) {}
 
   ~GPULayerLookupTest() {
-    NVE_CHECK_(cudaFree(m_gpu_table));
-    NVE_CHECK_(cudaFreeHost(m_host_table));
+    NVE_CHECK_(cudaFree(gpu_table_));
+    NVE_CHECK_(cudaFreeHost(host_table_));
   }
 
   void LookupAndCheck(const GPUTestCase& tc, std::vector<IndexT>& keys, uint64_t start_key = 0,
@@ -110,7 +111,7 @@ class GPULayerLookupTest {
     auto keys_buffer = setup.keys_buffer;
     auto output_bags = num_keys;
 
-    uint64_t output_size = static_cast<size_t>(num_keys * m_row_size);
+    uint64_t output_size = static_cast<size_t>(num_keys * row_size_);
     int8_t* output{nullptr};
     NVE_CHECK_(cudaMallocHost(&output, output_size));
     NVE_CHECK_(output != 0);
@@ -149,35 +150,35 @@ class GPULayerLookupTest {
         pp.weights = nullptr;
       }
 
-      m_layer->lookup(m_ctx, num_keys, keys_buffer, output, m_row_size, nullptr /*hitmask*/,
-                      &pp /*pool_params*/, hitrates.data());
+      layer_->lookup(ctx_, num_keys, keys_buffer, output, row_size_, nullptr /*hitmask*/,
+                     &pp /*pool_params*/, hitrates.data());
 
-      std::vector<int8_t> find_output(static_cast<size_t>(num_keys * m_row_size));
+      std::vector<int8_t> find_output(static_cast<size_t>(num_keys * row_size_));
       {
         auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-            m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+            ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
         auto values_bw = std::make_shared<BufferWrapper<void>>(
-            m_ctx, "values", find_output.data(),
-            static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-        m_ref_tab->find(m_ctx, num_keys, std::move(keys_bw), nullptr /*hitmask*/, m_row_size,
+            ctx_, "values", find_output.data(),
+            static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+        ref_tab_->find(ctx_, num_keys, std::move(keys_bw), nullptr /*hitmask*/, row_size_,
                            std::move(values_bw), nullptr /*value_sizes*/);
       }
 
-      m_ref_output.resize(static_cast<size_t>(output_bags * m_row_size));
-      m_ref_tab->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type,
+      ref_output_.resize(static_cast<size_t>(output_bags * row_size_));
+      ref_tab_->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type,
                          pp.csr_offsets, pp.num_csr_offsets, pp.fixed_hotness, pp.weights,
-                         pp.weight_type, m_ref_output.data());
+                         pp.weight_type, ref_output_.data());
     } else {
-      m_layer->lookup(m_ctx, num_keys, keys_buffer, output, m_row_size, nullptr /*hitmask*/,
+      layer_->lookup(ctx_, num_keys, keys_buffer, output, row_size_, nullptr /*hitmask*/,
                       nullptr, hitrates.data());
 
-      m_ref_output.resize(static_cast<size_t>(num_keys * m_row_size));
+      ref_output_.resize(static_cast<size_t>(num_keys * row_size_));
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-          m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+          ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
       auto values_bw = std::make_shared<BufferWrapper<void>>(
-          m_ctx, "values", m_ref_output.data(),
-          static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-      m_ref_tab->find(m_ctx, num_keys, std::move(keys_bw), nullptr /*hitmask*/, m_row_size,
+          ctx_, "values", ref_output_.data(),
+          static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+      ref_tab_->find(ctx_, num_keys, std::move(keys_bw), nullptr /*hitmask*/, row_size_,
                          std::move(values_bw), nullptr /*value_sizes*/);
     }
     
@@ -186,7 +187,7 @@ class GPULayerLookupTest {
     // compare hitrates
     ASSERT_EQ(hitrates[0], 1.0f);
 
-    const int64_t output_elements = static_cast<int64_t>(m_ref_output.size()) / dtype_size(tc.data_type);
+    const int64_t output_elements = static_cast<int64_t>(ref_output_.size()) / dtype_size(tc.data_type);
 
     float tolerance = 0.f;
     if (tc.do_pooling && tc.pooling_type != PoolingType_t::Concatenate) {
@@ -205,7 +206,7 @@ class GPULayerLookupTest {
     for (int64_t i=0 ; i<output_elements ; i++) {
       ASSERT_NEAR(
         load_as_float(output, i, tc.data_type),
-        load_as_float(m_ref_output.data(), i, tc.data_type),
+        load_as_float(ref_output_.data(), i, tc.data_type),
         tolerance
       );
 
@@ -217,7 +218,7 @@ class GPULayerLookupTest {
                                   bool use_weights) {
     const IndexT key = 0;
     const IndexT hotness = 1;
-    std::vector<int8_t> output(static_cast<size_t>(m_row_size));
+    std::vector<int8_t> output(static_cast<size_t>(row_size_));
     std::vector<int8_t> weights;
 
     EmbeddingLayerBase::PoolingParams pp;
@@ -231,7 +232,7 @@ class GPULayerLookupTest {
       pp.weight_type = weight_type;
     }
 
-    EXPECT_THROW(m_layer->lookup(m_ctx, 1, &key, output.data(), m_row_size,
+    EXPECT_THROW(layer_->lookup(ctx_, 1, &key, output.data(), row_size_,
                                  /*hitmask=*/nullptr, &pp, /*hitrates=*/nullptr),
                  Exception);
   }
@@ -242,13 +243,13 @@ class GPULayerLookupTest {
       return;
     }
 
-    SetupKeys setup(keys, start_key, end_key, datavectors, m_row_size);
+    SetupKeys setup(keys, start_key, end_key, datavectors, row_size_);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
     auto data_buffer = setup.data_buffer;
 
     // 1. lookup these keys to ref
-    auto output_size = static_cast<size_t>(num_keys * m_row_size);
+    auto output_size = static_cast<size_t>(num_keys * row_size_);
     int8_t* lookup_output{nullptr};
     NVE_CHECK_(cudaMallocHost(&lookup_output, output_size));
     NVE_CHECK_(lookup_output != 0);
@@ -256,12 +257,12 @@ class GPULayerLookupTest {
     std::vector<float> hitrates(3);
 
     // 3. call accumulate 
-    m_layer->update(m_ctx, num_keys, keys_buffer, m_row_size, m_row_size, data_buffer, -1);
+    layer_->update(ctx_, num_keys, keys_buffer, row_size_, row_size_, data_buffer, -1);
 
     NVE_CHECK_(cudaDeviceSynchronize());
 
     // 4. call lookup
-    m_layer->lookup(m_ctx, num_keys, keys_buffer, lookup_output, m_row_size, nullptr /*hitmask*/,
+    layer_->lookup(ctx_, num_keys, keys_buffer, lookup_output, row_size_, nullptr /*hitmask*/,
                     nullptr, hitrates.data());
 
     NVE_CHECK_(cudaDeviceSynchronize());
@@ -271,8 +272,8 @@ class GPULayerLookupTest {
 
     // 5. compare to ref
     for (int64_t i = 0; i < num_keys; i++) {
-      for (int64_t j = 0; j < m_row_size; j++) {
-        ASSERT_EQ(res_lookup_output[static_cast<size_t>((i * m_row_size) + j)], data_buffer[static_cast<size_t>((i * m_row_size) + j)]);
+      for (int64_t j = 0; j < row_size_; j++) {
+        ASSERT_EQ(res_lookup_output[static_cast<size_t>((i * row_size_) + j)], data_buffer[static_cast<size_t>((i * row_size_) + j)]);
       }
     }
 
@@ -285,20 +286,20 @@ class GPULayerLookupTest {
       return;
     }
   
-    SetupKeys setup(keys, start_key, end_key, datavectors, m_row_size);
+    SetupKeys setup(keys, start_key, end_key, datavectors, row_size_);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
 
     // 1. lookup these keys to ref
-    auto output_size = static_cast<size_t>(num_keys * m_row_size);
+    auto output_size = static_cast<size_t>(num_keys * row_size_);
     int8_t* lookup_output{nullptr};
     NVE_CHECK_(cudaMallocHost(&lookup_output, output_size));
     NVE_CHECK_(lookup_output != 0);
-    std::vector<int8_t> ref_lookup_output(static_cast<size_t>(num_keys * m_row_size));
-    std::vector<int8_t> res_lookup_output(static_cast<size_t>(num_keys * m_row_size));
+    std::vector<int8_t> ref_lookup_output(static_cast<size_t>(num_keys * row_size_));
+    std::vector<int8_t> res_lookup_output(static_cast<size_t>(num_keys * row_size_));
     std::vector<float> hitrates(3);
 
-    m_layer->lookup(m_ctx, num_keys, keys_buffer, lookup_output, m_row_size, nullptr /*hitmask*/,
+    layer_->lookup(ctx_, num_keys, keys_buffer, lookup_output, row_size_, nullptr /*hitmask*/,
                     nullptr, hitrates.data());
 
     NVE_CHECK_(cudaDeviceSynchronize());
@@ -334,12 +335,12 @@ class GPULayerLookupTest {
     }
 
     // 3. call accumulate 
-    m_layer->accumulate(m_ctx, num_keys, keys_buffer, m_row_size, m_row_size, setup.data_buffer, value_type, -1);
+    layer_->accumulate(ctx_, num_keys, keys_buffer, row_size_, row_size_, setup.data_buffer, value_type, -1);
 
     NVE_CHECK_(cudaDeviceSynchronize());
 
     // 4. call lookup
-    m_layer->lookup(m_ctx, num_keys, keys_buffer, lookup_output, m_row_size, nullptr /*hitmask*/,
+    layer_->lookup(ctx_, num_keys, keys_buffer, lookup_output, row_size_, nullptr /*hitmask*/,
                     nullptr, hitrates.data());
 
     NVE_CHECK_(cudaDeviceSynchronize());
@@ -356,15 +357,15 @@ class GPULayerLookupTest {
   }
 
  public:
-  const int64_t m_row_size;
-  const int64_t m_rows;
+  const int64_t row_size_;
+  const int64_t rows_;
  private:
-  std::vector<int8_t> m_ref_output;
-  int8_t* m_gpu_table{nullptr};
-  int8_t* m_host_table{nullptr};
-  std::shared_ptr<layer_type> m_layer{nullptr};
-  context_ptr_t m_ctx;
-  std::shared_ptr<MockHostTable<IndexT>> m_ref_tab{nullptr};
+  std::vector<int8_t> ref_output_;
+  int8_t* gpu_table_{nullptr};
+  int8_t* host_table_{nullptr};
+  std::shared_ptr<layer_type> layer_{nullptr};
+  context_ptr_t ctx_;
+  std::shared_ptr<MockHostTable<IndexT>> ref_tab_{nullptr};
 };
 
 TEST(GPUValidation, RejectsUnsupportedTableValueType) {
@@ -412,15 +413,16 @@ static void RunGpuLayerOutOfRangeKeysTest(bool accumulate) {
   for (size_t i = 0; i < total_floats; ++i) {
     ref_table[i] = static_cast<float>(i);
   }
-  float* d_table = nullptr;
-  NVE_CHECK_(cudaMalloc(&d_table, total_floats * sizeof(float)));
-  NVE_CHECK_(cudaMemcpy(d_table, ref_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
+  float* raw_table = nullptr;
+  NVE_CHECK_(cudaMalloc(&raw_table, total_floats * sizeof(float)));
+  DevicePtr<float> d_table(raw_table);
+  NVE_CHECK_(cudaMemcpy(d_table.get(), ref_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
 
   GPUEmbeddingLayerConfig cfg;
   cfg.device_id = 0;
   cfg.num_embeddings = num_rows;
   cfg.embedding_width_in_bytes = row_size;
-  cfg.embedding_table = d_table;
+  cfg.embedding_table = d_table.get();
   cfg.value_dtype = DataType_t::Float32;
   auto layer = std::make_shared<GPUEmbeddingLayer<IndexT>>(cfg);
   auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
@@ -467,7 +469,7 @@ static void RunGpuLayerOutOfRangeKeysTest(bool accumulate) {
   NVE_CHECK_(cudaDeviceSynchronize());
 
   std::vector<float> result(total_floats);
-  NVE_CHECK_(cudaMemcpy(result.data(), d_table, total_floats * sizeof(float), cudaMemcpyDeviceToHost));
+  NVE_CHECK_(cudaMemcpy(result.data(), d_table.get(), total_floats * sizeof(float), cudaMemcpyDeviceToHost));
   for (int64_t r = 0; r < num_rows + guard_rows; ++r) {
     for (size_t j = 0; j < row_floats; ++j) {
       const size_t idx = static_cast<size_t>(r) * row_floats + j;
@@ -475,8 +477,6 @@ static void RunGpuLayerOutOfRangeKeysTest(bool accumulate) {
           << (r >= num_rows ? "guard row " : "row ") << r << " float " << j;
     }
   }
-
-  NVE_CHECK_(cudaFree(d_table));
 }
 
 // Lookups of keys outside [0, num_embeddings) must resolve to the configured default row instead of
@@ -499,15 +499,16 @@ static void RunGpuLayerDefaultRowLookupTest(bool pooled) {
       host_table[static_cast<size_t>(r) * row_floats + j] = (r < num_rows) ? value : -value;
     }
   }
-  float* d_table = nullptr;
-  NVE_CHECK_(cudaMalloc(&d_table, total_floats * sizeof(float)));
-  NVE_CHECK_(cudaMemcpy(d_table, host_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
+  float* raw_table = nullptr;
+  NVE_CHECK_(cudaMalloc(&raw_table, total_floats * sizeof(float)));
+  DevicePtr<float> d_table(raw_table);
+  NVE_CHECK_(cudaMemcpy(d_table.get(), host_table.data(), total_floats * sizeof(float), cudaMemcpyHostToDevice));
 
   GPUEmbeddingLayerConfig cfg;
   cfg.device_id = 0;
   cfg.num_embeddings = num_rows;
   cfg.embedding_width_in_bytes = row_size;
-  cfg.embedding_table = d_table;
+  cfg.embedding_table = d_table.get();
   cfg.value_dtype = DataType_t::Float32;
   cfg.default_row_index = default_row_index;
   auto layer = std::make_shared<GPUEmbeddingLayer<IndexT>>(cfg);
@@ -556,8 +557,6 @@ static void RunGpuLayerDefaultRowLookupTest(bool pooled) {
           << "output row " << out << " float " << j;
     }
   }
-
-  NVE_CHECK_(cudaFree(d_table));
 }
 
 TEST(GPUValidation, RejectsDefaultRowOutsideTable) {
@@ -627,12 +626,6 @@ TEST(GPUOutOfRangeKeys, PooledLookupPoolsDefaultRow) {
   RunGpuLayerDefaultRowLookupTest(true /*pooled*/);
 }
 
-struct CudaFreeDeleter {
-  void operator()(void* ptr) const {
-    if (ptr) cudaFree(ptr);
-  }
-};
-
 template <typename IndexT>
 class QuantGpuLayerTest {
  public:
@@ -677,7 +670,7 @@ class QuantGpuLayerTest {
     auto lookup_keys = keys();
     std::vector<int8_t> result(lookup_keys.size() * static_cast<size_t>(row_bytes_));
     void* output = result.data();
-    std::unique_ptr<void, CudaFreeDeleter> device_result;
+    DevicePtr<void> device_result;
     if (device_output) {
       void* ptr = nullptr;
       NVE_CHECK_(cudaMalloc(&ptr, result.size()));
@@ -746,7 +739,7 @@ class QuantGpuLayerTest {
         static_cast<size_t>(output_rows) * static_cast<size_t>(output_stride_);
     std::vector<int8_t> result(output_bytes);
     void* output = result.data();
-    std::unique_ptr<void, CudaFreeDeleter> device_result;
+    DevicePtr<void> device_result;
     if (device_output) {
       void* ptr = nullptr;
       NVE_CHECK_(cudaMalloc(&ptr, output_bytes));
@@ -1077,53 +1070,53 @@ TEST(GPUQuantValidation, RejectsAccumulate) {
 // [Sanity] Init the layer
 TEST_P(GPU, Init) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   GPULayerLookupTest<int64_t> elt(tc);
 }
 
 // [Sanity] lookup 1key
 TEST_P(GPU, SingleLookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   GPULayerLookupTest<int64_t> elt(tc);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, static_cast<int64_t>(elt.m_rows), tc.data_type);
+  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, static_cast<int64_t>(elt.rows_), tc.data_type);
   elt.LookupAndCheck(tc, keys);
 }
 
 // [Lookup]
 TEST_P(GPU, Lookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   GPULayerLookupTest<int64_t> elt(tc);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.m_rows), tc.data_type);
+  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.rows_), tc.data_type);
   elt.LookupAndCheck(tc, keys);
 }
 
 TEST_P(GPU_UP_ACC, Update) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   GPULayerLookupTest<int64_t> elt(tc);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.m_rows), tc.data_type);
+  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.rows_), tc.data_type);
   elt.Update(keys, data);
 }
 
 TEST_P(GPU_UP_ACC, Accumulate) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   GPULayerLookupTest<int64_t> elt(tc);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.m_rows), tc.data_type);
+  GenerateData<int64_t>(keys, data, static_cast<size_t>(tc.test_keys), tc.row_size, 0, static_cast<int64_t>(elt.rows_), tc.data_type);
   elt.Accumulate(keys, data, tc.data_type);
 }
 

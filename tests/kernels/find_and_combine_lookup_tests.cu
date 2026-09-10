@@ -41,72 +41,72 @@ class EmbeddingCacheLookupRefTest : public EmbeddingCacheRefTest<T> {
 
     void InitTestExtras() {
         if (T::FIXED_HOTNESS_FLAG) {
-            this->m_num_keys = this->m_batch * this->m_hotness;
+            this->num_keys_ = this->batch_ * this->hotness_;
         } else {
             // allocate and init offsets
-            m_offsets = std::make_shared<TestBuffer<IndexType>>((this->m_batch + 1) * sizeof(IndexType));
+            offsets_ = std::make_shared<TestBuffer<IndexType>>((this->batch_ + 1) * sizeof(IndexType));
             std::mt19937 gen(0X475381);
             std::uniform_int_distribution<uint32_t> dist_offset(1, 31);
 
             IndexType curr_offset = 0;
-            for (uint32_t b = 0; b < this->m_batch; b++) {
-                m_offsets->ph[b] = curr_offset;
+            for (uint32_t b = 0; b < this->batch_; b++) {
+                offsets_->ph[b] = curr_offset;
                 curr_offset += dist_offset(gen);
             }
-            this->m_num_keys = curr_offset;
-            m_offsets->ph[this->m_batch] = curr_offset;
-            m_offsets->HtoD(this->m_stream);
+            this->num_keys_ = curr_offset;
+            offsets_->ph[this->batch_] = curr_offset;
+            offsets_->HtoD(this->stream_);
         }
 
         if (T::IS_WEIGHTED_FLAG) {
             // allocate and init weights
-            m_weights = std::make_shared<TestBuffer<ElemType>>(this->m_num_keys * sizeof(ElemType));
+            weights_ = std::make_shared<TestBuffer<ElemType>>(this->num_keys_ * sizeof(ElemType));
             std::mt19937 genr(0X753812);
             std::uniform_real_distribution<float> dist_float(0.1f, 1.0f);
             std::bernoulli_distribution distrib(0.5);
-            for (IndexType i=0 ; i < this->m_num_keys; i++) {
-                m_weights->ph[i] = distrib(genr) ? ElemType(0.5f) : ElemType(0.25f);
+            for (IndexType i=0 ; i < this->num_keys_; i++) {
+                weights_->ph[i] = distrib(genr) ? ElemType(0.5f) : ElemType(0.25f);
             }
 
-            m_weights->HtoD(this->m_stream);
+            weights_->HtoD(this->stream_);
         }
     }
 
     void AllocateKeys() {
-        this->m_keys = std::make_shared<TestBuffer<IndexType>>(this->m_num_keys * sizeof(IndexType));
+        this->keys_ = std::make_shared<TestBuffer<IndexType>>(this->num_keys_ * sizeof(IndexType));
         const float alpha = 1.05f;
 
         const size_t seed = 283982;
-        auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(this->m_num_rows),
-                                                T::FIXED_HOTNESS_FLAG ? this->m_hotness : 32, seed);
-        for (uint32_t b = 0; b < this->m_batch; b++)
+        auto sg = getSampleGenerator<IndexType>(alpha, static_cast<IndexType>(this->num_rows_),
+                                                T::FIXED_HOTNESS_FLAG ? this->hotness_ : 32, seed);
+        for (uint32_t b = 0; b < this->batch_; b++)
         {
             auto sample = sg->getCategoryIndices();
-            IndexType start_pos = T::FIXED_HOTNESS_FLAG ? b * this->m_hotness : this->m_offsets->ph[b];
-            IndexType keys_to_copy = T::FIXED_HOTNESS_FLAG ? this->m_hotness :
-                                                             (this->m_offsets->ph[b + 1] - this->m_offsets->ph[b]);
-            std::copy(sample.begin(), sample.begin() + keys_to_copy, this->m_keys->ph + start_pos);
+            IndexType start_pos = T::FIXED_HOTNESS_FLAG ? b * this->hotness_ : this->offsets_->ph[b];
+            IndexType keys_to_copy = T::FIXED_HOTNESS_FLAG ? this->hotness_ :
+                                                             (this->offsets_->ph[b + 1] - this->offsets_->ph[b]);
+            std::copy(sample.begin(), sample.begin() + keys_to_copy, this->keys_->ph + start_pos);
         }
-        this->m_keys->HtoD(this->m_stream);
+        this->keys_->HtoD(this->stream_);
     }
 
     void ComputeRefResults(const ElemType* table,
                            const IndexType* indices,    
                            const std::vector<IndexType>& /*cache_data*/) {
         NVE_DEBUG_PRINTF_("compute lookup reference results\n");
-        m_ref_result.resize(0);
-        for (uint32_t b = 0; b < this->m_batch; b++) {
+        ref_result_.resize(0);
+        for (uint32_t b = 0; b < this->batch_; b++) {
             IndexType hotness;
             IndexType start_idx;
             if (T::FIXED_HOTNESS_FLAG) {
-                hotness = this->m_hotness;
+                hotness = this->hotness_;
                 start_idx = b * hotness;
             } else {
-                hotness = m_offsets->ph[b+1] - m_offsets->ph[b];
-                start_idx = m_offsets->ph[b];
+                hotness = offsets_->ph[b+1] - offsets_->ph[b];
+                start_idx = offsets_->ph[b];
             }
 
-            for (uint32_t el = 0; el < this->m_num_elements; el++) {
+            for (uint32_t el = 0; el < this->num_elements_; el++) {
                 AccumType acc = 0;
                 AccumType weight_acc = 0;
                 
@@ -115,9 +115,9 @@ class EmbeddingCacheLookupRefTest : public EmbeddingCacheRefTest<T> {
                     // row positionally (sampleStart + h), matching the kernel's laneIdx logic.
                     IndexType row = T::LOAD_INDICES_FLAG ? indices[start_idx + h]
                                                          : static_cast<IndexType>(start_idx + h);
-                    AccumType el_cast = table[row * this->m_num_elements + el];
+                    AccumType el_cast = table[row * this->num_elements_ + el];
                     if (T::IS_WEIGHTED_FLAG) {
-                        AccumType weight_cast = m_weights->ph[start_idx + h];
+                        AccumType weight_cast = weights_->ph[start_idx + h];
                         acc += el_cast * weight_cast;
                         weight_acc += weight_cast;
                     } else {
@@ -125,12 +125,12 @@ class EmbeddingCacheLookupRefTest : public EmbeddingCacheRefTest<T> {
                     }
                 }
                 if (T::SUM_POOLING_FLAG) {
-                    m_ref_result.push_back(to_float(acc));
+                    ref_result_.push_back(to_float(acc));
                 } else {
                     if (T::IS_WEIGHTED_FLAG) {
-                        m_ref_result.push_back(to_float(weight_acc != AccumType(0) ? acc / weight_acc : AccumType(1)));
+                        ref_result_.push_back(to_float(weight_acc != AccumType(0) ? acc / weight_acc : AccumType(1)));
                     } else {
-                        m_ref_result.push_back(to_float(acc / AccumType(hotness)));
+                        ref_result_.push_back(to_float(acc / AccumType(hotness)));
                     }
                 }
             }
@@ -140,41 +140,41 @@ class EmbeddingCacheLookupRefTest : public EmbeddingCacheRefTest<T> {
     void LaunchKernel(const ElemType* table,
                       const IndexType* indices,
                       CacheDataType& cache_data) {
-        // find_and_combine's load_indices=false path indexes rows positionally over [0, m_num_keys);
-        // load_indices=true uses keys in [1, m_num_rows). Either way every accessed row must be < m_num_rows.
-        ASSERT_LT(static_cast<uint64_t>(this->m_num_keys), this->m_num_rows)
+        // find_and_combine's load_indices=false path indexes rows positionally over [0, num_keys_);
+        // load_indices=true uses keys in [1, num_rows_). Either way every accessed row must be < num_rows_.
+        ASSERT_LT(static_cast<uint64_t>(this->num_keys_), this->num_rows_)
             << "num_keys must be < table rows so positional (load_indices=false) reads stay in-bounds";
-        m_result = std::make_shared<TestBuffer<OutputType>>(this->m_batch * this->m_hotness * this->m_num_elements * sizeof(OutputType));
+        result_ = std::make_shared<TestBuffer<OutputType>>(this->batch_ * this->hotness_ * this->num_elements_ * sizeof(OutputType));
         NVE_DEBUG_PRINTF_("launch lookup kernel\n");
 
         int8_t** tables_d;
         std::vector<const int8_t*> tables_h;
         tables_h.push_back(reinterpret_cast <const int8_t*>(table));
         CHECK_CUDA_ERROR(cudaMalloc(&tables_d, sizeof(int8_t*)));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(tables_d, tables_h.data(), sizeof(int8_t*), cudaMemcpyDefault, this->m_stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(tables_d, tables_h.data(), sizeof(int8_t*), cudaMemcpyDefault, this->stream_));
 
         SparseType_t hot_type = T::FIXED_HOTNESS_FLAG ? SparseType_t::Fixed : SparseType_t::CSR;
         PoolingType_t pooling_type = T::IS_WEIGHTED_FLAG
             ? (T::SUM_POOLING_FLAG ? PoolingType_t::WeightedSum : PoolingType_t::WeightedMean)
             : (T::SUM_POOLING_FLAG ? PoolingType_t::Sum        : PoolingType_t::Mean);
         call_find_and_combine_kernel<IndexType, CacheDataType>(
-            static_cast<uint32_t>(this->m_num_keys), this->m_batch, reinterpret_cast<const int8_t*>(table), indices,
-            m_offsets == nullptr ? nullptr : m_offsets->pd,
-            m_weights == nullptr ? nullptr : m_weights->pd,
-            this->m_hotness, cache_data, this->m_num_elements,
+            static_cast<uint32_t>(this->num_keys_), this->batch_, reinterpret_cast<const int8_t*>(table), indices,
+            offsets_ == nullptr ? nullptr : offsets_->pd,
+            weights_ == nullptr ? nullptr : weights_->pd,
+            this->hotness_, cache_data, this->num_elements_,
             hot_type, pooling_type, /*load_indices=*/T::LOAD_INDICES_FLAG,
             data_type<ElemType>(),    // element_type
             data_type<ElemType>(),    // weight_type
             data_type<AccumType>(),   // acc_type
             data_type<OutputType>(),  // output_type
-            m_result->pd, this->m_stream);
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(this->m_stream));
+            result_->pd, this->stream_);
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(this->stream_));
         CHECK_CUDA_ERROR(cudaFree(tables_d));
     }
 
     void CheckResult() {
         NVE_DEBUG_PRINTF_("check lookup results\n");
-        m_result->DtoH(this->m_stream);
+        result_->DtoH(this->stream_);
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
         // Model the kernel's final Cast<AccumType, OutputType> by rounding the (float) reference
@@ -184,17 +184,17 @@ class EmbeddingCacheLookupRefTest : public EmbeddingCacheRefTest<T> {
         const float tolerance = ((!T::IS_WEIGHTED_FLAG) && T::SUM_POOLING_FLAG) ? 0.f : 1e-7f;
         Near near(tolerance);
         bool all_near = true;
-        for (size_t i = 0; i < m_ref_result.size(); ++i) {
-            const OutputType expected = to_output(m_ref_result[i]);
-            all_near = all_near && near(expected, m_result->ph[i]);
+        for (size_t i = 0; i < ref_result_.size(); ++i) {
+            const OutputType expected = to_output(ref_result_[i]);
+            all_near = all_near && near(expected, result_->ph[i]);
         }
         EXPECT_TRUE(all_near);
     }
 
-    std::shared_ptr<TestBuffer<OutputType>> m_result = nullptr;
-    std::vector<float> m_ref_result;
-    std::shared_ptr<TestBuffer<ElemType>> m_weights = nullptr;
-    std::shared_ptr<TestBuffer<IndexType>> m_offsets = nullptr;
+    std::shared_ptr<TestBuffer<OutputType>> result_ = nullptr;
+    std::vector<float> ref_result_;
+    std::shared_ptr<TestBuffer<ElemType>> weights_ = nullptr;
+    std::shared_ptr<TestBuffer<IndexType>> offsets_ = nullptr;
 };
 
 TYPED_TEST_SUITE_P(EmbeddingCacheLookupRefTest);
@@ -205,7 +205,7 @@ TYPED_TEST_P(EmbeddingCacheLookupRefTest, TestPoolingAgainstRefCpu) {
     for (const auto batch : {17, 2048}) {
         for (const auto hotness : {59}) {
             for (const auto num_elements : {132, 30, 63}) {
-                for(const auto allocOnHost: {true, false}){
+                for (const auto allocOnHost: {true, false}){
                     NVE_DEBUG_PRINTF_("running test on batch %d hotness %d num_elements %d allocateDataOn: %s\n", batch, hotness, num_elements, allocOnHost?"host":"device");
                     this->LaunchTest(262144, num_elements, batch, hotness, allocOnHost);
                 }

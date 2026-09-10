@@ -39,6 +39,37 @@ def torch_type_to_nve_type(torch_type: torch.dtype):
     else:
         raise ValueError(f"Invalid data type: {torch_type}")
 
+def _check_forward_inputs(keys, offsets=None, per_sample_weights=None):
+    """Validate dtypes/contiguity before the raw data_ptr() handoff to the binding.
+
+    The binding is int64-keyed and receives untyped pointers, so a wrong dtype
+    or a non-contiguous view would be silently misread as garbage.
+    """
+    if keys.dtype != torch.int64:
+        raise TypeError(f"keys must be an int64 tensor, got {keys.dtype}")
+    if not keys.is_contiguous():
+        raise ValueError("keys must be contiguous")
+    if offsets is not None:
+        if offsets.dtype != torch.int64:
+            raise TypeError(f"offsets must be an int64 tensor, got {offsets.dtype}")
+        if not offsets.is_contiguous():
+            raise ValueError("offsets must be contiguous")
+        # num_bags + 1 entries (include_last_offset=True convention). The values
+        # (start at 0, non-decreasing, trailing sentinel == len(keys)) are checked
+        # at lookup time in C++ — reading them here would break export tracing.
+        if offsets.numel() < 2:
+            raise ValueError("offsets must have at least two entries (num_bags + 1, "
+                             "include_last_offset=True convention)")
+    if per_sample_weights is not None:
+        if per_sample_weights.dtype not in (torch.float32, torch.float16):
+            raise TypeError(f"per_sample_weights must be a float32 or float16 tensor, "
+                            f"got {per_sample_weights.dtype}")
+        if not per_sample_weights.is_contiguous():
+            raise ValueError("per_sample_weights must be contiguous")
+        if per_sample_weights.numel() != keys.numel():
+            raise ValueError(f"per_sample_weights must have one element per key: "
+                             f"got {per_sample_weights.numel()} weights for {keys.numel()} keys")
+
 def _current_stream_handle(device: torch.device) -> int:
     """Return the CUDA stream handle to pass into the C++ binding, or 0 on CPU.
 
@@ -66,6 +97,14 @@ def config_to_nve_config(config: dict):
         embed_config.max_modify_size = config["max_modify_size"]
     if "default_row_index" in config:
         embed_config.default_row_index = config["default_row_index"]
+    if "default_embedding" in config:
+        value = config["default_embedding"]
+        if isinstance(value, torch.Tensor):
+            # Raw row bytes in the tensor's own dtype; the layer validates the
+            # byte length against its row size at construction.
+            value = value.detach().to("cpu").contiguous().view(torch.uint8).numpy().tobytes()
+        # else: an iterable of byte values (e.g. the export/load json round-trip).
+        embed_config.default_embedding = list(value)
     return embed_config
 
 class LayerType(Enum):
@@ -128,12 +167,36 @@ class NVEmbeddingBase(torch.nn.Module):
                  config: Optional[dict] = None):
         super().__init__()
 
+        if (config is not None
+                and isinstance(config.get("default_embedding"), torch.Tensor)
+                and config["default_embedding"].dtype != data_type):
+            # Checked before config_to_nve_config flattens the tensor to raw
+            # bytes, where a wrong dtype could still pass the byte-length check.
+            raise ValueError(
+                f"config['default_embedding'] dtype "
+                f"{config['default_embedding'].dtype} does not match layer "
+                f"data_type {data_type}")
         self.config = config_to_nve_config(config)
         self.layer_type = layer_type
         self.num_embeddings = num_embeddings
         self.embedding_size = embedding_size
         self.data_type = data_type
         self.layer_data_type = torch_type_to_nve_type(data_type)
+        row_bytes = embedding_size * torch.empty(0, dtype=data_type).element_size()
+        if len(self.config.default_embedding) not in (0, row_bytes):
+            raise ValueError(
+                f"config['default_embedding'] must hold one row ({embedding_size} "
+                f"elements of {data_type} = {row_bytes} bytes), got "
+                f"{len(self.config.default_embedding)} bytes")
+        if layer_type in (LayerType.HostLayer, LayerType.Hierarchical):
+            if config is None or "default_embedding" not in config:
+                # Misses return zeros unless the user picks a value; pass an explicit
+                # empty list to disable the default fill (misses undefined).
+                self.config.default_embedding = [0] * row_bytes
+        elif len(self.config.default_embedding) > 0:
+            raise ValueError(
+                f"config['default_embedding'] is only supported for HostLayer and "
+                f"Hierarchical layers, got layer_type={layer_type}")
         self.gpu_cache_size = gpu_cache_size
         self.host_cache_size = host_cache_size
         self.optimize_for_training = optimize_for_training
@@ -384,6 +447,7 @@ class NVEmbedding(NVEmbeddingBase):
         Returns:
             torch.Tensor: Embedding vectors for the input keys
         """
+        _check_forward_inputs(keys)
         if HAS_TORCH_OPS:
             if self.optimize_for_training:
                 return nve_ops.NVEmbeddingOpTraining.apply(
@@ -413,7 +477,7 @@ class NVEmbeddingBag(NVEmbeddingBase):
         gpu_cache_size (int, optional): Size of GPU cache in bytes. Defaults to 0.
         host_cache_size (int, optional): Size of host cache. Defaults to 0.
         storage (Optional[nve.MemBlock | nve.Table | nve_ps.NVEParameterServer]):
-            Backing storage. MemBlock for GPULayer/LinearUVM; Table or
+            Backing storage. MemBlock for GPULayer/LinearUVM/HostLayer; Table or
             NVEParameterServer for Hierarchical. Defaults to None.
         weight_init (Optional[torch.Tensor]): Initial values for embedding weights. Not supported for Hierarchical. Defaults to None.
         optimize_for_training (bool): Whether to optimize caching for training vs inference. Defaults to True.
@@ -421,10 +485,11 @@ class NVEmbeddingBag(NVEmbeddingBase):
         id (int, optional): Identifier for the embedding layer. Defaults to None, if None the layer will be assigned a Id automatically. Ids must be unique inside a nested model, in order for serialization to work.
 
     Note:
-        LayerType.HostLayer is not supported by NVEmbeddingBag — pooled lookups
-        are not implemented for the host layer. Use NVEmbedding for HostLayer.
-
         'max' pooling (unlike torch.nn.EmbeddingBag) is not implemented.
+
+        offsets always follow torch's include_last_offset=True convention:
+        num_bags + 1 entries, starting at 0 and ending with a trailing sentinel
+        equal to len(input). torch-default offsets (no sentinel) are rejected.
     """
     def __init__(self,
                  num_embeddings: int,
@@ -440,13 +505,9 @@ class NVEmbeddingBag(NVEmbeddingBase):
                  device : Optional[torch.device] = None,
                  id : Optional[int] = None,
                  config: Optional[dict] = None):
-        # HostLayer has no pooled-lookup implementation (HostEmbeddingLayer::lookup
-        # rejects pool_params), and the bag forward always issues a pooled lookup.
-        # Fail fast at construction rather than at the first forward().
-        if layer_type == LayerType.HostLayer:
-            raise ValueError(
-                "NVEmbeddingBag does not support LayerType.HostLayer (pooled lookups "
-                "are not implemented for the host layer). Use NVEmbedding for HostLayer.")
+        # Fail fast on unsupported or mistyped modes.
+        if mode != "concat":
+            nve_ops.pooling_type_from_mode(mode, weighted=False)
         super().__init__(num_embeddings, embedding_size, data_type, layer_type, gpu_cache_size=gpu_cache_size, host_cache_size=host_cache_size, storage=storage, weight_init=weight_init, optimize_for_training=optimize_for_training, device=device, id=id, config=config)
         self.mode = mode
 
@@ -455,7 +516,9 @@ class NVEmbeddingBag(NVEmbeddingBase):
 
         Args:
             input (torch.Tensor): Input indices to lookup in the embedding table
-            offsets (torch.Tensor): Offsets into input tensor defining the boundaries of sequences
+            offsets (torch.Tensor): Offsets into input tensor defining the boundaries of sequences.
+                Uses torch's include_last_offset=True convention: num_bags + 1 entries, with
+                offsets[0] == 0 and a trailing sentinel offsets[-1] == input.numel().
             per_sample_weights (Optional[torch.Tensor], optional): Weights for each embedding entry. Defaults to None.
 
         Returns:
@@ -463,6 +526,7 @@ class NVEmbeddingBag(NVEmbeddingBase):
                          concatenated embeddings. For other modes ('sum', 'mean'), returns
                          the reduced embeddings according to the specified mode.
         """
+        _check_forward_inputs(input, offsets, per_sample_weights)
         if not HAS_TORCH_OPS:
             if self.mode == "concat":
                 return nve_ops.CacheEmbeddingOp.apply(input, self.weight)

@@ -26,23 +26,23 @@
 namespace nve {
 
 MPIMemBlock::MPIMemBlock(size_t row_size, size_t num_embeddings, nve::DataType_t dtype, const std::vector<size_t> ranks, const std::vector<int> devices)
-    : MPIMemBlock(row_size * num_embeddings * static_cast<size_t>(dtype_size(dtype)), ranks, devices) {}
+  : MPIMemBlock(row_size * num_embeddings * static_cast<size_t>(dtype_size(dtype)), ranks, devices) {}
 
 MPIMemBlock::MPIMemBlock(size_t size_to_alloc, const std::vector<size_t> ranks, const std::vector<int> devices) : MemBlock(MemBlockType::MPI) {
-    auto mpi_env = std::make_shared<nve::MPIEnv>(ranks, devices);
-    mpi_buffer_ = std::make_shared<nve::CUDADistributedBuffer>(size_to_alloc, mpi_env, nve::BufferLocation::ALLOCATION_GPU_MEM);
-    NVE_CHECK_(mpi_buffer_->ptr() != nullptr);
+  auto mpi_env = std::make_shared<nve::MPIEnv>(ranks, devices);
+  mpi_buffer_ = std::make_shared<nve::CUDADistributedBuffer>(size_to_alloc, mpi_env, nve::BufferLocation::ALLOCATION_GPU_MEM);
+  NVE_CHECK_(mpi_buffer_->ptr() != nullptr);
 }
 
 void* MPIMemBlock::get_ptr() const {
-    return mpi_buffer_->ptr();
+  return mpi_buffer_->ptr();
 }
 
 size_t MPIMemBlock::get_size_in_bytes() const {
-    return mpi_buffer_->total_size();
+  return mpi_buffer_->total_size();
 }
 
-} // namespace nve
+}  // namespace nve
 
 #else  // NVE_DISABLE_MPI
 
@@ -51,28 +51,28 @@ namespace nve {
 
 namespace {
 constexpr char kNoMpi[] =
-    "MPIMemBlock requires MPI support; this build was compiled with "
-    "NVE_DISABLE_MPI=ON (no OpenMPI support).";
+  "MPIMemBlock requires MPI support; this build was compiled with "
+  "NVE_DISABLE_MPI=ON (no OpenMPI support).";
 }
 
 MPIMemBlock::MPIMemBlock(size_t, size_t, nve::DataType_t, const std::vector<size_t>, const std::vector<int>)
-    : MemBlock(MemBlockType::MPI) {
-    NVE_THROW_(kNoMpi);
+  : MemBlock(MemBlockType::MPI) {
+  NVE_THROW_(kNoMpi);
 }
 
 MPIMemBlock::MPIMemBlock(size_t, const std::vector<size_t>, const std::vector<int>)
-    : MemBlock(MemBlockType::MPI) {
-    NVE_THROW_(kNoMpi);
+  : MemBlock(MemBlockType::MPI) {
+  NVE_THROW_(kNoMpi);
 }
 
 void* MPIMemBlock::get_ptr() const {
-    return nullptr;
+  return nullptr;
 }
 
 size_t MPIMemBlock::get_size_in_bytes() const {
-    return 0;
+  return 0;
 }
 
-} // namespace nve
+}  // namespace nve
 
 #endif  // NVE_DISABLE_MPI

@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <bit_ops.hpp>
 #include "embed_cache.cuh"
 #include "ec_set_associative.h"
 #include "ec_kernel_common.cuh"
@@ -468,7 +469,7 @@ __global__ void query(const IndexT* d_keys, const size_t len,
 template<typename IndexT, typename TagT>
 cudaError_t call_tag_invalidate_kernel(typename EmbedCacheSA<IndexT, TagT>::ModifyList* list, uint32_t num_entries, TagT* tags, TagT sentinel_key, cudaStream_t stream)
 {
-    dim3 grid_size((num_entries + 32 - 1)/32,1);
+    dim3 grid_size(ceil_div(num_entries, 32u),1);
     dim3 block_size(32, 1);
     invalidate_tag_kernel<IndexT, TagT><<<grid_size, block_size, 0, stream>>>(list, tags, sentinel_key);
     return cudaGetLastError();
@@ -580,7 +581,7 @@ cudaError_t call_mem_update_accumulate_no_sync_kernel(const IndexT* d_keys, cons
 template<typename IndexT, typename TagT>
 cudaError_t call_tag_update_kernel(typename EmbedCacheSA<IndexT, TagT>::ModifyList* list, uint32_t num_entries, TagT* tags, cudaStream_t stream)
 {
-    dim3 grid_size((num_entries + 32 - 1)/32,1);
+    dim3 grid_size(ceil_div(num_entries, 32u),1);
     dim3 block_size(32, 1);
     tag_update_kernel<IndexT, TagT><<<grid_size, block_size, 0, stream>>>(list, tags);
     return cudaGetLastError();

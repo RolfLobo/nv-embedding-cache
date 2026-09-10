@@ -26,6 +26,10 @@
 #include <plugin/external_plugin_table.hpp>
 #include <thread_pool.hpp>
 #include <allocator.hpp>
+#include <cuda_support.hpp>
+#ifndef NVE_DRIVERLESS_BUILD
+#include <cuda_driver_support.hpp>
+#endif
 
 #include <memory>
 #include <string>
@@ -43,6 +47,18 @@ nve_status_t nve_set_error(nve_status_t status, const std::string& message);
 
 #define NVE_C_TRY try {
 
+/* Driver-API failures only exist in builds that link libcuda. */
+#ifndef NVE_DRIVERLESS_BUILD
+#define NVE_C_CATCH_DRIVER_                                         \
+  catch (const nve::RuntimeError<CUresult>& e) {                    \
+    return nve_set_error(e.result() == CUDA_ERROR_OUT_OF_MEMORY  \
+                             ? NVE_ERROR_OUT_OF_MEMORY : NVE_ERROR_CUDA, \
+                         e.to_string());                            \
+  }
+#else
+#define NVE_C_CATCH_DRIVER_
+#endif
+
 #define NVE_C_CATCH                                                 \
   }                                                                 \
   catch (const nve::ExternalPluginError& e) {                       \
@@ -58,6 +74,16 @@ nve_status_t nve_set_error(nve_status_t status, const std::string& message);
   catch (const std::invalid_argument& e) {                          \
     return nve_set_error(NVE_ERROR_INVALID_ARGUMENT, e.what());     \
   }                                                                 \
+  catch (const nve::NotImplementedError& e) {                       \
+    return nve_set_error(NVE_ERROR_NOT_IMPLEMENTED, e.what());      \
+  }                                                                 \
+  catch (const nve::RuntimeError<cudaError_t>& e) {                 \
+    /* to_string() carries the CUDA error name, what() only the expression */ \
+    return nve_set_error(e.error() == cudaErrorMemoryAllocation     \
+                             ? NVE_ERROR_OUT_OF_MEMORY : NVE_ERROR_CUDA, \
+                         e.to_string());                            \
+  }                                                                 \
+  NVE_C_CATCH_DRIVER_                                               \
   catch (const std::exception& e) {                                 \
     return nve_set_error(NVE_ERROR_RUNTIME, e.what());              \
   }                                                                 \

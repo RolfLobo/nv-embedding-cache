@@ -149,6 +149,30 @@ static void LogAndTestVerbosity(LogLevel_t test_lvl) {
 }
 
 // Test log capture class works (intercept cout and cerr)
+// Counts how often it is streamed: proves that filtered messages are never formatted.
+struct FormatCounter {
+  int* count;
+};
+inline std::ostream& operator<<(std::ostream& o, const FormatCounter& c) {
+  ++*c.count;
+  return o << "formatted";
+}
+
+TEST(logger_test, filtered_levels_are_not_formatted) {
+  GetGlobalLogger()->set_verbosity_level(LogLevel_t::Error);
+  LogCapture lc;
+  int count = 0;
+  FormatCounter fc{&count};
+  NVE_LOG_VERBOSE_("verbose ", fc);
+  NVE_LOG_INFO_("info ", fc);
+  NVE_LOG_PERF_("perf ", fc);
+  NVE_LOG_WARNING_("warning ", fc);
+  EXPECT_EQ(0, count);
+  NVE_LOG_ERROR_("error ", fc);
+  EXPECT_EQ(1, count);
+  EXPECT_TRUE(lc.GetCerrString().find("formatted") != std::string::npos);
+}
+
 TEST(logger_test, check_capture) {
   LogCapture lc;
   std::string log_str = "This is a log string!";

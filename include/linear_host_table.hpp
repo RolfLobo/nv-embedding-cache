@@ -175,10 +175,10 @@ protected:
     static constexpr char buffer_name[]{"linear_host_table_key_counter"};
 
     NVE_CHECK_(ctx != nullptr, "Invalid context");
-    void* buffer = ctx->get_buffer(buffer_name, sizeof(int64_t), true);
+    void* buffer = ctx->get_buffer(buffer_name, sizeof(int64_t), true /*host_alloc*/);
     NVE_CHECK_(buffer != nullptr, "Failed to get counter buffer");
     return reinterpret_cast<int64_t*>(buffer);
   }
 };
 
-} // namespace nve
+}  // namespace nve

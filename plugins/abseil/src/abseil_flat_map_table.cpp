@@ -16,7 +16,6 @@
  */
 
 #include <abseil_flat_map_table.hpp>
-#include <host_table_detail.hpp>
 #include <stl_map_backed_table_detail.hpp>
 
 namespace nve {
@@ -102,11 +101,11 @@ inline static host_table_ptr_t make_abseil_flat_map_table_2(
     const table_id_t id, const AbseilFlatMapTableConfig& config) {
   switch (config.overflow_policy.handler) {
     case OverflowHandler_t::EvictRandom:
-      return make_abseil_flat_map_table_3<KeyType, no_meta_type>(id, config);
+      return make_abseil_flat_map_table_3<KeyType, no_meta_t>(id, config);
     case OverflowHandler_t::EvictLRU:
-      return make_abseil_flat_map_table_3<KeyType, lru_meta_type>(id, config);
+      return make_abseil_flat_map_table_3<KeyType, lru_meta_t>(id, config);
     case OverflowHandler_t::EvictLFU:
-      return make_abseil_flat_map_table_3<KeyType, lfu_meta_type>(id, config);
+      return make_abseil_flat_map_table_3<KeyType, lfu_meta_t>(id, config);
   }
   NVE_THROW_("`config.overflow_policy.handler` (", config.overflow_policy.handler,
              ") is out of bounds!");

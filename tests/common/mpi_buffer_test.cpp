@@ -74,7 +74,7 @@ TEST_P(MPIBufferTest, InitBuffer) {
     GTEST_SKIP() << "Skipping test using pidfd (kernel version too low)";
     return;
   }
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   auto mpi_env = std::make_shared<nve::MPIEnv>();
   auto shared_buf = std::make_shared<nve::CUDADistributedBuffer>(tc.table_size, mpi_env, tc.location);
 }
@@ -110,7 +110,7 @@ TEST_P(MPIBufferTest, ReadWrite) {
     GTEST_SKIP() << "Skipping test using pidfd (kernel version too low)";
     return;
   }
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   auto mpi_env = std::make_shared<nve::MPIEnv>();
   TestDistBuffer(tc, std::move(mpi_env));
 }
@@ -134,7 +134,7 @@ TEST_P(MPIBufferTest, ReadWrite_PartialGroup) {
   }
   auto mpi_env_partial = std::make_shared<nve::MPIEnv>(ranks, devices);
 
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   TestDistBuffer(tc, std::move(mpi_env_partial));
 }
 

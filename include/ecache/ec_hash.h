@@ -59,4 +59,4 @@ NVE_CUDA_CALLABLE inline KeyT embed_cache_construct_key(TagT tag, SetT set_idx, 
     return static_cast<KeyT>(static_cast<UKeyT>(tag) * num_sets + set_idx);
 }
 
-} // namespace nve
+}  // namespace nve

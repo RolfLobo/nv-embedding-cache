@@ -60,21 +60,45 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
                                          float* hitrates) {
   NVE_NVTX_SCOPED_FUNCTION_COL1_();
   NVE_CHECK_ARG_(ctx != nullptr, "Invalid context");
-  NVE_CHECK_ARG_(keys != nullptr, "Invalid keys");
-  NVE_CHECK_ARG_(output != nullptr, "Invalid output");
-  NVE_CHECK_ARG_(num_keys > 0, "Invalid number of keys");
+  NVE_CHECK_ARG_(num_keys >= 0, "Invalid number of keys");
+  NVE_CHECK_ARG_(keys != nullptr || num_keys == 0, "Invalid keys");
   const cudaStream_t lookup_stream = ctx->get_lookup_stream();
-
-  const size_t num_keys_sz = static_cast<size_t>(num_keys);
-  constexpr size_t hitmask_elem_bits = sizeof(bitmask64_t) * 8;
-  const size_t hitmask_elements = (num_keys_sz + hitmask_elem_bits - 1) / hitmask_elem_bits;
-  const size_t hitmask_buffer_size = hitmask_elements * sizeof(bitmask64_t);
-  const size_t key_buffer_size = sizeof(KeyType) * num_keys_sz;
-  const size_t row_size = static_cast<size_t>(table_->get_max_row_size());
 
   if (pool_params) {
     validate_pool_params(*pool_params);
   }
+
+  // Empty lookup (e.g. an all-empty-bags batch): nothing to gather, but CSR pooling
+  // may still have bags — zero them, matching torch.nn.EmbeddingBag and the GPU
+  // layers, which accept num_keys == 0.
+  if (num_keys == 0) {
+    const int64_t output_rows = get_lookup_output_rows(num_keys, pool_params);
+    if (output_rows > 0) {
+      NVE_CHECK_ARG_(output != nullptr, "Invalid output");
+      const size_t output_buffer_size =
+          static_cast<size_t>(output_rows) * static_cast<size_t>(output_stride);
+      auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, output_buffer_size);
+      auto* output_host = output_bw->access_buffer(cudaMemoryTypeUnregistered,
+                                                   /*copy_content=*/false, lookup_stream);
+      std::memset(output_host, 0, output_buffer_size);
+      auto* final_output = output_bw->get_buffer(cudaMemoryTypeUnregistered);
+      if (final_output != nullptr && final_output != output) {
+        NVE_CHECK_(cudaMemcpyAsync(output, final_output, output_buffer_size,
+                                   cudaMemcpyDefault, lookup_stream));
+      }
+    }
+    if (hitrates) {
+      hitrates[0] = 1.f;  // vacuously, no key missed
+    }
+    return;
+  }
+  NVE_CHECK_ARG_(output != nullptr, "Invalid output");
+
+  const size_t num_keys_sz = static_cast<size_t>(num_keys);
+  const size_t hitmask_elements = to_uint(ceil_div(num_keys, bitmask64::num_bits));
+  const size_t hitmask_buffer_size = hitmask_elements * sizeof(bitmask64_t);
+  const size_t key_buffer_size = sizeof(KeyType) * num_keys_sz;
+  const size_t row_size = static_cast<size_t>(table_->get_max_row_size());
 
   // Same-type Concatenate is a plain per-key memcpy: no scratch buffer, type conversion, or
   // reduction is needed. Treat it as the no-pooling path by clearing pool_params so the gather
@@ -107,7 +131,8 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
   std::shared_ptr<BufferWrapper<void>> output_bw;
   std::shared_ptr<BufferWrapper<void>> gather_bw;
   if (pool_params) {
-    void* gather_scratch = ctx->get_buffer("pool_gather", gather_buffer_size, /*host_alloc=*/true);
+    void* gather_scratch =
+        ctx->get_buffer("pool_gather", gather_buffer_size, true /*host_alloc*/);
     gather_bw = std::make_shared<BufferWrapper<void>>(ctx, "pool_gather", gather_scratch,
                                                       gather_buffer_size);
   } else {
@@ -126,7 +151,7 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
     bitmask64_t* hitmask_ptr = output_hitmask;
     if (hitmask_ptr == nullptr) {
       hitmask_ptr = reinterpret_cast<bitmask64_t*>(
-          ctx->get_buffer("hitmask", hitmask_buffer_size, /*host_alloc=*/true));
+          ctx->get_buffer("hitmask", hitmask_buffer_size, true /*host_alloc*/));
     }
     hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", hitmask_ptr, hitmask_buffer_size);
     auto* hitmask_host = hitmask_bw->access_buffer(cudaMemoryTypeUnregistered,
@@ -160,8 +185,8 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
                                                 lookup_stream);
     auto thread_pool = ctx->get_thread_pool();
     const int64_t num_workers = thread_pool->num_workers();
-    const int64_t keys_per_task = std::max<int64_t>(1, (num_keys + num_workers - 1) / num_workers);
-    const int64_t num_tasks = (num_keys + keys_per_task - 1) / keys_per_task;
+    const int64_t keys_per_task = std::max<int64_t>(1, ceil_div(num_keys, num_workers));
+    const int64_t num_tasks = ceil_div(num_keys, keys_per_task);
     const uint8_t* default_emb = config_.default_embedding.data();
     auto* gather_bytes = static_cast<uint8_t*>(gather_buf);
 
@@ -169,10 +194,9 @@ void HostEmbeddingLayer<KeyType>::lookup(context_ptr_t& ctx, const int64_t num_k
       const int64_t start_key = idx * keys_per_task;
       const int64_t end_key = std::min<int64_t>(start_key + keys_per_task, num_keys);
       for (int64_t k = start_key; k < end_key; k++) {
-        const size_t k_sz = static_cast<size_t>(k);
-        const auto elem = hit_mask_buf[k_sz / hitmask_elem_bits];
-        const auto bit = (elem >> (k_sz % hitmask_elem_bits)) & static_cast<bitmask64_t>(1);
-        if (bit == 0) {
+        const bitmask64_t elem{hit_mask_buf[k / bitmask64::num_bits]};
+        const bool bit{bitmask64::get(elem, k % bitmask64::num_bits)};
+        if (!bit) {
           std::memcpy(gather_bytes + k * gather_stride, default_emb, row_size);
         }
       }
@@ -228,10 +252,9 @@ void HostEmbeddingLayer<KeyType>::insert(context_ptr_t& ctx, const int64_t num_k
                                          const int64_t value_size, const void* values,
                                          const int64_t table_id) {
   NVE_NVTX_SCOPED_FUNCTION_COL2_();
-  if (table_id != 0) {
-    NVE_LOG_INFO_("HostEmbeddingLayer::insert called with invalid table_id - ignored");
-    return;
-  }
+  // Single-table layer: a negative table_id means "all tables", 0 is the host table; anything
+  // else is invalid, as in the other layers.
+  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   const size_t key_buffer_size = sizeof(KeyType) * static_cast<size_t>(num_keys);
   const size_t values_buffer_size = static_cast<size_t>(num_keys) * static_cast<size_t>(value_stride);
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
@@ -245,11 +268,9 @@ void HostEmbeddingLayer<KeyType>::update(context_ptr_t& ctx, const int64_t num_k
                                          const int64_t value_size, const void* values,
                                          const int64_t table_id) {
   NVE_NVTX_SCOPED_FUNCTION_COL3_();
-  // Single-table layer: table_id 0 (or negative == all) targets the host table.
-  if (table_id > 0) {
-    NVE_LOG_INFO_("HostEmbeddingLayer::update called with invalid table_id - ignored");
-    return;
-  }
+  // Single-table layer: a negative table_id means "all tables", 0 is the host table; anything
+  // else is invalid, as in the other layers.
+  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   const size_t key_buffer_size = sizeof(KeyType) * static_cast<size_t>(num_keys);
   const size_t values_buffer_size = static_cast<size_t>(num_keys) * static_cast<size_t>(value_stride);
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
@@ -263,11 +284,9 @@ void HostEmbeddingLayer<KeyType>::accumulate(context_ptr_t& ctx, const int64_t n
                                              const int64_t value_size, const void* values,
                                              DataType_t value_type, const int64_t table_id) {
   NVE_NVTX_SCOPED_FUNCTION_COL4_();
-  // Single-table layer: table_id 0 (or negative == all) targets the host table.
-  if (table_id > 0) {
-    NVE_LOG_INFO_("HostEmbeddingLayer::accumulate called with invalid table_id - ignored");
-    return;
-  }
+  // Single-table layer: a negative table_id means "all tables", 0 is the host table; anything
+  // else is invalid, as in the other layers.
+  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   const size_t key_buffer_size = sizeof(KeyType) * static_cast<size_t>(num_keys);
   const size_t values_buffer_size = static_cast<size_t>(num_keys) * static_cast<size_t>(value_stride);
   auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_buffer_size);
@@ -286,11 +305,10 @@ template <typename KeyType>
 void HostEmbeddingLayer<KeyType>::erase(context_ptr_t& ctx, const int64_t num_keys,
                                         const void* keys, const int64_t table_id) {
   NVE_NVTX_SCOPED_FUNCTION_COL6_();
+  // Single-table layer: a negative table_id means "all tables", 0 is the host table; anything
+  // else is invalid, as in the other layers.
+  NVE_CHECK_(table_id < get_num_tables(), "Invalid table_id");
   if (num_keys < 1) {
-    return;
-  }
-  if (table_id != 0) {
-    NVE_LOG_INFO_("HostEmbeddingLayer::erase called with invalid table_id - ignored");
     return;
   }
   NVE_CHECK_(keys != nullptr, "Invalid Keys buffer");

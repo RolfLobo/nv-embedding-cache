@@ -28,7 +28,7 @@ target_link_libraries(nve_driverless_test PUBLIC gtest_main nve-common)
 # nve-common already drop their CUDA driver dependency in that configuration —
 # giving a binary with no libcuda / libtorch_cuda dependency that loads on a
 # driverless host.
-if(NOT NVE_DISABLE_TORCH_BINDINGS AND TORCH_FOUND)
+if (NOT NVE_DISABLE_TORCH_BINDINGS AND TORCH_FOUND)
     add_executable(nve_inference_driverless driverless_inference.cu)
 
     target_include_directories(nve_inference_driverless SYSTEM PRIVATE

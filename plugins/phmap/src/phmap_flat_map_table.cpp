@@ -48,7 +48,7 @@ PHMapFlatMapTable<KeyType, MetaType, PartitionerType>::PHMapFlatMapTable(
     const table_id_t id, const PHMapFlatMapTableConfig& config)
     : base_type(id, config) {
   for (auto& part : this->parts_) {
-    part.slot_map.reserve(static_cast<uint64_t>(config.initial_capacity));
+    part.slot_map.reserve(to_uint(config.initial_capacity));
   }
 }
 
@@ -103,11 +103,11 @@ inline static host_table_ptr_t make_phmap_flat_map_table_2(const table_id_t id,
                                                            const PHMapFlatMapTableConfig& config) {
   switch (config.overflow_policy.handler) {
     case OverflowHandler_t::EvictRandom:
-      return make_phmap_flat_map_table_3<KeyType, no_meta_type>(id, config);
+      return make_phmap_flat_map_table_3<KeyType, no_meta_t>(id, config);
     case OverflowHandler_t::EvictLRU:
-      return make_phmap_flat_map_table_3<KeyType, lru_meta_type>(id, config);
+      return make_phmap_flat_map_table_3<KeyType, lru_meta_t>(id, config);
     case OverflowHandler_t::EvictLFU:
-      return make_phmap_flat_map_table_3<KeyType, lfu_meta_type>(id, config);
+      return make_phmap_flat_map_table_3<KeyType, lfu_meta_t>(id, config);
   }
   NVE_THROW_("`config.overflow_policy.handler` (", config.overflow_policy.handler,
              ") is out of bounds!");

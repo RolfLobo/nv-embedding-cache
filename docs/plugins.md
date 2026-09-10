@@ -4,6 +4,22 @@ NVE table backends can be packaged as plugin shared objects. A plugin exposes a
 single table factory; the host loads the SO, creates the factory, and produces
 `nve::Table` instances.
 
+## Bundled plugins
+
+All of these are internal-mode plugins built from this repository. The SO name is
+what you pass to the loader; the feature is the `NVE_FEATURES` entry that builds
+it (see `docs/build_flags.md`).
+
+| Plugin | SO | Feature | What it is |
+|---|---|---|---|
+| stl_map | `libnve-plugin-stl-map.so` | *(always built)* | Host table over `std::unordered_map`. The reference/fallback backend and the smallest example of the plugin API. |
+| abseil | `libnve-plugin-abseil.so` | `abseil_plugin` | Host table over Abseil's `flat_hash_map`, as an open-addressing alternative to `stl_map`'s node-based map. |
+| phmap | `libnve-plugin-phmap.so` | `phmap_plugin` | Host table over the parallel-hashmap flat map — same shape as `abseil`, different implementation and size/speed trade-offs. |
+| nvhm | `libnve-plugin-nvhm.so` | `nvhm_plugin` | Host table over NVIDIA's nvHashMap. |
+| redis | `libnve-plugin-redis.so` | `redis_plugin` | Remote table backed by a Redis cluster or a single node. Needs a reachable server; capacity is the server's, not the process's. |
+| rocksdb | `libnve-plugin-rocksdb.so` | `rocksdb_plugin` | Table backed by RocksDB, so the working set is bounded by disk rather than RAM. |
+| sph | `libnve-plugin-sph-experimental.so` | `sph_plugin` | **Experimental.** GPU-resident perfect-hash table; the whole table lives in device memory, so it slots in as a GPU tier rather than a host tier. |
+
 ## The two ABI modes
 
 Every plugin declares one of two ABI modes. The mode defines which object types are safe to transfer to the plugin, not where its source lives.
@@ -120,7 +136,8 @@ default-constructed factory that ignores factory JSON, use
 CMake: `add_library(nve-plugin-<name> SHARED src/plugin.cpp ...)` linking
 `nve-common` — see `plugins/stl_map/CMakeLists.txt` for the smallest example.
 
-In-tree examples: `plugins/{stl_map,abseil,phmap,nvhm,redis,rocksdb}`.
+In-tree examples: `plugins/{stl_map,abseil,phmap,nvhm,redis,rocksdb,sph}` — see
+[Bundled plugins](#bundled-plugins) for what each one is.
 
 ## Writing an external plugin
 

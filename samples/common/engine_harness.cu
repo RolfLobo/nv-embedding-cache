@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <bit_ops.hpp>
 #include <chrono>
 #include <cstddef>
 #include <fstream>
@@ -57,7 +58,7 @@ inline int64_t volume(const nvinfer1::Dims& dims, const nvinfer1::Dims& strides,
       return 0;
     }
     if (i == vecDim) {
-      d = (d + comps - 1) / comps;
+      d = nve::ceil_div(d, static_cast<int64_t>(comps));
     }
     maxNbElems = std::max(maxNbElems, d * strides.d[i]);
   }
@@ -80,7 +81,7 @@ EngineHarness::EngineHarness(const std::string& filename, unsigned numExecutionC
 
   // Create contexts
   for (unsigned i = 0; i < numExecutionContexts; i++) {
-    m_executionContexts.emplace_back(engine->createExecutionContext());
+    executionContexts_.emplace_back(engine->createExecutionContext());
   }
 
   // Collect bindings
@@ -90,7 +91,7 @@ EngineHarness::EngineHarness(const std::string& filename, unsigned numExecutionC
   const int32_t endBindingIndex = bindingsInProfile ? bindingsInProfile : engine->getNbIOTensors();
 
   assert(nOptProfiles <= 1);
-  auto context = m_executionContexts.at(0);
+  auto context = executionContexts_.at(0);
 
   for (int b = 0; b < endBindingIndex; ++b) {
     const auto name = engine->getIOTensorName(b);
@@ -127,20 +128,20 @@ EngineHarness::EngineHarness(const std::string& filename, unsigned numExecutionC
         assert(0);
     }
 
-    m_ioBindings.push_back({name, isInput,
-                            static_cast<size_t>(vol) * static_cast<size_t>(dataTypeSize), dataType,
-                            dims});
+    ioBindings_.push_back({name, isInput,
+                           static_cast<size_t>(vol) * static_cast<size_t>(dataTypeSize), dataType,
+                           dims});
   }
 }
 
-std::vector<IOBinding> EngineHarness::GetIOBindings() const { return m_ioBindings; }
+std::vector<IOBinding> EngineHarness::GetIOBindings() const { return ioBindings_; }
 
 bool EngineHarness::Enqueue(cudaStream_t stream, unsigned contextIndex,
                             const std::vector<void*>& ioBuffers) {
-  assert(ioBuffers.size() == m_ioBindings.size());
-  auto ctx = m_executionContexts.at(contextIndex);
+  assert(ioBuffers.size() == ioBindings_.size());
+  auto ctx = executionContexts_.at(contextIndex);
   for (size_t i = 0; i < ioBuffers.size(); i++) {
-    bool result = ctx->setTensorAddress(m_ioBindings.at(i).name.c_str(), ioBuffers[i]);
+    bool result = ctx->setTensorAddress(ioBindings_.at(i).name.c_str(), ioBuffers[i]);
     if (!result) {
       return false;
     }

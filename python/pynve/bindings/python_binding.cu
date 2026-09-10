@@ -66,11 +66,11 @@ namespace nve {
     {
         DLManagedTensor* p = layer->create_dlpack_tensor(dtype);
         return py::capsule(p, "dltensor", [](PyObject* capsule) {
-            const char *name = PyCapsule_GetName(capsule);
+            const char* name = PyCapsule_GetName(capsule);
             if (!name || std::strcmp(name, "dltensor") != 0) {
                 return;
             }
-            auto *managed = static_cast<DLManagedTensor *>(
+            auto* managed = static_cast<DLManagedTensor *>(
                 PyCapsule_GetPointer(capsule, "dltensor")
             );
             if (!managed) return;
@@ -186,6 +186,7 @@ PYBIND11_MODULE(nve, m) {
         .def_readwrite("kernel_mode_value_2", &EmbedLayerConfig::kernel_mode_value_2)
         .def_readwrite("max_modify_size", &EmbedLayerConfig::max_modify_size)
         .def_readwrite("default_row_index", &EmbedLayerConfig::default_row_index)
+        .def_readwrite("default_embedding", &EmbedLayerConfig::default_embedding)
         .def("to_json", [](const EmbedLayerConfig& c) {
             return nlohmann::json(c).dump();
         }, "Serialize the config to a JSON string.");

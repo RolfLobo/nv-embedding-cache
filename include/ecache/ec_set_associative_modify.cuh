@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <bit_ops.hpp>
 #include "ec_hash.h"
 
 namespace nve {
@@ -126,7 +127,7 @@ cudaError_t CallSortKernel(const CounterType* counters, KeyType* res, uint32_t n
     assert ((NUM_WAYS & (NUM_WAYS - 1)) == 0);
 
     auto sets_in_warp = 32 / NUM_WAYS;
-    dim3 gridSize ((num_sets + sets_in_warp - 1) / sets_in_warp, 1);
+    dim3 gridSize (ceil_div(num_sets, sets_in_warp), 1);
     dim3 blockSize (NUM_WAYS, sets_in_warp);
 
     SortKernel<KeyType, CounterType, NUM_WAYS><<<gridSize, blockSize, 0, stream>>>(num_sets, counters, res);
@@ -446,7 +447,7 @@ cudaError_t ComputeSetReplaceData(
         const uint32_t num_warps = 1;
         auto keys_in_block = num_warps * 32;
 
-        const uint32_t grid_size_keys = (static_cast<uint32_t>(num_keys) + keys_in_block - 1) / keys_in_block;
+        const uint32_t grid_size_keys = ceil_div(static_cast<uint32_t>(num_keys), keys_in_block);
 
         dim3 gridSizeComputeSets (grid_size_keys, 1);
         dim3 blockSizeComputeSets (32, num_warps);
@@ -497,7 +498,7 @@ cudaError_t ComputeSetReplaceData(
             return err;
         }
         auto sets_in_warp = 32 / NUM_WAYS;
-        dim3 gridSize ((num_represented_sets + sets_in_warp - 1) / sets_in_warp, 1);
+        dim3 gridSize (ceil_div(num_represented_sets, sets_in_warp), 1);
         dim3 blockSize (NUM_WAYS, sets_in_warp);
 
         SetReplaceDataKernel<KeyType, TagType, CounterType, NUM_WAYS><<<gridSize, blockSize, 0, stream>>>(
@@ -578,7 +579,7 @@ cudaError_t ComputeSetInvalidateData(
     assert (NUM_WAYS <= 32);
     assert ((NUM_WAYS & (NUM_WAYS - 1)) == 0);
 
-    dim3 gridSize (static_cast<uint32_t>(num_keys + 32 - 1) / 32, 1);
+    dim3 gridSize (ceil_div(static_cast<uint32_t>(num_keys), 32u), 1);
     dim3 blockSize (32, 1);
 
     SetUpdateDataKernel<KeyType, TagType, NUM_WAYS, true><<<gridSize, blockSize, 0, stream>>>(
@@ -606,7 +607,7 @@ cudaError_t ComputeSetUpdateData(
     assert (NUM_WAYS <= 32);
     assert ((NUM_WAYS & (NUM_WAYS - 1)) == 0);
 
-    dim3 gridSize (static_cast<uint32_t>(num_keys + 32 - 1) / 32, 1);
+    dim3 gridSize (ceil_div(static_cast<uint32_t>(num_keys), 32u), 1);
     dim3 blockSize (32, 1);
 
     SetUpdateDataKernel<KeyType, TagType, NUM_WAYS><<<gridSize, blockSize, 0, stream>>>(

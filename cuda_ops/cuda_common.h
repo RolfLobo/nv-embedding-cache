@@ -24,7 +24,7 @@
 #ifndef EC_CHECK
 #define EC_CHECK(ans) { ECAssert_((ans), __FILE__, __LINE__); }
 template<typename ErrType>
-inline void ECAssert_(ErrType code, const char *file, int line, bool abort=true) {
+inline void ECAssert_(ErrType code, const char* file, int line, bool abort=true) {
     if (code != ErrType(0)) {
         fprintf(stderr, "EC_CHECK: %d %s %d\n", code, file, line);
         if (abort) exit(code);
@@ -43,7 +43,13 @@ public:
         if (device_id_ < 0) {
             return;
         }
-        NVE_CHECK_(cudaGetDevice(&curr_device_));
+        // Destructor chains construct ScopedDevice at process exit; once the CUDA
+        // runtime is unloading there is no device state left to save or restore.
+        const cudaError_t res = cudaGetDevice(&curr_device_);
+        if (nve::cuda_runtime_unloading(res, "device switch")) {
+            return;
+        }
+        NVE_CHECK_(res, "cudaGetDevice failed");
         swap_device_ = curr_device_ != device_id_;
         if (swap_device_) {
             NVE_CHECK_(cudaSetDevice(device_id_));
@@ -53,7 +59,11 @@ public:
     ~ScopedDevice()
     {
         if (swap_device_) {
-            NVE_CHECK_(cudaSetDevice(curr_device_));
+            const cudaError_t res = cudaSetDevice(curr_device_);
+            if (nve::cuda_runtime_unloading(res, "device restore")) {
+                return;
+            }
+            NVE_CHECK_(res, "cudaSetDevice failed");
         }
     }
 private:

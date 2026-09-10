@@ -62,8 +62,14 @@ std::string RuntimeError<bool>::to_string() const {
 }
 
 Logger* GetGlobalLogger() {
-  static Logger global_logger_;
-  return &global_logger_;
+  // Intentionally leaked: teardown paths log through this pointer from
+  // destructors that may run after static destruction (e.g. layers alive at
+  // interpreter exit), where a function-local static Logger would already be
+  // destroyed. The Logger owns nothing that needs cleanup — the default
+  // backend writes line-flushed output to std::cout/cerr — and the OS
+  // reclaims the allocation at process exit.
+  static Logger* const global_logger_ = new Logger();
+  return global_logger_;
 }
 
 static thread_local std::random_device rand_dev_;

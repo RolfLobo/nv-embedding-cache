@@ -91,22 +91,22 @@ class UVMLayerTest {
                 PrivateStreamMode private_stream_mode, bool modify_on_gpu, int device_id, bool insert_heuristic = false,
                 std::function<void(GPUTableConfig&)> gpu_cfg_overwrite = nullptr,
                 size_t seed = 31337)
-    : m_row_size(row_size), m_max_rows(uvm_table_size / row_size), m_device_id(device_id) {
+    : row_size_(row_size), max_rows_(uvm_table_size / row_size), device_id_(device_id) {
     ScopedDevice dev(device_id);
     // init linear table
     {
-      NVE_CHECK_(cudaMallocHost(&m_linear_table, static_cast<size_t>(m_row_size * m_max_rows)));
-      NVE_CHECK_(static_cast<size_t>(m_row_size) % sizeof(float) == 0); // cannot use ASSERT_EQ in c'tor
+      NVE_CHECK_(cudaMallocHost(&linear_table_, static_cast<size_t>(row_size_ * max_rows_)));
+      NVE_CHECK_(static_cast<size_t>(row_size_) % sizeof(float) == 0); // cannot use ASSERT_EQ in c'tor
 
       // Init table values with multiple threads to save on test time
       std::vector<std::shared_ptr<std::thread>> input_gen_threads;
       const int64_t num_threads = static_cast<int64_t>(std::thread::hardware_concurrency());
       for (int64_t t=0 ; t<num_threads ; t++) {
-        auto start_row = t * m_max_rows / num_threads;
-        auto end_row = std::min<int64_t>((t + 1) * m_max_rows / num_threads, m_max_rows);
+        auto start_row = t * max_rows_ / num_threads;
+        auto end_row = std::min<int64_t>((t + 1) * max_rows_ / num_threads, max_rows_);
 
         input_gen_threads.push_back(std::make_shared<std::thread>(
-          InitTableRows, m_linear_table, m_row_size, start_row, end_row, data_type, seed + static_cast<size_t>(t)
+          InitTableRows, linear_table_, row_size_, start_row, end_row, data_type, seed + static_cast<size_t>(t)
         ));
       }
       for (auto& t : input_gen_threads) {
@@ -125,8 +125,8 @@ class UVMLayerTest {
       cfg.cache_size = static_cast<size_t>(gpu_table_size);
       cfg.max_modify_size = MAX_MODIFY_SIZE;
       cfg.row_size_in_bytes = row_size;
-      cfg.uvm_table = m_linear_table;
-      cfg.uvm_num_rows = m_max_rows;
+      cfg.uvm_table = linear_table_;
+      cfg.uvm_num_rows = max_rows_;
       cfg.count_misses = true;
       cfg.value_dtype = data_type;
       cfg.private_stream = private_stream;
@@ -134,7 +134,7 @@ class UVMLayerTest {
       if (gpu_cfg_overwrite != nullptr) {
         gpu_cfg_overwrite(cfg);
       }
-      m_gpu_tab = std::make_shared<GpuTable<IndexT>>(cfg);
+      gpu_tab_ = std::make_shared<GpuTable<IndexT>>(cfg);
     }
 
     // init layer
@@ -147,32 +147,32 @@ class UVMLayerTest {
       } else {
         cfg.insert_heuristic = std::make_shared<NeverInsertHeuristic>();
       }
-      m_layer = std::make_shared<LinearUVMEmbeddingLayer<IndexT>>(cfg, m_gpu_tab);
+      layer_ = std::make_shared<LinearUVMEmbeddingLayer<IndexT>>(cfg, gpu_tab_);
     }
     // init context
     cudaStream_t ctx_stream = (private_stream_mode == PrivateStreamMode::Optimized) ? private_stream : 0;
-    m_ctx = m_layer->create_execution_context(ctx_stream, ctx_stream, nullptr, nullptr);
+    ctx_ = layer_->create_execution_context(ctx_stream, ctx_stream, nullptr, nullptr);
 
     // create ref (using single mock table)
     {
       HostTableConfig mock_cfg;
       mock_cfg.value_dtype = data_type;
-      mock_cfg.max_value_size = m_row_size;
-      m_ref_tab = std::make_shared<MockHostTable<IndexT>>(mock_cfg, true /*functional_ref*/);
+      mock_cfg.max_value_size = row_size_;
+      ref_tab_ = std::make_shared<MockHostTable<IndexT>>(mock_cfg, true /*functional_ref*/);
     }
   }
 
   UVMLayerTest(UVMTestCase tc, int device_id = 0) : UVMLayerTest<IndexT>(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type, tc.private_stream_mode, tc.modify_on_gpu, device_id) {}
   ~UVMLayerTest() {
-    ScopedDevice dev(m_device_id);
-    m_ctx->wait();
-    m_ctx.reset();  // explicitly destroy the context before the stream since the context synchronizes on the stream during d'tor
+    ScopedDevice dev(device_id_);
+    ctx_->wait();
+    ctx_.reset();  // explicitly destroy the context before the stream since the context synchronizes on the stream during d'tor
                     // (which may be the private stream about to be destroyed)
     if (private_stream) {
       NVE_CHECK_(cudaStreamSynchronize(private_stream)); // Make sure all work for the stream is complete before destruction
       NVE_CHECK_(cudaStreamDestroy(private_stream));
     }
-    NVE_CHECK_(cudaFreeHost(m_linear_table));
+    NVE_CHECK_(cudaFreeHost(linear_table_));
   }
 
   void LookupAndCheck(std::vector<IndexT>& keys, uint64_t start_key = 0,
@@ -184,35 +184,33 @@ class UVMLayerTest {
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
 
-    auto output_size = static_cast<size_t>(num_keys * m_row_size);
+    auto output_size = static_cast<size_t>(num_keys * row_size_);
     int8_t* output{nullptr};
     NVE_CHECK_(cudaMallocHost(&output, output_size));
     NVE_CHECK_(output != 0);
     std::vector<int8_t> ref_output(output_size);
 
-    int64_t mask_bits_per_elem = static_cast<int64_t>(sizeof(bitmask64_t) * 8);
-    auto hitmask_size = static_cast<size_t>((num_keys + mask_bits_per_elem - 1) / mask_bits_per_elem);
-    std::vector<bitmask64_t> ref_hitmask(hitmask_size);
+    std::vector<bitmask64_t> ref_hitmask(to_uint(ceil_div(num_keys, bitmask64::num_bits)));
 
     std::vector<float> hitrates(3);
 
-    m_layer->lookup(m_ctx, num_keys, keys_buffer, output, m_row_size, nullptr /*hitmask*/,
+    layer_->lookup(ctx_, num_keys, keys_buffer, output, row_size_, nullptr /*hitmask*/,
                     nullptr /*pool_params*/, hitrates.data());
     NVE_CHECK_(cudaDeviceSynchronize());
     int64_t ref_hits;
-    m_ref_tab->reset_lookup_counter(m_ctx);
+    ref_tab_->reset_lookup_counter(ctx_);
     {
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-          m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+          ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
       auto hit_mask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(
-          m_ctx, "hit_mask", ref_hitmask.data(), hitmask_size * sizeof(bitmask64_t));
+          ctx_, "hit_mask", ref_hitmask.data(), ref_hitmask.size() * sizeof(bitmask64_t));
       auto values_bw = std::make_shared<BufferWrapper<void>>(
-          m_ctx, "values", ref_output.data(),
-          static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-      m_ref_tab->find(m_ctx, num_keys, std::move(keys_bw), std::move(hit_mask_bw), m_row_size,
+          ctx_, "values", ref_output.data(),
+          static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+      ref_tab_->find(ctx_, num_keys, std::move(keys_bw), std::move(hit_mask_bw), row_size_,
                          std::move(values_bw), nullptr /*value_sizes*/);
     }
-    m_ref_tab->get_lookup_counter(m_ctx, &ref_hits);
+    ref_tab_->get_lookup_counter(ctx_, &ref_hits);
 
 
     // compare hitrates
@@ -220,10 +218,10 @@ class UVMLayerTest {
 
     // compare outputs for hits
     for (int64_t i = 0; i < num_keys; i++) {
-      bool ref_hit = ref_hitmask.at(static_cast<size_t>(i / mask_bits_per_elem)) & (1ll << (i % mask_bits_per_elem));
-      const int8_t* ref_vec = ref_hit ? ref_output.data() + (i * m_row_size) : m_linear_table + (keys.at(static_cast<size_t>(i)) * m_row_size);
-      for (int64_t j = 0; j < m_row_size; j++) {
-        ASSERT_EQ(output[(i * m_row_size) + j], *(ref_vec + j));
+      bool ref_hit{bitmask64::get(ref_hitmask.at(to_uint(i / bitmask64::num_bits)), i % bitmask64::num_bits)};
+      const int8_t* ref_vec = ref_hit ? ref_output.data() + (i * row_size_) : linear_table_ + (keys.at(static_cast<size_t>(i)) * row_size_);
+      for (int64_t j = 0; j < row_size_; j++) {
+        ASSERT_EQ(output[(i * row_size_) + j], *(ref_vec + j));
       }
     }
     NVE_CHECK_(cudaFreeHost(output));
@@ -274,30 +272,30 @@ class UVMLayerTest {
     }
 
     // Allocate based on num_keys (matches the BufferWrapper size used by the layer internally),
-    // even though only output_bags * m_row_size bytes are written for Sum/Mean pooling.
-    auto output_size = static_cast<size_t>(num_keys * m_row_size);
+    // even though only output_bags * row_size_ bytes are written for Sum/Mean pooling.
+    auto output_size = static_cast<size_t>(num_keys * row_size_);
     int8_t* output{nullptr};
     NVE_CHECK_(cudaMallocHost(&output, output_size));
     NVE_CHECK_(output != 0);
 
     std::vector<float> hitrates(3);
 
-    m_layer->lookup(m_ctx, num_keys, keys_buffer, output, m_row_size, nullptr /*hitmask*/,
+    layer_->lookup(ctx_, num_keys, keys_buffer, output, row_size_, nullptr /*hitmask*/,
                     &pp /*pool_params*/, hitrates.data());
 
-    std::vector<int8_t> find_output(static_cast<size_t>(num_keys * m_row_size));
+    std::vector<int8_t> find_output(static_cast<size_t>(num_keys * row_size_));
     {
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-          m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+          ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
       auto values_bw = std::make_shared<BufferWrapper<void>>(
-          m_ctx, "values", find_output.data(),
-          static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-      m_ref_tab->find(m_ctx, num_keys, std::move(keys_bw), nullptr /* hitmask */, m_row_size,
+          ctx_, "values", find_output.data(),
+          static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+      ref_tab_->find(ctx_, num_keys, std::move(keys_bw), nullptr /* hitmask */, row_size_,
                       std::move(values_bw), nullptr /*value_sizes*/);
     }
 
-    std::vector<int8_t> ref_output(static_cast<size_t>(output_bags * m_row_size));
-    auto* mock_ref = static_cast<MockHostTable<IndexT>*>(m_ref_tab.get());
+    std::vector<int8_t> ref_output(static_cast<size_t>(output_bags * row_size_));
+    auto* mock_ref = static_cast<MockHostTable<IndexT>*>(ref_tab_.get());
     mock_ref->combine(find_output.data(), num_keys, pp.pooling_type, pp.sparse_type,
                       pp.csr_offsets, pp.num_csr_offsets, pp.fixed_hotness, pp.weights,
                       pp.weight_type, ref_output.data());
@@ -340,7 +338,7 @@ class UVMLayerTest {
     if (keys.empty()) {
       return;
     }
-    SetupKeys setup(keys, start_key, end_key, datavectors, m_row_size);
+    SetupKeys setup(keys, start_key, end_key, datavectors, row_size_);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
     auto data_buffer = setup.data_buffer;
@@ -349,21 +347,21 @@ class UVMLayerTest {
     for (int64_t i=0 ; i<num_keys ; i++) {
       auto pos = start_key + static_cast<size_t>(i);
       auto key = keys[pos];
-      auto row_size = static_cast<size_t>(m_row_size);
-      ASSERT_LE(key, m_max_rows); // Not handling keys too big for the linear table
+      auto row_size = static_cast<size_t>(row_size_);
+      ASSERT_LE(key, max_rows_); // Not handling keys too big for the linear table
       
-      std::memcpy(m_linear_table + (key * m_row_size), datavectors.data() + (pos * row_size), row_size);
+      std::memcpy(linear_table_ + (key * row_size_), datavectors.data() + (pos * row_size), row_size);
     }
 
-    m_layer->insert(m_ctx, num_keys, keys_buffer, m_row_size, m_row_size, data_buffer, 0);
-    bool ref_insert = (m_gpu_tab != nullptr);
+    layer_->insert(ctx_, num_keys, keys_buffer, row_size_, row_size_, data_buffer, 0);
+    bool ref_insert = (gpu_tab_ != nullptr);
     if (ref_insert) {
       auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-          m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+          ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
       auto values_bw = std::make_shared<BufferWrapper<const void>>(
-          m_ctx, "values", data_buffer,
-          static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-      m_ref_tab->insert(m_ctx, num_keys, std::move(keys_bw), m_row_size, m_row_size,
+          ctx_, "values", data_buffer,
+          static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+      ref_tab_->insert(ctx_, num_keys, std::move(keys_bw), row_size_, row_size_,
                            std::move(values_bw));
     }
   }
@@ -373,18 +371,18 @@ class UVMLayerTest {
     if (keys.empty()) {
       return;
     }
-    SetupKeys setup(keys, start_key, end_key, datavectors, m_row_size);
+    SetupKeys setup(keys, start_key, end_key, datavectors, row_size_);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
     auto data_buffer = setup.data_buffer;
 
-    m_layer->update(m_ctx, num_keys, keys_buffer, m_row_size, m_row_size, data_buffer, -1);
+    layer_->update(ctx_, num_keys, keys_buffer, row_size_, row_size_, data_buffer, -1);
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-        m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+        ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
     auto values_bw = std::make_shared<BufferWrapper<const void>>(
-        m_ctx, "values", data_buffer,
-        static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-    m_ref_tab->update(m_ctx, num_keys, std::move(keys_bw), m_row_size, m_row_size,
+        ctx_, "values", data_buffer,
+        static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+    ref_tab_->update(ctx_, num_keys, std::move(keys_bw), row_size_, row_size_,
                          std::move(values_bw));
   }
 
@@ -393,18 +391,18 @@ class UVMLayerTest {
     if (keys.empty()) {
       return;
     }
-    SetupKeys setup(keys, start_key, end_key, datavectors, m_row_size);
+    SetupKeys setup(keys, start_key, end_key, datavectors, row_size_);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
     auto data_buffer = setup.data_buffer;
 
-    m_layer->accumulate(m_ctx, num_keys, keys_buffer, m_row_size, m_row_size, data_buffer, value_type, -1);
+    layer_->accumulate(ctx_, num_keys, keys_buffer, row_size_, row_size_, data_buffer, value_type, -1);
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-        m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+        ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
     auto updates_bw = std::make_shared<BufferWrapper<const void>>(
-        m_ctx, "updates", data_buffer,
-        static_cast<size_t>(num_keys) * static_cast<size_t>(m_row_size));
-    m_ref_tab->update_accumulate(m_ctx, num_keys, std::move(keys_bw), m_row_size, m_row_size,
+        ctx_, "updates", data_buffer,
+        static_cast<size_t>(num_keys) * static_cast<size_t>(row_size_));
+    ref_tab_->update_accumulate(ctx_, num_keys, std::move(keys_bw), row_size_, row_size_,
                                     std::move(updates_bw), value_type);
   }
 
@@ -415,42 +413,47 @@ class UVMLayerTest {
     SetupKeys setup(keys, start_key, end_key);
     auto num_keys = setup.num_keys;
     auto keys_buffer = setup.keys_buffer;
-    m_layer->erase(m_ctx, num_keys, keys_buffer, 0);
+    layer_->erase(ctx_, num_keys, keys_buffer, 0);
     auto keys_bw = std::make_shared<BufferWrapper<const void>>(
-        m_ctx, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
-    m_ref_tab->erase(m_ctx, num_keys, std::move(keys_bw));
+        ctx_, "keys", keys_buffer, static_cast<size_t>(num_keys) * sizeof(IndexT));
+    ref_tab_->erase(ctx_, num_keys, std::move(keys_bw));
   }
 
   void Clear(bool clear_ref = true) {
-    m_layer->clear(m_ctx);
+    layer_->clear(ctx_);
     if (clear_ref) {
-      m_ref_tab->clear(m_ctx);
+      ref_tab_->clear(ctx_);
     }
   }
 
-  void Wait() { m_ctx->wait(); }
+  void Wait() { ctx_->wait(); }
 
   typename LinearUVMEmbeddingLayer<IndexT>::Config Config() const {
-    return m_layer->get_config();
+    return layer_->get_config();
   }
 
+  // Direct access for tests that call the layer / reference with non-default arguments.
+  layer_type& layer() { return *layer_; }
+  context_ptr_t& ctx() { return ctx_; }
+  HostTableLike& ref() { return *ref_tab_; }
+
  public:
-  const int64_t m_row_size;
-  const int64_t m_max_rows;
+  const int64_t row_size_;
+  const int64_t max_rows_;
  private:
-  typename layer_type::gpu_table_ptr_t m_gpu_tab{nullptr};
-  host_table_ptr_t m_ref_tab;
-  int8_t* m_linear_table{nullptr};
-  std::shared_ptr<layer_type> m_layer;
-  context_ptr_t m_ctx;
+  typename layer_type::gpu_table_ptr_t gpu_tab_{nullptr};
+  host_table_ptr_t ref_tab_;
+  int8_t* linear_table_{nullptr};
+  std::shared_ptr<layer_type> layer_;
+  context_ptr_t ctx_;
   cudaStream_t private_stream{0};
-  int m_device_id;
+  int device_id_;
 };
 
 // [Sanity] Init the layer
 TEST_P(UVM, Init) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -461,7 +464,7 @@ TEST_P(UVM, Init) {
 // [Sanity] insert 1key, lookup 1key
 TEST_P(UVM, SingleLookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -470,7 +473,7 @@ TEST_P(UVM, SingleLookup) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data);
   ult.LookupAndCheck(keys);
 }
@@ -479,7 +482,7 @@ TEST_P(UVM, SingleLookup) {
 // inserts), clear, lookup
 TEST_P(UVM, Lookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -488,7 +491,7 @@ TEST_P(UVM, Lookup) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheck(keys);
@@ -500,7 +503,7 @@ TEST_P(UVM, Lookup) {
 // [Update] insert k, update 2k, lookup 2k,...
 TEST_P(UVM, Update) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -509,7 +512,7 @@ TEST_P(UVM, Update) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys / 2); // insert half so the rest will be read from UVM
   NVE_CHECK_(cudaDeviceSynchronize());
 
@@ -529,7 +532,7 @@ TEST_P(UVM, Update) {
 // [Insert] insert k, lookup k+k`, insert k`, lookup k+k`
 TEST_P(UVM, Insert) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -538,7 +541,7 @@ TEST_P(UVM, Insert) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys / 6);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheck(keys);
@@ -551,7 +554,7 @@ TEST_P(UVM, Insert) {
 // [Accumulate] insert k+k`, accumulate k+k``
 TEST_P(UVM, Accumulate) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -560,7 +563,7 @@ TEST_P(UVM, Accumulate) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys / 2);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheck(keys);
@@ -577,7 +580,7 @@ TEST_P(UVM, Accumulate) {
 //  [Erase] inserk k+k`, lookup k+k`+k``, erase k, lookup k+k`+k``
 TEST_P(UVM, Erase) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -586,7 +589,7 @@ TEST_P(UVM, Erase) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys / 2);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheck(keys);
@@ -608,7 +611,7 @@ TEST_P(UVM, LookupNonDefaultDevice) {
     GTEST_SKIP() << "Skipping multi-GPU test since only " << num_devices << " device(s) found";
     return;
   }
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -617,7 +620,7 @@ TEST_P(UVM, LookupNonDefaultDevice) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data, 0, tc.test_keys / 2);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheck(keys);
@@ -634,7 +637,7 @@ TEST_P(UVM, LookupMultiDevice) {
     return;
   }
 
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -646,7 +649,7 @@ TEST_P(UVM, LookupMultiDevice) {
       for (int i = 0; i < 10; i++) {
         std::vector<int64_t> keys;
         std::vector<uint8_t> data;
-        GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult_0.m_max_rows, tc.data_type);
+        GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult_0.max_rows_, tc.data_type);
         ult_0.Insert(keys, data, 0, tc.test_keys / 2);
         NVE_CHECK_(cudaDeviceSynchronize());
         ult_0.LookupAndCheck(keys);
@@ -657,7 +660,7 @@ TEST_P(UVM, LookupMultiDevice) {
       for (int i = 0; i < 10; i++) {
         std::vector<int64_t> keys;
         std::vector<uint8_t> data;
-        GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult_1.m_max_rows, tc.data_type);
+        GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult_1.max_rows_, tc.data_type);
         ult_1.Insert(keys, data, 0, tc.test_keys / 2);
         NVE_CHECK_(cudaDeviceSynchronize());
         ult_1.LookupAndCheck(keys);
@@ -700,7 +703,7 @@ INSTANTIATE_TEST_SUITE_P(
 // [Pooling - Sanity] insert 1 key, lookup 1 key with pooling
 TEST_P(UVMPooling, SingleLookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -709,7 +712,7 @@ TEST_P(UVMPooling, SingleLookup) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, 1, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheckPooling(tc, keys);
@@ -718,7 +721,7 @@ TEST_P(UVMPooling, SingleLookup) {
 // [Pooling] insert k, lookup k with pooling and compare against reference combine
 TEST_P(UVMPooling, Lookup) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   if (IsLargeTestAnd7xxx(tc)) {
     GTEST_SKIP() << "Skipping large UVM test";
     return;
@@ -737,7 +740,7 @@ TEST_P(UVMPooling, Lookup) {
     }
   }
 
-  GenerateData<int64_t>(keys, data, num_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, num_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   ult.Insert(keys, data);
   NVE_CHECK_(cudaDeviceSynchronize());
   ult.LookupAndCheckPooling(tc, keys);
@@ -1087,13 +1090,13 @@ class UVMSpecialConfig : public ::testing::TestWithParam<UVMTestCase> {};
 
 TEST_P(UVMSpecialConfig, InflightInsert) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type, tc.private_stream_mode, false, 0 /*device_id*/,
                             true /*insert_heuristic*/); // override insert_heuristic
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   // Insert keys to ref and linear (insert to all, the remove from gpu table)
   ult.Insert(keys, data);
@@ -1129,12 +1132,12 @@ TEST_P(UVMSpecialConfig, InflightInsert) {
 // tc.modify_on_gpu exercises both the GPU (key-indexed) and CPU histogram paths of insert_from_uvm.
 TEST_P(UVMSpecialConfig, InflightInsertPooling) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
                             tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   // Populate linear table + ref with known data, then drop the GPU cache so lookups start cold.
   ult.Insert(keys, data);
@@ -1162,12 +1165,12 @@ TEST_P(UVMSpecialConfig, InflightInsertPooling) {
 // the UVM table (the partial per-key data gathered before the switch is discarded).
 TEST_P(UVMSpecialConfig, InflightInsertPoolingMixed) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
                             tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   ult.Insert(keys, data);
   ult.Clear(false /* clear_ref */);
@@ -1202,12 +1205,12 @@ TEST_P(UVMSpecialConfig, InflightInsertPoolingMixed) {
 // all collected keys correctly.
 TEST_P(UVMSpecialConfig, InflightInsertPoolingMixedReverse) {
   cudaGetLastError();
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
                             tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, true /*insert_heuristic*/);
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   ult.Insert(keys, data);
   ult.Clear(false /* clear_ref */);
@@ -1238,13 +1241,13 @@ TEST_P(UVMSpecialConfig, InflightInsertPoolingMixedReverse) {
 
 TEST_P(UVMSpecialConfig, LargeModify) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type,
                             tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/, false /*insert_heuristic*/,
                             [&tc](GPUTableConfig& cfg){ cfg.max_modify_size = tc.test_keys / 3; }); // override config to reduce max_modify_size
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   // Test insert in parts
   ult.Insert(keys, data);
@@ -1282,13 +1285,13 @@ TEST_P(UVMSpecialConfig, LargeModify) {
 
 TEST_P(UVMSpecialConfig, UVMUpdate) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc);
 
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
 
   // Insert only half the keys
   ult.Insert(keys, data, tc.test_keys / 4 , tc.test_keys * 3 / 4);
@@ -1303,13 +1306,13 @@ TEST_P(UVMSpecialConfig, UVMUpdate) {
 
 TEST_P(UVMSpecialConfig, UVMCPUAccumulate) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc);
 
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   // Insert only a small set of keys to guarantee hit rate with a small cache
   ult.Insert(keys, data, 0, 100);
 
@@ -1323,7 +1326,7 @@ TEST_P(UVMSpecialConfig, UVMCPUAccumulate) {
 
 TEST_P(UVMSpecialConfig, UVMGPUAccumulate) {
   cudaGetLastError();  // Clear potential errors left by previous tests.
-  const auto tc = GetParam();
+  const auto& tc = GetParam();
   UVMLayerTest<int64_t> ult(tc.row_size, tc.gpu_table_size, tc.uvm_table_size, tc.data_type, tc.private_stream_mode, tc.modify_on_gpu, 0 /*device_id*/,
                             false /*insert_heuristic*/,
                             [](GPUTableConfig& cfg){ cfg.uvm_cpu_accumulate = false; }); // override config to disable cpu uvm update
@@ -1331,7 +1334,7 @@ TEST_P(UVMSpecialConfig, UVMGPUAccumulate) {
   std::vector<int64_t> keys;
   std::vector<uint8_t> data;
 
-  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.m_max_rows, tc.data_type);
+  GenerateData<int64_t>(keys, data, tc.test_keys, tc.row_size, 0, ult.max_rows_, tc.data_type);
   // Insert only a small set of keys to guarantee hit rate with a small cache
   ult.Insert(keys, data, 0, 100);
 
@@ -1356,5 +1359,58 @@ INSTANTIATE_TEST_SUITE_P(
         UVMTestCase({ int64_t(1) << 30, int64_t(1) << 26, int64_t(1) << 10, int64_t(1) << 15, DataType_t::Float32, PrivateStreamMode::Optimized, true})
 
     ));
+
+
+// Modify ops take a value_stride that may exceed the row size (padded rows). The layer must pass the
+// row size, not the stride, as the value size to the GPU table.
+TEST(UVMPaddedStride, InsertUpdateAccumulateWithPaddedValueStride) {
+  cudaGetLastError();  // Clear potential errors left by previous tests.
+  constexpr int64_t row_size = 256;
+  constexpr int64_t stride = row_size + 64;
+  constexpr size_t num_keys = 512;
+  // The CPU accumulate path requires tightly packed updates; use the GPU kernel path instead.
+  UVMLayerTest<int64_t> ult(row_size, int64_t(1) << 24, int64_t(1) << 26, DataType_t::Float32,
+                            PrivateStreamMode::None, true /*modify_on_gpu*/, 0 /*device*/,
+                            false /*insert_heuristic*/,
+                            [](GPUTableConfig& cfg) { cfg.uvm_cpu_accumulate = false; });
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> data;
+  GenerateData<int64_t>(keys, data, num_keys, row_size, 0, ult.max_rows_, DataType_t::Float32,
+                        true /*unique*/);
+  const int64_t n = static_cast<int64_t>(num_keys);
+
+  // Spread the tightly packed rows out to the padded stride.
+  std::vector<uint8_t> padded(num_keys * stride, 0xEE);
+  const auto pad = [&]() {
+    for (size_t i = 0; i < num_keys; i++) {
+      std::memcpy(&padded[i * stride], &data[i * row_size], row_size);
+    }
+  };
+  const auto ref_op = [&](auto&& op) {
+    auto keys_bw = std::make_shared<BufferWrapper<const void>>(ult.ctx(), "keys", keys.data(), num_keys * sizeof(int64_t));
+    auto values_bw = std::make_shared<BufferWrapper<const void>>(ult.ctx(), "values", data.data(), data.size());
+    op(std::move(keys_bw), std::move(values_bw));
+  };
+
+  pad();
+  ult.layer().insert(ult.ctx(), n, keys.data(), stride, row_size, padded.data(), 0);
+  ref_op([&](auto k, auto v) { ult.ref().insert(ult.ctx(), n, std::move(k), row_size, row_size, std::move(v)); });
+  NVE_CHECK_(cudaDeviceSynchronize());
+  ult.LookupAndCheck(keys);
+
+  for (auto& b : data) { b ^= 0x5A; }  // change every row so the update is observable
+  pad();
+  ult.layer().update(ult.ctx(), n, keys.data(), stride, row_size, padded.data(), 0);
+  ref_op([&](auto k, auto v) { ult.ref().update(ult.ctx(), n, std::move(k), row_size, row_size, std::move(v)); });
+  NVE_CHECK_(cudaDeviceSynchronize());
+  ult.LookupAndCheck(keys);
+
+  ult.layer().accumulate(ult.ctx(), n, keys.data(), stride, row_size, padded.data(), DataType_t::Float32, 0);
+  ref_op([&](auto k, auto v) {
+    ult.ref().update_accumulate(ult.ctx(), n, std::move(k), row_size, row_size, std::move(v), DataType_t::Float32);
+  });
+  NVE_CHECK_(cudaDeviceSynchronize());
+  ult.LookupAndCheck(keys);
+}
 
 }  // namespace nve

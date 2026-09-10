@@ -33,14 +33,17 @@ namespace plugin {
 void NvhmMapTableConfig::check() const {
   base_type::check();
 
-  NVE_CHECK_(num_partitions >= 0 && has_single_bit(static_cast<uint64_t>(num_partitions)));
+  NVE_CHECK_(num_partitions >= 0 && has_single_bit(to_uint(num_partitions)));
   NVE_CHECK_(!workgroups.empty());
   NVE_CHECK_(max_find_task_size > 0);
 
-  NVE_CHECK_(key_fetch_queue_length == 0 || (key_fetch_queue_length <= 8 && has_single_bit(static_cast<uint64_t>(key_fetch_queue_length))));
+  NVE_CHECK_(kernel_size > 0 && kernel_size <= 512 && has_single_bit(to_uint(kernel_size)));
+
+  NVE_CHECK_(key_fetch_queue_length == 0 ||
+    (key_fetch_queue_length > 0 && key_fetch_queue_length <= 8 && has_single_bit(to_uint(key_fetch_queue_length))));
 
   NVE_CHECK_(initial_capacity >= 0);
-  NVE_CHECK_(value_alignment >= 0 && has_single_bit(static_cast<uint64_t>(value_alignment)));
+  NVE_CHECK_(value_alignment > 0 && has_single_bit(to_uint(value_alignment)));
 
   overflow_policy.check();
 }
@@ -61,7 +64,6 @@ void from_json(const nlohmann::json& json, NvhmMapTableConfig& conf) {
   NVE_READ_JSON_FIELD_(key_fetch_queue_length);
   NVE_READ_JSON_FIELD_(prefetch_values);
 
-  NVE_READ_JSON_FIELD_(minimize_psl);
   NVE_READ_JSON_FIELD_(auto_shrink);
 
   NVE_READ_JSON_FIELD_(overflow_policy);
@@ -83,7 +85,6 @@ void to_json(nlohmann::json& json, const NvhmMapTableConfig& conf) {
   NVE_WRITE_JSON_FIELD_(key_fetch_queue_length);
   NVE_WRITE_JSON_FIELD_(prefetch_values);
 
-  NVE_WRITE_JSON_FIELD_(minimize_psl);
   NVE_WRITE_JSON_FIELD_(auto_shrink);
 
   NVE_WRITE_JSON_FIELD_(overflow_policy);
@@ -137,96 +138,94 @@ inline static host_table_ptr_t make_nvhm_map_table_6(const table_id_t id,
   }
 }
 
-template <typename KeyType, typename MetaType, typename KernelType,
-          bool MinimizePSL>
-inline static host_table_ptr_t make_nvhm_map_table_5(const table_id_t id,
-                                                          const NvhmMapTableConfig& config) {
-  if (config.auto_shrink) {
-    using map_t = nvhm::map<KeyType, MetaType, char, KernelType,
-                                     nvhm::default_seq_t, MinimizePSL, true>;
-    return make_nvhm_map_table_6<map_t>(id, config);
-  } else {
-    using map_t = nvhm::map<KeyType, MetaType, char, KernelType,
-                                     nvhm::default_seq_t, MinimizePSL, false>;
-    return make_nvhm_map_table_6<map_t>(id, config);
-  }
+template <typename KeyType, typename MetaType, nvhm::flags_t Flags, typename KernelType>
+static host_table_ptr_t make_nvhm_map_table_5(const table_id_t id, const NvhmMapTableConfig& config) {
+  using map_t = nvhm::map<KeyType, MetaType, Flags, KernelType>;
+  return make_nvhm_map_table_6<map_t>(id, config);
 }
 
-template <typename KeyType, typename MetaType, typename KernelType>
-inline static host_table_ptr_t make_nvhm_map_table_4(const table_id_t id,
-                                                          const NvhmMapTableConfig& config) {
-  if (config.minimize_psl) {
-    return make_nvhm_map_table_5<KeyType, MetaType, KernelType, true>(id, config);
-  } else {
-    return make_nvhm_map_table_5<KeyType, MetaType, KernelType, false>(id, config);
-  }
-}
-
-template <typename KeyType, typename MetaType>
-inline static host_table_ptr_t make_nvhm_map_table_3(const table_id_t id,
-                                                          const NvhmMapTableConfig& config) {
+template <typename KeyType, typename MetaType, nvhm::flags_t Flags>
+static host_table_ptr_t make_nvhm_map_table_4(const table_id_t id, const NvhmMapTableConfig& config) {
   switch (config.kernel_size) {
-#if defined(NVE_FEATURE_HT_KERNEL_8)
+#if defined(NVE_FEATURE_HT_KERNEL_1)
     case 1:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
+                                        nvhm::default_kernel1_t>(id, config);
+#endif
+#if defined(NVE_FEATURE_HT_KERNEL_2)
+    case 2:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
+                                        nvhm::default_kernel2_t>(id, config);
+#endif
+#if defined(NVE_FEATURE_HT_KERNEL_4)
+    case 4:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
+                                        nvhm::default_kernel4_t>(id, config);
+#endif
+#if defined(NVE_FEATURE_HT_KERNEL_8)
+    case 8:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel8_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_16)
-    case 2:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 16:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel16_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_32)
-    case 4:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 32:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel32_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_64)
-    case 8:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 64:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel64_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_128)
-    case 16:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 128:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel128_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_256)
-    case 32:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 256:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel256_t>(id, config);
 #endif
 #if defined(NVE_FEATURE_HT_KERNEL_512)
-    case 64:
-      return make_nvhm_map_table_4<KeyType, MetaType,
+    case 512:
+      return make_nvhm_map_table_5<KeyType, MetaType, Flags,
                                         nvhm::default_kernel512_t>(id, config);
-#endif
-#if defined(NVE_FEATURE_HT_KERNEL_1024)
-    case 128:
-      return make_nvhm_map_table_4<KeyType, MetaType,
-                                        nvhm::default_kernel1024_t>(id, config);
 #endif
   }
   NVE_THROW_("`config.kernel_size` (", config.kernel_size, ") is out of bounds!");
 }
 
+template <typename KeyType, typename MetaType>
+static host_table_ptr_t make_nvhm_map_table_3(const table_id_t id, const NvhmMapTableConfig& config) {
+  constexpr nvhm::flags_t flags{nvhm::flags_t::blobs | nvhm::flags_t::aggressive_prefetch};
+  if (config.auto_shrink) {
+    return make_nvhm_map_table_4<KeyType, MetaType, flags | nvhm::flags_t::auto_shrink>(id, config);
+  } else {
+    return make_nvhm_map_table_4<KeyType, MetaType, flags>(id, config);
+  }
+}
+
 template <typename KeyType>
-static host_table_ptr_t make_nvhm_map_table_2(const table_id_t id,
-                                              const NvhmMapTableConfig& config) {
+static host_table_ptr_t make_nvhm_map_table_2(const table_id_t id, const NvhmMapTableConfig& config) {
   switch (config.overflow_policy.handler) {
     case OverflowHandler_t::EvictRandom:
-      return make_nvhm_map_table_3<KeyType, no_meta_type>(id, config);
+      return make_nvhm_map_table_3<KeyType, no_meta_t>(id, config);
     case OverflowHandler_t::EvictLRU:
-      return make_nvhm_map_table_3<KeyType, lru_meta_type>(id, config);
+      return make_nvhm_map_table_3<KeyType, lru_meta_t>(id, config);
     case OverflowHandler_t::EvictLFU:
-      return make_nvhm_map_table_3<KeyType, lfu_meta_type>(id, config);
+      return make_nvhm_map_table_3<KeyType, lfu_meta_t>(id, config);
   }
   NVE_THROW_("`config.overflow_policy.handler` (", config.overflow_policy.handler,
              ") is out of bounds!");
 }
 
-static host_table_ptr_t make_nvhm_map_table_1(const table_id_t id,
-                                              const NvhmMapTableConfig& config) {
+static host_table_ptr_t make_nvhm_map_table_1(const table_id_t id, const NvhmMapTableConfig& config) {
   switch (config.key_size) {
 #if defined(NVE_FEATURE_HT_KEY_8)
     case sizeof(int8_t):

@@ -73,4 +73,4 @@ private:
   uint64_t collect_devices(std::vector<int>& all_devices);
 };
 
-} // namespace nve
+}  // namespace nve

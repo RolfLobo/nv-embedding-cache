@@ -38,7 +38,7 @@ FSMInsertHeuristic::FSMInsertHeuristic(const std::vector<float> threshold) :
     threshold_(std::move(threshold))
 {
     const auto num_tables = threshold_.size();
-    for(size_t i=0 ; i<num_tables ; i++) {
+    for (size_t i=0 ; i<num_tables ; i++) {
         prev_hitrate_.push_back(0);
         state_.push_back(State::Start);
     }
@@ -216,4 +216,4 @@ bool NeverInsertHeuristic::insert_needed(const float /*hitrate*/, const size_t /
     return false;
 }
 
-} // namespace nve
+}  // namespace nve

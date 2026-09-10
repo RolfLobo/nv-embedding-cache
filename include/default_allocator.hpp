@@ -20,6 +20,7 @@
 #include <cuda_runtime_api.h>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <nve_types.hpp>
 #include <unordered_map>
 #include <sys/mman.h>
@@ -33,8 +34,9 @@ namespace nve {
  * @param alloc_size Size of the allocation needed in bytes
  * @returns Number of bits in the huge page enum or 0 if there aren't enough huge pages.
  *          E.g. if there are enough 2MB pages for the desired size the return value will be 21 (1<<21 is 2MB for the page size)
+ * @note Never throws: a missing or unreadable sysfs hugepage directory also yields 0.
  */
-size_t get_largest_hugepage_bits(size_t alloc_size);
+size_t get_largest_hugepage_bits(size_t alloc_size) noexcept;
 
 /**
  * Default allocator for large memory allocation.
@@ -55,8 +57,11 @@ public:
   virtual cudaError_t host_free(void* ptr) noexcept override;
 
 private:
+  // The default allocator is a process-wide singleton shared by every context, so the bookkeeping
+  // maps below are guarded.
+  std::mutex mutex_;
   std::unordered_map<int,cudaMemPool_t> mem_pools_;
-  cudaMemPool_t getMemPool(int device) noexcept;
+  cudaMemPool_t get_mem_pool(int device) noexcept;
   const size_t host_alloc_threshold_;
   std::unordered_map<void*, size_t> host_mmap_allocations_;
 };

@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <vector>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <memory>
@@ -51,9 +52,9 @@ class RuntimeError<ECError> : public Exception {
                       const ECError& error, const std::string& hint)
       : base_type(file, line, expr, hint), error_{error} {}
 
-  inline ECError error() const noexcept { return error_; }
+  constexpr ECError error() const noexcept { return error_; }
 
-  virtual std::string to_string() const override;
+  std::string to_string() const override;
 
  private:
   ECError error_;
@@ -129,15 +130,25 @@ class LayerExecutionContext: public ExecutionContext {
     : ExecutionContext(lookup_stream, modify_stream, std::move(thread_pool), std::move(allocator)),
       table_contexts_(std::move(table_contexts)), parallel_task_res_(table_contexts_.size()) {}
 
-  virtual ~LayerExecutionContext() { wait(); }
-
-  virtual void wait() override {
-    for (auto& res : parallel_task_res_) {
-      if (res.valid()) {
-        res.get(); // This needs to precede the stream sync since it queues work on the streams
-      }
+  // Destructors must not throw: reap the tasks (failures are logged there) and swallow a stream
+  // sync error.
+  virtual ~LayerExecutionContext() {
+    reap_parallel_tasks();
+    try {
+      ExecutionContext::wait();
+    } catch (const std::exception& e) {
+      NVE_LOG_ERROR_("Stream sync failed during context teardown: ", e.what());
     }
+  }
+
+  // Reap every task and sync the streams, then rethrow the first task failure so an explicit
+  // wait() still reports a failed auto-insert. Every failure was already logged when it was reaped.
+  virtual void wait() override {
+    std::exception_ptr first_error = reap_parallel_tasks();
     ExecutionContext::wait();
+    if (first_error) {
+      std::rethrow_exception(first_error);
+    }
   }
 
   void submit_parallel_task(ThreadPool::task_type task, int64_t table_id) {
@@ -147,7 +158,13 @@ class LayerExecutionContext: public ExecutionContext {
       if (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
         NVE_LOG_PERF_("Waiting for parallel task"); // This shouldn't happen - just a precaution
       }
-      fut.get(); // Also propagates any exception from the previous task before it is overwritten below.
+      // The previous task was a best-effort background op (auto-insert). Its failure must not be
+      // reported as an error of the unrelated lookup that happens to submit the next one: log it.
+      try {
+        fut.get();
+      } catch (const std::exception& e) {
+        NVE_LOG_ERROR_("Async task for table ", table_id, " failed: ", e.what());
+      }
     }
     fut = thread_pool_->submit(std::move(task));
   }
@@ -157,6 +174,28 @@ class LayerExecutionContext: public ExecutionContext {
   // For now only auto-insert can be offloaded and only one can exist at a given time for every table
   // todo: extend to multiple futures when needed.
   std::vector<ThreadPool::result_type> parallel_task_res_;
+
+ private:
+  // Reap all finished async tasks (they queue work on the streams, so this must precede the stream
+  // sync). Logs every failure and returns the first one for the caller to rethrow.
+  std::exception_ptr reap_parallel_tasks() {
+    std::exception_ptr first_error;
+    for (size_t table_id = 0; table_id < parallel_task_res_.size(); table_id++) {
+      auto& res = parallel_task_res_[table_id];
+      if (!res.valid()) {
+        continue;
+      }
+      try {
+        res.get();
+      } catch (const std::exception& e) {
+        NVE_LOG_ERROR_("Async task for table ", table_id, " failed: ", e.what());
+        if (!first_error) {
+          first_error = std::current_exception();
+        }
+      }
+    }
+    return first_error;
+  }
 };
 
 /**
@@ -277,6 +316,39 @@ private:
   void launch_insert(
     std::shared_ptr<LayerExecutionContext> layer_ctx,
     const int64_t output_stride);
+};
+
+/**
+ * Holds an `AutoInsertHandler`'s modify lock for the enclosing scope.
+ *
+ * Layers must not run a modify op (update / accumulate / clear / erase) in parallel with an
+ * auto-insert. Releasing on scope exit keeps that lock balanced when the table op throws - a
+ * leaked modify lock deadlocks every later modify, including the one in the layer destructor.
+ *
+ * A null handler is a no-op, so call sites don't have to branch (cf. `ScopedDevice`).
+ */
+class ScopedModifyLock final {
+public:
+  explicit ScopedModifyLock(const std::shared_ptr<AutoInsertHandler>& handler)
+    : handler_(handler.get()) {
+    if (handler_) handler_->lock_modify();
+  }
+  ~ScopedModifyLock() {
+    // Never throw out of a destructor - the lock is released either way, so log and move on.
+    try {
+      if (handler_) handler_->unlock_modify();
+    } catch (const std::exception& e) {
+      NVE_LOG_ERROR_("Failed to unlock modify lock: ", e.what());
+    }
+  }
+
+  ScopedModifyLock(const ScopedModifyLock&) = delete;
+  ScopedModifyLock& operator=(const ScopedModifyLock&) = delete;
+  ScopedModifyLock(ScopedModifyLock&&) = delete;
+  ScopedModifyLock& operator=(ScopedModifyLock&&) = delete;
+
+private:
+  AutoInsertHandler* handler_; // not owned; null when auto-insert is disabled
 };
 
 void validate_pool_params(const EmbeddingLayerBase::PoolingParams& pool_params);

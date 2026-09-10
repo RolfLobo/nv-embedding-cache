@@ -38,4 +38,4 @@ __device__ inline float4 Add(float4 a, float4 b)
   return ret;
 }
 
-} // namespace nve
+}  // namespace nve

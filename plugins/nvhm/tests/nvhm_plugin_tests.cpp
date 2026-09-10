@@ -30,7 +30,7 @@ TEST(nvhm_plugin, parse_table_conf) {
                                      2, Partitioner_t::AlwaysZero, {1}, 128,
                                      16, 1337, 32,
                                      4, false,
-                                     true, true,
+                                     true,
                                      {1024, OverflowHandler_t::EvictLRU, 0.5}};
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
@@ -51,7 +51,6 @@ TEST(nvhm_plugin, parse_table_conf) {
     "key_fetch_queue_length": 4,
     "prefetch_values": false,
 
-    "minimize_psl": true,
     "auto_shrink": true,
 
     "overflow_policy": {

@@ -164,4 +164,4 @@ std::vector<int> resolve_memblock_devices(
     MemBlockType type, int def_index,
     const std::vector<int>& override = {});
 
-} // namespace nve
+}  // namespace nve

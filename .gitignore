@@ -19,5 +19,8 @@ python/pynve.egg-info/
 # misc
 .devcontainer/.env
 .cache/
+
+# agents
 .claude/
+.agents/
 /.codex

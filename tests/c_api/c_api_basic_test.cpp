@@ -36,6 +36,24 @@ TEST(NveCApiBasic, VersionNullArgs) {
   EXPECT_STRNE("", msg);
 }
 
+TEST(NveCApiBasic, AbiVersion) {
+  int32_t major, minor;
+  EXPECT_EQ(NVE_SUCCESS, nve_abi_version(&major, &minor));
+  EXPECT_EQ(NVE_C_ABI_VERSION_MAJOR, major);
+  EXPECT_EQ(NVE_C_ABI_VERSION_MINOR, minor);
+}
+
+TEST(NveCApiBasic, AbiVersionNullArgs) {
+  int32_t major, minor;
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_abi_version(nullptr, nullptr));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_abi_version(&major, nullptr));
+  EXPECT_EQ(NVE_ERROR_INVALID_ARGUMENT, nve_abi_version(nullptr, &minor));
+  const char* msg = nullptr;
+  nve_get_last_error(&msg);
+  EXPECT_NE(nullptr, msg);
+  EXPECT_STRNE("", msg);
+}
+
 TEST(NveCApiBasic, GetLastErrorEmpty) {
   const char* msg = nullptr;
   EXPECT_EQ(NVE_SUCCESS, nve_get_last_error(&msg));

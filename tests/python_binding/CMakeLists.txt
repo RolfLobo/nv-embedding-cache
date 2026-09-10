@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if(NOT NVE_DRIVERLESS_BUILD AND NOT NVE_DISABLE_TORCH_BINDINGS AND TORCH_FOUND)
+if (NOT NVE_DRIVERLESS_BUILD AND NOT NVE_DISABLE_TORCH_BINDINGS AND TORCH_FOUND)
     add_executable(export_inference_test export_inference_test.cpp)
     target_link_libraries(export_inference_test PRIVATE gtest_main)
     target_compile_definitions(export_inference_test PRIVATE

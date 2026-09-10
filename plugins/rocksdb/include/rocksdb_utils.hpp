@@ -43,7 +43,7 @@ class RuntimeError<rocksdb::Status> : public Exception {
                       const rocksdb::Status& status, const std::string& hint)
       : base_type(file, line, expr, hint), status_{status} {}
 
-  inline rocksdb::Status status() const noexcept { return status_; }
+  constexpr const rocksdb::Status& status() const noexcept { return status_; }
 
   const char* what() const noexcept override;
 
@@ -66,6 +66,7 @@ struct RocksDBContext final {
 
   const std::string path;
   std::unique_ptr<rocksdb::DB> db;
+  const bool read_only;
 
   mutable std::mutex write;
   rocksdb::ColumnFamilyOptions col_family_opts;

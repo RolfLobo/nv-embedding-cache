@@ -29,7 +29,7 @@ using namespace nve;
 using namespace nlohmann::literals;
 
 std::vector<int64_t> make_uniform_keys(int64_t n) {
-  std::vector<int64_t> keys(static_cast<size_t>(n));
+  std::vector<int64_t> keys(to_uint(n));
 
   std::default_random_engine rng(random_seed());
   std::uniform_int_distribution dist(0, 1'000'000);
@@ -67,15 +67,12 @@ void find_insert_find(const std::string& plugin_path, const nlohmann::json& fac_
 
     int64_t cnt;
 
-    const size_t keys_bytes = static_cast<size_t>(n) * sizeof(key_type);
-    const size_t hit_mask_bytes = hit_mask.size() * sizeof(bitmask64_t);
-
     auto make_keys_bw = [&](const key_type* p) {
-      return std::make_shared<BufferWrapper<const void>>(ctx, "keys", p, keys_bytes);
+      return std::make_shared<BufferWrapper<const void>>(ctx, "keys", p, to_uint(n) * sizeof(key_type));
     };
     auto make_hit_mask_bw = [&]() {
       return std::make_shared<BufferWrapper<bitmask64_t>>(
-          ctx, "hit_mask", hit_mask.data(), hit_mask_bytes);
+          ctx, "hit_mask", hit_mask.data(), hit_mask.size() * sizeof(bitmask64_t));
     };
 
     std::fill(hit_mask.begin(), hit_mask.end(), 0);

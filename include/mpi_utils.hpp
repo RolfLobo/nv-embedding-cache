@@ -58,4 +58,4 @@ private:
 
 std::ostream& operator<<(std::ostream& os, const MPIEnv& env);
 
-} // namespace nve
+}  // namespace nve

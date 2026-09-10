@@ -50,12 +50,12 @@ protected:
     template<typename IndexT>
     void run_test() {
         const auto& params = GetParam();
-        const uint64_t n = static_cast<uint64_t>(params.n);
-        const auto row_size_in_bytes = params.row_size_in_bytes;
+        const uint64_t n{to_uint(params.n)};
+        const uint64_t row_size_in_bytes{params.row_size_in_bytes};
     
         // Allocate memory for test data
         std::vector<IndexT> keys(n);
-        std::vector<bitmask64_t> hit_mask(((n + 63) / 64), 0);
+        std::vector<bitmask64_t> hit_mask(ceil_div(n, to_uint(bitmask64::num_bits)), 0);
         std::vector<int8_t> values(n * row_size_in_bytes, 0);
         std::vector<int8_t> uvm_table(n * row_size_in_bytes);
     
@@ -71,7 +71,8 @@ protected:
             }
             // Randomly set hit mask bits with 50% probability
             if (dist(rng)) {
-                hit_mask[i / 64] |= (1ULL << (i % 64));
+                int64_t j{static_cast<int64_t>(i) % bitmask64::num_bits};
+                hit_mask[i / to_uint(bitmask64::num_bits)] |= bitmask64::single(j);
             } else {
                 ++expected_resolved_hits;
             }
@@ -95,19 +96,19 @@ protected:
         EXPECT_EQ(resolved_hits, expected_resolved_hits);
     
         // check that hit mask is all 1s
-        for (uint64_t i = 0; i < (n / 64); ++i) {
-            EXPECT_EQ(hit_mask[i], 0xffffffffffffffffULL);
+        for (uint64_t i = 0; i < n / to_uint(bitmask64::num_bits); ++i) {
+            EXPECT_EQ(hit_mask[i], bitmask64::full);
         }
 
-        uint64_t rem = n - ((n / 64) * 64); 
+        int64_t rem = n % bitmask64::num_bits; 
         if (rem > 0) {
-            EXPECT_EQ(hit_mask[n / 64], ((1ULL << (rem)) - 1));
+            EXPECT_EQ(hit_mask[n / bitmask64::num_bits], bitmask64::until(rem));
         }
 
         // Verify results
         for (uint64_t i = 0; i < n; ++i) {
             // we only filled the previous table misses
-            if ((hit_mask_copy[i / 64] & (1ULL << (i % 64))) == 0) {
+            if (!bitmask64::get(hit_mask_copy[i / to_uint(bitmask64::num_bits)], static_cast<int64_t>(i) % bitmask64::num_bits)) {
                 for (uint64_t j = 0; j < row_size_in_bytes; ++j) {
                     EXPECT_EQ(values[i * row_size_in_bytes + j], 
                             uvm_table[static_cast<size_t>(keys[i]) * row_size_in_bytes + j])
@@ -173,8 +174,8 @@ protected:
     void run_test() {
         const auto& params = GetParam();
         
-        const uint64_t n = static_cast<uint64_t>(params.n);
-        const auto row_size_in_bytes = params.row_size_in_bytes;
+        const uint64_t n{to_uint(params.n)};
+        const uint64_t row_size_in_bytes{params.row_size_in_bytes};
     
         // Allocate memory for test data
         std::vector<IndexT> keys(n);
@@ -319,4 +320,4 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::ValuesIn(genCase(cases_n, cases_row_size_in_bytes, cases_key_type, cases_num_threads))
 );
 
-} // namespace nve
+}  // namespace nve

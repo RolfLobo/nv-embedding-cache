@@ -28,6 +28,11 @@
   #define NVE_C_API __attribute__((visibility("default")))
 #endif
 
+/* NVE C ABI versions */
+/* Within the same major version, ABI is backwards compatible - otherwise rebuild is needed. */
+#define NVE_C_ABI_VERSION_MAJOR (1)
+#define NVE_C_ABI_VERSION_MINOR (0)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -285,6 +290,14 @@ NVE_C_API nve_host_table_config_t            nve_host_table_config_default(void)
  * @param patch Output patch version.
  */
 NVE_C_API nve_status_t nve_version(int32_t* major, int32_t* minor, int32_t* patch);
+
+/**
+ * Get the NVE C ABI version.
+ * Within the same major version ABI is backwards compatible, otherwise rebuild is needed.
+ * @param major Output ABI major version.
+ * @param minor Output ABI minor version.
+ */
+NVE_C_API nve_status_t nve_abi_version(int32_t* major, int32_t* minor);
 
 /* ============================================================================
  * Thread Pool

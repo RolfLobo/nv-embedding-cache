@@ -84,7 +84,7 @@ inline void CallGatherKeysAndDataPtrs(
     constexpr uint32_t warps_per_block = 8;
     constexpr uint32_t indices_per_block = warp_size * warps_per_block;
 
-    dim3 grid_size ((static_cast<uint32_t>(num_unique_keys) + indices_per_block - 1) / indices_per_block, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_unique_keys), indices_per_block), 1);
     dim3 block_size (indices_per_block);
     GatherKeysAndDataPtrs<KeyType, LoadIndices><<<grid_size, block_size, 0, stream>>>(
         const_cast<int8_t*>(data), mapping, priorities, keys,
@@ -101,7 +101,7 @@ void CallGatherLocations(
     constexpr uint32_t warps_per_block = 8;
     constexpr uint32_t indices_per_block = warp_size * warps_per_block;
 
-    dim3 grid_size ((static_cast<uint32_t>(num_unique_keys) + indices_per_block - 1) / indices_per_block, 1);
+    dim3 grid_size (ceil_div(static_cast<uint32_t>(num_unique_keys), indices_per_block), 1);
     dim3 block_size (indices_per_block);
     GatherLocations<KeyType><<<grid_size, block_size, 0, stream>>>(num_unique_keys, offsets, idx_mapping_all, idx_mapping_unique);
     NVE_CHECK_(cudaGetLastError());

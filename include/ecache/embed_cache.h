@@ -790,22 +790,42 @@ public:
     virtual ECError get_keys_stored_in_cache(const LookupContextHandle& lookup_context_handle, IndexT* out_keys, size_t& num_out_keys) const = 0;
 
     /**
-     * \brief Start a custom flow
-     * 
+     * \brief RAII scope for a custom flow.
+     *
      * When a user implements a gather flow that does not perform cache lookup as one cuda kernel, it might cause race condition with invalidate and commit operations.
-     * This function marks the beginning of such a flow and tell the cache that all kernel launched between start_custom_flow and end_custom_flow are "atomic" with respect to invalidate and commit operations.
+     * Every kernel launched while this object is alive is "atomic" with respect to invalidate and commit operations.
      * Note it users responsibility to ensure that any internal streams are supplied to EC event.
-     * 
-     * @return EC_SUCCESS on success, Might return other values based on implementation
+     *
+     * The flow is closed on scope exit, including when a launch throws - a leaked flow blocks every later invalidate and commit.
+     *
+     * Throws ECException if the flow could not be started.
      */
-    virtual ECError start_custom_flow() = 0;
+    class ScopedCustomFlow final
+    {
+    public:
+        explicit ScopedCustomFlow(EmbedCacheBase& cache) : cache_(cache)
+        {
+            CHECK_ERR_AND_THROW(cache_.start_custom_flow());
+        }
 
-    /**
-     * \brief End a custom flow
-     * 
-     * @return EC_SUCCESS on success, Might return other values based on implementation
-     */
-    virtual ECError end_custom_flow() = 0;
+        ~ScopedCustomFlow()
+        {
+            // Never throw out of a destructor - the flow is over either way, so log and move on.
+            const ECError err = cache_.end_custom_flow();
+            if (err != ECERROR_SUCCESS && cache_.logger_)
+            {
+                cache_.logger_->log(LogLevel_t::Error, "Failed to end custom flow");
+            }
+        }
+
+        ScopedCustomFlow(const ScopedCustomFlow&) = delete;
+        ScopedCustomFlow& operator=(const ScopedCustomFlow&) = delete;
+        ScopedCustomFlow(ScopedCustomFlow&&) = delete;
+        ScopedCustomFlow& operator=(ScopedCustomFlow&&) = delete;
+
+    private:
+        EmbedCacheBase& cache_;
+    };
 
     /**
      * \brief Return the cache total capcity in Lines
@@ -819,5 +839,17 @@ protected:
     CACHE_IMPLEMENTATION_TYPE type_;
     Allocator* allocator_;
     mutable Logger* logger_;
+
+private:
+    /**
+     * \brief Open / close a custom flow.
+     *
+     * Private so a flow can only be opened through ScopedCustomFlow and cannot be left open;
+     * derived classes still override these.
+     *
+     * @return EC_SUCCESS on success, Might return other values based on implementation
+     */
+    virtual ECError start_custom_flow() = 0;
+    virtual ECError end_custom_flow() = 0;
 };
 }

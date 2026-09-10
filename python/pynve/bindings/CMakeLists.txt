@@ -44,7 +44,7 @@ target_link_libraries(nve
     PRIVATE Python::Module
 )
 
-if(NOT NVE_DISABLE_TORCH_BINDINGS)
+if (NOT NVE_DISABLE_TORCH_BINDINGS)
     target_compile_definitions(nve PRIVATE NVE_WITH_TORCH_BINDINGS)
     target_link_libraries(nve PRIVATE -Wl,--no-as-needed nve-torch-ops)
 endif()

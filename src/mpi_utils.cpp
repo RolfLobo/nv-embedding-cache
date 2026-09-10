@@ -192,6 +192,6 @@ std::ostream& operator<<(std::ostream& os, const MPIEnv& env) {
   return os;
 }
 
-} // namespace nve
+}  // namespace nve
 
 #endif  // NVE_DISABLE_MPI

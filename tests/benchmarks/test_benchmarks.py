@@ -66,5 +66,8 @@ def test_multi_gpu_bench(runner, mode):
     root_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     sample_path = os.path.join(root_path, 'benchmarks', 'multi_gpu_bench.py')
     cmd = runner + [sample_path] + (['--'] if runner[0] == 'torchx' else []) +['--mode', mode] + base_params
+    # Add ~/.local/bin to path for torchx
+    env = os.environ.copy()
+    env['PATH'] = os.path.expanduser('~/.local/bin') + os.pathsep + env.get('PATH', '')
     print(f'\nRunning: {cmd}')
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, env=env)

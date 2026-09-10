@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -126,11 +127,21 @@ class Logger final {
   /**
    * Set the Logger verbosity level. Only messages on the same level, or a lower will be logged.
    */
-  inline void set_verbosity_level(const LogLevel_t level) {
-    verbosity_level_ = level;
+  inline void set_verbosity_level(const LogLevel_t level) noexcept {
+    verbosity_level_.store(level, std::memory_order_relaxed);
   }
 
-  inline LogLevel_t get_verbosity_level() noexcept { return verbosity_level_; }
+  inline LogLevel_t get_verbosity_level() const noexcept {
+    return verbosity_level_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * Cheap, lock-free check whether a message of the given level would be logged. The logging
+   * macros use it to skip formatting the message entirely for filtered levels.
+   */
+  inline bool is_enabled(const LogLevel_t level) const noexcept {
+    return level <= get_verbosity_level();
+  }
 
   /**
    * Set the logger backend (override the default one).
@@ -150,8 +161,11 @@ class Logger final {
    * Log a message with a given verbosity.
    */
   inline void log(const LogLevel_t level, const std::string_view& msg) {
-    if (logger_backend_ && level <= verbosity_level_) {
-      std::lock_guard lock(mutex_);
+    if (!is_enabled(level)) {
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    if (logger_backend_) {
       logger_backend_->log(level, msg);
     }
   }
@@ -181,7 +195,7 @@ class Logger final {
     return LogLevel_t::Warning;
   }
  private:
-  LogLevel_t verbosity_level_ = LogLevel_t::Warning;
+  std::atomic<LogLevel_t> verbosity_level_{LogLevel_t::Warning};
   std::mutex mutex_;
   std::shared_ptr<LoggerBackend> logger_backend_;
 };

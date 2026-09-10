@@ -17,11 +17,10 @@
 
 #include <gtest/gtest.h>
 
-#include <execution_context.hpp>
-#include <json_support.hpp>
-#include <stl_map_backed_table.hpp>
+#include <stl_map_table.hpp>
 
 using namespace nve;
+using namespace nve::plugin;
 using namespace nlohmann::literals;
 
 TEST(stl_map_backed_table, parse_table_conf) {

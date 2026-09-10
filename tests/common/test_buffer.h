@@ -24,7 +24,7 @@
 template<typename T>
 struct TestBuffer
 {
-    TestBuffer(size_t size) : m_size(size)
+    TestBuffer(size_t size) : size_(size)
     {
         CHECK_CUDA_ERROR(cudaMalloc(&pd, size));
         CHECK_CUDA_ERROR(cudaMallocHost(&ph, size));
@@ -38,15 +38,15 @@ struct TestBuffer
 
     void DtoH(cudaStream_t stream)
     {
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(ph, pd, m_size, cudaMemcpyDefault, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(ph, pd, size_, cudaMemcpyDefault, stream));
     }
 
     void HtoD(cudaStream_t stream)
     {
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(pd, ph, m_size, cudaMemcpyDefault, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(pd, ph, size_, cudaMemcpyDefault, stream));
     }
     
     T* pd = nullptr;
     T* ph = nullptr;
-    size_t m_size;
+    size_t size_;
 };

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <numa_support.hpp>
 #include <regex>
+#include <mutex>
 #include <thread_pool.hpp>
 
 namespace nve {
@@ -25,7 +26,7 @@ namespace nve {
 void from_json(const nlohmann::json& json, ThreadPoolConfig& conf) { NVE_READ_JSON_FIELD_(name); }
 
 void to_json(nlohmann::json& json, const ThreadPoolConfig& conf) {
-  json = json.object();
+  json = nlohmann::json::object();
 
   NVE_WRITE_JSON_FIELD_(name);
 }
@@ -66,15 +67,20 @@ thread_pool_ptr_t create_thread_pool(const nlohmann::json& json) {
   return create_tp(json);
 }
 
+// The default pool is created lazily on first use, which can happen from several threads creating
+// their first execution context at once: guard the config and the pool with one mutex.
+static std::mutex default_tp_mutex;
 static nlohmann::json default_tp_config{R"({"name": "nve_default_tp"})"};
 static thread_pool_ptr_t default_tp;
 
 void configure_default_thread_pool(const nlohmann::json& json) {
+  std::lock_guard lock(default_tp_mutex);
   NVE_CHECK_(!default_tp, "Cannot reconfigure the default thread pool after it was created.");
   default_tp_config = json;
 }
 
 thread_pool_ptr_t default_thread_pool() {
+  std::lock_guard lock(default_tp_mutex);
   if (!default_tp) {
     NVE_LOG_VERBOSE_("Creating default thread pool...");
     default_tp = create_thread_pool(default_tp_config);
@@ -240,7 +246,7 @@ void from_json(const nlohmann::json& json, NumaWorkgroupConfig& conf) {
 }
 
 void to_json(nlohmann::json& json, const NumaWorkgroupConfig& conf) {
-  json = json.object();
+  json = nlohmann::json::object();
 
   NVE_WRITE_JSON_FIELD_(cpu_socket_index);
   NVE_WRITE_JSON_FIELD_(numa_node_index);
@@ -273,9 +279,9 @@ NumaThreadPool::NumaThreadPool(const NumaThreadPoolConfig& config) : base_type(c
   std::vector<NumaWorkgroupConfig> workgroups{config.workgroups};
   if (workgroups.empty()) {
     const int64_t cpu_sockets{num_cpu_sockets()};
-    workgroups.resize(static_cast<uint64_t>(cpu_sockets));
+    workgroups.resize(to_uint(cpu_sockets));
     for (int64_t i{}; i < cpu_sockets; ++i) {
-      workgroups[static_cast<uint64_t>(i)] = {i, cpu_socket_numa_nodes(i).front(), 0};
+      workgroups[to_uint(i)] = {i, cpu_socket_numa_nodes(i).front(), 0};
     }
   }
 
@@ -294,7 +300,7 @@ NumaThreadPool::NumaThreadPool(const NumaThreadPoolConfig& config) : base_type(c
     num_workers += workgroup.num_workers;
   }
 
-  workers_.reserve(static_cast<uint64_t>(num_workers));
+  workers_.reserve(to_uint(num_workers));
   for (uint64_t i{}; i < workgroups.size(); ++i) {
     const auto& workgroup{workgroups[i]};
     for (int64_t j{}; j < workgroup.num_workers; ++j) {
@@ -338,13 +344,13 @@ ThreadPool::result_type NumaThreadPool::submit(task_type task, int64_t workgroup
 
   result_type res;
   {
-    std::lock_guard lk(tasks_guards_[static_cast<uint64_t>(workgroup)]);
-    res = tasks_[static_cast<uint64_t>(workgroup)].emplace(std::move(task)).get_future();
+    std::lock_guard lk(tasks_guards_[to_uint(workgroup)]);
+    res = tasks_[to_uint(workgroup)].emplace(std::move(task)).get_future();
   }
   NVE_LOG_VERBOSE_("Thread pool '", name, "'; submitted single task to workgroup #", workgroup,
                    '.');
 
-  on_submits_[static_cast<uint64_t>(workgroup)].notify_one();
+  on_submits_[to_uint(workgroup)].notify_one();
   return res;
 }
 
@@ -356,8 +362,8 @@ int64_t NumaThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
   NVE_CHECK_(!workers_.empty(), "ThreadPool `", name, "` is shutting down.");
 
   {
-    std::lock_guard lk(tasks_guards_[static_cast<uint64_t>(workgroup)]);
-    auto& tasks{tasks_[static_cast<uint64_t>(workgroup)]};
+    std::lock_guard lk(tasks_guards_[to_uint(workgroup)]);
+    auto& tasks{tasks_[to_uint(workgroup)]};
     if (results) {
       for (int64_t i{}; i < num_tasks; ++i) {
         results[i] = tasks.emplace(std::bind(task, task_idx++)).get_future();
@@ -371,7 +377,7 @@ int64_t NumaThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
 
   NVE_LOG_VERBOSE_("Thread pool '", name, "'; submitted batch ", num_tasks, " tasks to workgroup #",
                    workgroup, '.');
-  on_submits_[static_cast<uint64_t>(workgroup)].notify_all();
+  on_submits_[to_uint(workgroup)].notify_all();
   return task_idx;
 }
 

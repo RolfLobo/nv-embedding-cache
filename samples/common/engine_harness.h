@@ -50,6 +50,6 @@ class EngineHarness {
   bool Enqueue(cudaStream_t stream, unsigned contextIndex, const std::vector<void*>& ioBuffers);
 
  private:
-  std::vector<IOBinding> m_ioBindings;
-  std::vector<std::shared_ptr<nvinfer1::IExecutionContext>> m_executionContexts;
+  std::vector<IOBinding> ioBindings_;
+  std::vector<std::shared_ptr<nvinfer1::IExecutionContext>> executionContexts_;
 };

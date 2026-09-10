@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <bit_ops.hpp>
 #include <nve_c_api.h>
 #include <cuda_runtime.h>
 #include <cstring>
@@ -284,7 +285,7 @@ TEST_F(GpuTableTest, InsertFindErase) {
   void* d_values = nullptr;
   void* d_output = nullptr;
   void* d_hitmask = nullptr;
-  const size_t hitmask_size = ((num_keys + 63) / 64) * sizeof(uint64_t);
+  const size_t hitmask_size = nve::ceil_div(num_keys, static_cast<uint64_t>(64)) * sizeof(uint64_t);
 
   CUDA_CHECK(cudaMalloc(&d_keys, num_keys * sizeof(int64_t)));
   CUDA_CHECK(cudaMalloc(&d_values, num_keys * ROW_SIZE));
@@ -1577,6 +1578,111 @@ TEST_F(HierarchicalRedisLayerTest, InsertLookupAndUpdate) {
 }
 
 TEST_F(HierarchicalNvhmLayerTest, GetNumTables) {
+  int64_t n = -1;
+  NVE_CHECK(nve_layer_get_num_tables(layer_, &n));
+  EXPECT_EQ(2, n);
+}
+
+/* ============================================================================
+ * Hierarchical Layer with GPU cache + SPH table
+ *
+ * SPH is a GPU-resident table, so unlike the NVHM fixture above both tiers live
+ * on the same device (the layer requires GPU tables to come first and share a
+ * device). Only the ops SPH implements are covered here: it throws
+ * NVE_THROW_NOT_IMPLEMENTED_ for erase and update_accumulate, so there is no
+ * EraseAndClear / UpdateAndAccumulate counterpart.
+ * ============================================================================ */
+
+class HierarchicalSphLayerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    CUDA_CHECK(cudaSetDevice(DEVICE_ID));
+
+    nve_status_t st = nve_create_table_factory(
+        &sph_factory_, nve_test::plugin_full_path("sph-experimental").c_str(), "{}");
+    if (st != NVE_SUCCESS) {
+      GTEST_SKIP() << "SPH plugin not available";
+    }
+
+    // GPU cache tier without UVM backing — misses fall through to the SPH tier.
+    auto gpu_cfg = nve_gpu_table_config_default();
+    gpu_cfg.device_id = DEVICE_ID;
+    gpu_cfg.cache_size = 1 << 20;
+    gpu_cfg.row_size_in_bytes = ROW_SIZE;
+    gpu_cfg.uvm_table = nullptr;
+    gpu_cfg.count_misses = 1;
+    gpu_cfg.value_dtype = NVE_DTYPE_FLOAT32;
+    NVE_CHECK(nve_gpu_table_create(&gpu_table_, NVE_KEY_INT64, &gpu_cfg, nullptr));
+
+    // initial_capacity is well above SPH's internal 2048-key floor.
+    const char* table_config = R"({
+      "device_id": 0,
+      "initial_capacity": 4096,
+      "row_size_in_bytes": 128,
+      "value_dtype": "float32"
+    })";
+    NVE_CHECK(nve_table_factory_produce(sph_factory_, 0, table_config, &sph_table_));
+
+    auto hier_cfg = nve_hierarchical_layer_config_default();
+    hier_cfg.layer_name = "test_hier_sph";
+
+    nve_table_t tables[] = {gpu_table_, sph_table_};
+    NVE_CHECK(nve_hierarchical_layer_create(&layer_, NVE_KEY_INT64, &hier_cfg, tables, 2, nullptr));
+    NVE_CHECK(nve_layer_create_execution_context(layer_, &ctx_, nullptr, nullptr, nullptr, nullptr));
+
+    NVE_CHECK(nve_layer_clear(layer_, ctx_));
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+
+  void TearDown() override {
+    if (ctx_) { nve_context_wait(ctx_); nve_context_destroy(ctx_); }
+    if (layer_) nve_layer_destroy(layer_);
+    if (gpu_table_) nve_table_destroy(gpu_table_);
+    if (sph_table_) nve_table_destroy(sph_table_);
+    if (sph_factory_) nve_table_factory_destroy(sph_factory_);
+  }
+
+  nve_table_t gpu_table_ = nullptr;
+  nve_table_factory_t sph_factory_ = nullptr;
+  nve_table_t sph_table_ = nullptr;
+  nve_layer_t layer_ = nullptr;
+  nve_context_t ctx_ = nullptr;
+};
+
+TEST_F(HierarchicalSphLayerTest, InsertAndLookup) {
+  const uint64_t num_keys = 4;
+  std::vector<int64_t> h_keys = {0, 1, 2, 3};
+
+  // Insert into the SPH tier only (table_id 1), so a correct lookup has to miss
+  // in the GPU cache and be resolved by SPH.
+  std::vector<float> h_vals(num_keys * NUM_FLOATS);
+  for (uint64_t r = 0; r < num_keys; ++r) {
+    for (uint64_t c = 0; c < NUM_FLOATS; ++c) {
+      h_vals[r * NUM_FLOATS + c] = 500.0f + static_cast<float>(r);
+    }
+  }
+
+  void* p_output = nullptr;
+  CUDA_CHECK(cudaMallocHost(&p_output, num_keys * ROW_SIZE));
+
+  NVE_CHECK(nve_layer_insert(layer_, ctx_, num_keys, h_keys.data(), ROW_SIZE, ROW_SIZE,
+                             h_vals.data(), 1));
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  NVE_CHECK(nve_layer_lookup(layer_, ctx_, num_keys, h_keys.data(), p_output, ROW_SIZE, nullptr,
+                             nullptr));
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  auto* out = static_cast<float*>(p_output);
+  for (uint64_t k = 0; k < num_keys; ++k) {
+    float expected = 500.0f + static_cast<float>(k);
+    EXPECT_FLOAT_EQ(expected, out[k * NUM_FLOATS]) << "Key " << h_keys[k];
+  }
+
+  CUDA_CHECK(cudaFreeHost(p_output));
+}
+
+TEST_F(HierarchicalSphLayerTest, GetNumTables) {
   int64_t n = -1;
   NVE_CHECK(nve_layer_get_num_tables(layer_, &n));
   EXPECT_EQ(2, n);
